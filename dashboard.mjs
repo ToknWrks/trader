@@ -64,7 +64,7 @@ strong { color: #fafafa; }
 .badge-flat { background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.4); border: 1px solid rgba(255,255,255,0.1); padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; }
 .badge-active { background: rgba(74,222,128,0.1); color: #4ade80; border: 1px solid rgba(74,222,128,0.25); padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; }
 .badge-inactive { background: rgba(255,255,255,0.03); color: rgba(255,255,255,0.3); border: 1px solid rgba(255,255,255,0.08); padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.7rem; }
-btn { font-size: 0.7rem; padding: 0.25rem 0.65rem; border-radius: 6px; cursor: pointer; background: transparent; transition: all 0.15s; }
+.btn { font-size: 0.7rem; padding: 0.25rem 0.65rem; border-radius: 6px; cursor: pointer; background: transparent; transition: all 0.15s; }
 .btn-green { border: 1px solid rgba(74,222,128,0.4); color: #4ade80; }
 .btn-green:hover { background: rgba(74,222,128,0.1); }
 .btn-red { border: 1px solid rgba(248,113,113,0.4); color: #f87171; }
@@ -155,7 +155,7 @@ async function positionsPage() {
           <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
           <td>$${parseFloat(pos.positionValue ?? "0").toFixed(2)}</td>
           <td class="red">${liqPx > 0 ? "$" + liqPx.toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
-          <td><button class="btn btn-red" onclick="closePos('${pos.coin}')">Force Exit</button></td>
+          <td><button class="btn btn-red" onclick="closePos(this, '${pos.coin}')">Force Exit</button></td>
         </tr>`;
       }).join("")
     : `<tr><td colspan="8" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No open positions</td></tr>`;
@@ -174,9 +174,9 @@ async function positionsPage() {
     <p class="hint">Auto-refreshes every 30s · <a href="/positions">Refresh now</a></p>
     <script>
       setTimeout(() => location.reload(), 30000);
-      async function closePos(asset) {
+      async function closePos(btn, asset) {
         if (!confirm('Force close ' + asset + ' position on Hyperliquid?')) return;
-        const btn = event.target; btn.textContent = 'Closing...'; btn.disabled = true;
+        btn.textContent = 'Closing...'; btn.disabled = true;
         const res = await fetch('/api/close', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({asset}) });
         const d = await res.json();
         if (d.ok) { btn.textContent = 'Closed ✓'; btn.style.color='#4ade80'; setTimeout(()=>location.reload(),1500); }
@@ -209,9 +209,9 @@ function strategiesPage() {
           </td>
           <td style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
             ${s.active
-              ? `<button class="btn btn-red" onclick="toggleActive('${s.id}', false)">Deactivate</button>`
-              : `<button class="btn btn-green" onclick="toggleActive('${s.id}', true)">Activate</button>`}
-            ${sig !== "—" ? `<button class="btn ${execColor}" onclick="execStrategy('${s.id}','${execLabel}','${sig === "FLAT" ? "close" : "open"}')">${execLabel}</button>` : ""}
+              ? `<button class="btn btn-red" onclick="toggleActive(this, '${s.id}', false)">Deactivate</button>`
+              : `<button class="btn btn-green" onclick="toggleActive(this, '${s.id}', true)">Activate</button>`}
+            ${sig !== "—" ? `<button class="btn ${execColor}" onclick="execStrategy(this, '${s.id}','${execLabel}','${sig === "FLAT" ? "close" : "open"}')">${execLabel}</button>` : ""}
             <button class="btn btn-red" onclick="deleteStrat('${s.id}')">Delete</button>
           </td>
         </tr>`;
@@ -230,20 +230,20 @@ function strategiesPage() {
       </table>
     </div>
     <script>
-      async function toggleActive(id, active) {
+      async function toggleActive(btn, id, active) {
         const action = active ? 'Activate' : 'Deactivate';
         const warn = active ? 'It will automatically execute trades at the scheduled time.' : 'It will stop executing trades.';
         if (!confirm(action + ' this strategy?\\n\\n' + warn)) return;
-        const btn = event.target; btn.disabled = true; btn.textContent = 'Saving...';
+        btn.disabled = true; btn.textContent = 'Saving...';
         const res = await fetch('/api/toggle', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id, active}) });
         const d = await res.json();
         if (d.ok) setTimeout(() => location.reload(), 300);
         else { btn.disabled = false; alert(d.error); }
       }
-      async function execStrategy(id, label, type) {
+      async function execStrategy(btn, id, label, type) {
         const msg = (type === 'close' ? 'Close position?' : 'Open position?') + '\\n\\n' + label;
         if (!confirm(msg)) return;
-        const btn = event.target; btn.disabled = true; btn.textContent = 'Executing...';
+        btn.disabled = true; btn.textContent = 'Executing...';
         const res = await fetch('/api/execute', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id}) });
         const d = await res.json();
         if (d.ok) { btn.textContent = '✓ Done'; btn.style.color='#4ade80'; setTimeout(()=>location.reload(),1500); }
