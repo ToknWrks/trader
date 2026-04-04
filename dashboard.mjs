@@ -56,7 +56,32 @@ const SCHEDULE = parseSchedule();
 import {
   getStrategies, getStrategy, upsertStrategy, setStrategyActive,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
+  countSignals,
 } from "./db.mjs";
+
+// ── Base USDC balance ─────────────────────────────────────────────────────────
+
+const BASE_RPC = "https://mainnet.base.org";
+const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const X402_PRICE_USD = 0.001;
+
+async function getBaseUsdcBalance(address) {
+  try {
+    const padded = address.toLowerCase().replace("0x", "").padStart(64, "0");
+    const res = await fetch(BASE_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "eth_call",
+        params: [{ to: USDC_BASE, data: "0x70a08231" + padded }, "latest"],
+      }),
+    });
+    const { result } = await res.json();
+    return parseInt(result, 16) / 1e6; // USDC has 6 decimals
+  } catch {
+    return null;
+  }
+}
 
 // ── CSS ───────────────────────────────────────────────────────────────────────
 
@@ -269,6 +294,14 @@ async function positionsPage() {
   const withdrawable = parseFloat(hlData?.withdrawable ?? "0");
   const usdcSpot = parseFloat(spotData?.balances?.find(b => b.coin === "USDC")?.total ?? "0");
 
+  // x402 spend stats
+  const totalFetches = countSignals();
+  const totalSpend = (totalFetches * X402_PRICE_USD).toFixed(3);
+  const wallet = PRIVATE_KEY
+    ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
+    : null;
+  const baseUsdc = wallet ? await getBaseUsdcBalance(wallet.address) : null;
+
   const stats = `
     <div class="stat-row">
       <div class="stat"><div class="label">Account Value</div><div class="value">$${accountValue.toFixed(2)}</div></div>
@@ -307,6 +340,14 @@ async function positionsPage() {
         <tbody>${posRows}</tbody>
       </table>
     </div>
+    <p class="section-label" style="margin-top:2rem">x402 Signal Spend</p>
+    <div class="stat-row">
+      <div class="stat"><div class="label">Total Fetches</div><div class="value">${totalFetches.toLocaleString()}</div></div>
+      <div class="stat"><div class="label">Estimated Spend</div><div class="value cyan">$${totalSpend}</div></div>
+      <div class="stat"><div class="label">Base USDC Balance</div><div class="value ${baseUsdc !== null && baseUsdc < 0.05 ? "red" : ""}">${baseUsdc !== null ? "$" + baseUsdc.toFixed(4) : "—"}</div></div>
+      <div class="stat"><div class="label">Cost Per Fetch</div><div class="value" style="font-size:0.9rem;color:rgba(255,255,255,0.5)">$${X402_PRICE_USD}</div></div>
+    </div>
+    ${baseUsdc !== null && baseUsdc < 0.05 ? `<p style="font-size:0.78rem;color:#f87171;margin-bottom:1.5rem">⚠️ Low Base USDC — top up to continue fetching signals.</p>` : ""}
     <p class="hint">Auto-refreshes every 30s · <a href="/positions">Refresh now</a></p>
     <script>
       setTimeout(() => location.reload(), 30000);

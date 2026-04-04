@@ -113,6 +113,10 @@ export function getPriorSignal(strategy_id) {
   `).get(strategy_id);
 }
 
+export function countSignals() {
+  return db.prepare("SELECT COUNT(*) as total FROM signals").get().total;
+}
+
 export function getSignalHistory(strategy_id, limit = 30) {
   return db.prepare(`
     SELECT * FROM signals WHERE strategy_id = ?
