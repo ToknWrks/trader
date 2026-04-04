@@ -115,8 +115,9 @@ strong { color: #fafafa; }
 .modal-confirm-green:hover { background:rgba(74,222,128,0.2); }
 .modal-confirm-red { background:rgba(248,113,113,0.12); border:1px solid rgba(248,113,113,0.35); color:#f87171; border-radius:7px; padding:0.45rem 1rem; font-size:0.82rem; font-weight:600; cursor:pointer; }
 .modal-confirm-red:hover { background:rgba(248,113,113,0.2); }
-.info-btn { background:none; border:none; color:rgba(255,255,255,0.3); cursor:pointer; font-size:0.75rem; padding:0 0.25rem; vertical-align:middle; transition:color 0.15s; }
-.info-btn:hover { color:#A8F1F7; }
+.info-btn { background:none; border:none; color:#A8F1F7; cursor:pointer; padding:0 0.35rem; vertical-align:middle; transition:opacity 0.15s; line-height:1; }
+.info-btn:hover { opacity:0.7; }
+.info-btn svg { display:inline-block; vertical-align:middle; }
 .info-popover { display:none; position:fixed; z-index:90; background:#111113; border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:1rem 1.1rem; max-width:320px; font-size:0.78rem; color:rgba(255,255,255,0.65); line-height:1.6; box-shadow:0 8px 32px rgba(0,0,0,0.5); }
 .info-popover.open { display:block; }
 .info-popover strong { color:#fafafa; }
@@ -360,7 +361,7 @@ function strategiesPage() {
     </div>
     <div class="card">
       <table>
-        <thead><tr><th>Strategy</th><th>Symbol</th><th>Signal</th><th>Size</th><th>Leverage</th><th>Status <button class="info-btn" onclick="toggleInfoPopover(this)" title="How it works">ℹ</button></th><th>Actions</th></tr></thead>
+        <thead><tr><th>Strategy</th><th>Symbol</th><th>Signal</th><th>Size</th><th>Leverage</th><th>Status <button class="info-btn" onclick="toggleInfoPopover(this)" title="How it works"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></th><th>Actions</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
