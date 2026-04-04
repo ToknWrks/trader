@@ -1,0 +1,23 @@
+{
+  "name": "@toknwrks/trader",
+  "version": "0.1.0",
+  "description": "Autonomous trading agent for AgentSignal strategies. Runs locally — your keys never leave your machine.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "setup": "node setup.mjs",
+    "start": "pm2 start ecosystem.config.cjs && pm2 save",
+    "stop": "pm2 stop all",
+    "dashboard": "node dashboard.mjs",
+    "trade": "node trader.mjs",
+    "logs": "pm2 logs trader"
+  },
+  "dependencies": {
+    "@nktkas/hyperliquid": "^0.32.2",
+    "@x402/core": "^2.9.0",
+    "@x402/evm": "^2.9.0",
+    "better-sqlite3": "^11.0.0",
+    "marked": "^17.0.5",
+    "viem": "^2.47.10"
+  }
+}
