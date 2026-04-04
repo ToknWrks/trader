@@ -27,6 +27,32 @@ loadEnv();
 const PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY;
 const AGENT_SIGNAL_URL = process.env.AGENT_SIGNAL_URL ?? "https://agentsignal.app";
 
+// ── Schedule ──────────────────────────────────────────────────────────────────
+
+function parseSchedule() {
+  try {
+    const content = readFileSync(resolve(__dirname, "ecosystem.config.cjs"), "utf8");
+    const match = content.match(/cron_restart:\s*["']([^"']+)["']/);
+    if (!match) return { cron: "—", label: "on schedule", detail: "Check ecosystem.config.cjs" };
+    const [, cron] = match;
+    const [minute, hour, , , days] = cron.split(" ");
+    const utcH = parseInt(hour), utcM = parseInt(minute);
+    // Approximate ET (EDT = UTC-4, EST = UTC-5 — show both)
+    const edtH = utcH - 4, estH = utcH - 5;
+    const fmt = (h, m) => `${((h + 24) % 24) % 12 || 12}:${String(m).padStart(2,"0")} ${h % 24 >= 12 ? "PM" : "AM"}`;
+    const daysLabel = days === "1-5" ? "weekdays" : days === "*" ? "every day" : `days ${days}`;
+    return {
+      cron,
+      label: `${fmt(edtH, utcM)} ET / ${fmt(estH, utcM)} EST on ${daysLabel}`,
+      detail: `Cron: ${cron} — runs at ${hour}:${String(utcM).padStart(2,"0")} UTC on ${daysLabel}`,
+    };
+  } catch {
+    return { cron: "—", label: "on schedule", detail: "Could not read ecosystem.config.cjs" };
+  }
+}
+
+const SCHEDULE = parseSchedule();
+
 import {
   getStrategies, getStrategy, upsertStrategy, setStrategyActive,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
@@ -72,6 +98,29 @@ strong { color: #fafafa; }
 .btn-cyan { border: 1px solid rgba(168,241,247,0.3); color: #A8F1F7; }
 .btn-cyan:hover { background: rgba(168,241,247,0.08); }
 .hint { font-size: 0.78rem; color: rgba(255,255,255,0.4); margin-top: 1.5rem; }
+.modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:100; align-items:center; justify-content:center; }
+.modal-overlay.open { display:flex; }
+.modal { background:#111113; border:1px solid rgba(255,255,255,0.12); border-radius:14px; padding:1.75rem; max-width:420px; width:90%; }
+.modal-title { font-size:1rem; font-weight:700; color:#fafafa; letter-spacing:-0.02em; margin-bottom:0.5rem; }
+.modal-body { font-size:0.82rem; color:rgba(255,255,255,0.6); line-height:1.6; }
+.modal-body strong { color:#fafafa; }
+.modal-body .flow { margin:1rem 0; padding:1rem; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:8px; display:flex; flex-direction:column; gap:0.4rem; }
+.modal-body .flow-step { display:flex; align-items:flex-start; gap:0.5rem; font-size:0.78rem; }
+.modal-body .flow-step .num { color:#A8F1F7; font-weight:700; min-width:1rem; }
+.modal-schedule { margin-top:0.75rem; padding:0.6rem 0.85rem; background:rgba(168,241,247,0.05); border:1px solid rgba(168,241,247,0.15); border-radius:6px; font-size:0.75rem; color:#A8F1F7; }
+.modal-actions { display:flex; gap:0.65rem; margin-top:1.25rem; justify-content:flex-end; }
+.modal-cancel { background:transparent; border:1px solid rgba(255,255,255,0.12); color:rgba(255,255,255,0.5); border-radius:7px; padding:0.45rem 1rem; font-size:0.82rem; cursor:pointer; }
+.modal-cancel:hover { background:rgba(255,255,255,0.05); }
+.modal-confirm-green { background:rgba(74,222,128,0.12); border:1px solid rgba(74,222,128,0.35); color:#4ade80; border-radius:7px; padding:0.45rem 1rem; font-size:0.82rem; font-weight:600; cursor:pointer; }
+.modal-confirm-green:hover { background:rgba(74,222,128,0.2); }
+.modal-confirm-red { background:rgba(248,113,113,0.12); border:1px solid rgba(248,113,113,0.35); color:#f87171; border-radius:7px; padding:0.45rem 1rem; font-size:0.82rem; font-weight:600; cursor:pointer; }
+.modal-confirm-red:hover { background:rgba(248,113,113,0.2); }
+.info-btn { background:none; border:none; color:rgba(255,255,255,0.3); cursor:pointer; font-size:0.75rem; padding:0 0.25rem; vertical-align:middle; transition:color 0.15s; }
+.info-btn:hover { color:#A8F1F7; }
+.info-popover { display:none; position:fixed; z-index:90; background:#111113; border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:1rem 1.1rem; max-width:320px; font-size:0.78rem; color:rgba(255,255,255,0.65); line-height:1.6; box-shadow:0 8px 32px rgba(0,0,0,0.5); }
+.info-popover.open { display:block; }
+.info-popover strong { color:#fafafa; }
+.info-popover .sched { color:#A8F1F7; font-size:0.72rem; margin-top:0.5rem; }
 .pos-long { background: rgba(74,222,128,0.1); color: #4ade80; border: 1px solid rgba(74,222,128,0.25); padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.75rem; font-weight: 700; }
 .pos-short { background: rgba(248,113,113,0.1); color: #f87171; border: 1px solid rgba(248,113,113,0.25); padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.75rem; font-weight: 700; }
 input, select { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; color: #e4e4e7; padding: 0.4rem 0.6rem; font-size: 0.8rem; outline: none; }
@@ -101,6 +150,92 @@ function shell(title, body, active = "") {
     </div>
   </header>
   <div class="container">${body}</div>
+
+  <!-- Activate/Deactivate modal -->
+  <div class="modal-overlay" id="toggleModal">
+    <div class="modal">
+      <div class="modal-title" id="modalTitle"></div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-actions">
+        <button class="modal-cancel" onclick="closeModal()">Cancel</button>
+        <button id="modalConfirm" class="modal-confirm-green">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Status info popover -->
+  <div class="info-popover" id="infoPopover">
+    <strong>How it works</strong>
+    <div style="margin-top:0.5rem">
+      <div style="display:flex;gap:0.4rem;margin-bottom:0.3rem"><span style="color:#A8F1F7;font-weight:700">1.</span> Strategy activates — no order is placed yet.</div>
+      <div style="display:flex;gap:0.4rem;margin-bottom:0.3rem"><span style="color:#A8F1F7;font-weight:700">2.</span> Trader fetches the latest signal from agentsignal.app (pays $0.001 via x402).</div>
+      <div style="display:flex;gap:0.4rem;margin-bottom:0.3rem"><span style="color:#A8F1F7;font-weight:700">3.</span> If the signal has <strong>flipped</strong> (e.g. FLAT → LONG), a market order is placed on Hyperliquid.</div>
+      <div style="display:flex;gap:0.4rem"><span style="color:#A8F1F7;font-weight:700">4.</span> If signal hasn't changed, the trader holds and does nothing.</div>
+    </div>
+    <div class="sched">⏱ Runs automatically: ${SCHEDULE.label}<br><span style="opacity:0.5">${SCHEDULE.detail}</span></div>
+  </div>
+
+  <script>
+    const SCHEDULE = ${JSON.stringify(SCHEDULE)};
+
+    function closeModal() {
+      document.getElementById('toggleModal').classList.remove('open');
+    }
+    document.getElementById('toggleModal').addEventListener('click', function(e) {
+      if (e.target === this) closeModal();
+    });
+
+    let _pendingToggle = null;
+    function showToggleModal(btn, id, active) {
+      const title = active ? 'Activate Strategy' : 'Deactivate Strategy';
+      const confirmClass = active ? 'modal-confirm-green' : 'modal-confirm-red';
+      const confirmLabel = active ? 'Activate' : 'Deactivate';
+      document.getElementById('modalTitle').textContent = title;
+      document.getElementById('modalBody').innerHTML = active ? \`
+        <p>The trader will automatically execute trades on Hyperliquid when the signal flips.</p>
+        <div class="flow">
+          <div class="flow-step"><span class="num">1</span><span>No order is placed now — activation just enables auto-trading.</span></div>
+          <div class="flow-step"><span class="num">2</span><span>At the scheduled time, the trader fetches the latest signal.</span></div>
+          <div class="flow-step"><span class="num">3</span><span>If the signal has flipped (e.g. FLAT → LONG), it places a market order.</span></div>
+          <div class="flow-step"><span class="num">4</span><span>If the signal hasn't changed, it holds — no order is placed.</span></div>
+        </div>
+        <div class="modal-schedule">⏱ Next auto-run: \${SCHEDULE.label}<br><span style="opacity:0.6;font-size:0.7rem">\${SCHEDULE.detail}</span></div>
+      \` : \`
+        <p>The trader will <strong>stop executing trades</strong> for this strategy. Any open positions on Hyperliquid will remain open until you close them manually.</p>
+      \`;
+      const confirmBtn = document.getElementById('modalConfirm');
+      confirmBtn.className = confirmClass;
+      confirmBtn.textContent = confirmLabel;
+      _pendingToggle = { btn, id, active };
+      document.getElementById('toggleModal').classList.add('open');
+    }
+
+    document.getElementById('modalConfirm').addEventListener('click', async () => {
+      if (!_pendingToggle) return;
+      const { btn, id, active } = _pendingToggle;
+      closeModal();
+      btn.disabled = true; btn.textContent = 'Saving...';
+      const res = await fetch('/api/toggle', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id, active}) });
+      const d = await res.json();
+      if (d.ok) setTimeout(() => location.reload(), 300);
+      else { btn.disabled = false; btn.textContent = active ? 'Activate' : 'Deactivate'; alert(d.error); }
+    });
+
+    function toggleInfoPopover(btn) {
+      const pop = document.getElementById('infoPopover');
+      if (pop.classList.contains('open')) { pop.classList.remove('open'); return; }
+      const rect = btn.getBoundingClientRect();
+      pop.style.top = (rect.bottom + 8 + window.scrollY) + 'px';
+      pop.style.left = Math.min(rect.left, window.innerWidth - 340) + 'px';
+      pop.classList.add('open');
+    }
+    document.addEventListener('click', function(e) {
+      const pop = document.getElementById('infoPopover');
+      if (pop.classList.contains('open') && !pop.contains(e.target) && !e.target.closest('.info-btn')) {
+        pop.classList.remove('open');
+      }
+    });
+  </script>
 </body>
 </html>`;
 }
@@ -209,8 +344,8 @@ function strategiesPage() {
           </td>
           <td style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
             ${s.active
-              ? `<button class="btn btn-red" onclick="toggleActive(this, '${s.id}', false)">Deactivate</button>`
-              : `<button class="btn btn-green" onclick="toggleActive(this, '${s.id}', true)">Activate</button>`}
+              ? `<button class="btn btn-red" onclick="showToggleModal(this, '${s.id}', false)">Deactivate</button>`
+              : `<button class="btn btn-green" onclick="showToggleModal(this, '${s.id}', true)">Activate</button>`}
             ${sig !== "—" ? `<button class="btn ${execColor}" onclick="execStrategy(this, '${s.id}','${execLabel}','${sig === "FLAT" ? "close" : "open"}')">${execLabel}</button>` : ""}
             <button class="btn btn-red" onclick="deleteStrat('${s.id}')">Delete</button>
           </td>
@@ -225,21 +360,11 @@ function strategiesPage() {
     </div>
     <div class="card">
       <table>
-        <thead><tr><th>Strategy</th><th>Symbol</th><th>Signal</th><th>Size</th><th>Leverage</th><th>Status</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Strategy</th><th>Symbol</th><th>Signal</th><th>Size</th><th>Leverage</th><th>Status <button class="info-btn" onclick="toggleInfoPopover(this)" title="How it works">ℹ</button></th><th>Actions</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
     <script>
-      async function toggleActive(btn, id, active) {
-        const action = active ? 'Activate' : 'Deactivate';
-        const warn = active ? 'It will automatically execute trades at the scheduled time.' : 'It will stop executing trades.';
-        if (!confirm(action + ' this strategy?\\n\\n' + warn)) return;
-        btn.disabled = true; btn.textContent = 'Saving...';
-        const res = await fetch('/api/toggle', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id, active}) });
-        const d = await res.json();
-        if (d.ok) setTimeout(() => location.reload(), 300);
-        else { btn.disabled = false; alert(d.error); }
-      }
       async function execStrategy(btn, id, label, type) {
         const msg = (type === 'close' ? 'Close position?' : 'Open position?') + '\\n\\n' + label;
         if (!confirm(msg)) return;
