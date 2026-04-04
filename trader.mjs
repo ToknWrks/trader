@@ -35,7 +35,23 @@ const PRIVATE_KEY      = process.env.AGENT_PRIVATE_KEY?.trim();
 const AGENT_SIGNAL_URL = process.env.AGENT_SIGNAL_URL ?? "https://agentsignal.app";
 const HL_SIZE_USD      = parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
 const isDryRun         = argv.includes("--dry-run");
+const cryptoOnly       = argv.includes("--crypto-only");
+const stocksOnly       = argv.includes("--stocks-only");
 const today            = new Date().toISOString().slice(0, 10);
+
+// Crypto tickers traded on 24/7 markets (Hyperliquid perps)
+const CRYPTO_TICKERS = new Set([
+  "BTC","ETH","SOL","BNB","XRP","ADA","AVAX","DOT","MATIC","POL","LINK","UNI",
+  "ATOM","LTC","DOGE","SHIB","TRX","TON","SUI","APT","OP","ARB","INJ","SEI",
+  "TIA","JUP","WIF","BONK","PEPE","NEAR","FIL","ICP","HBAR","VET","ALGO","XLM",
+  "XMR","ETC","BCH","AAVE","CRV","MKR","SNX","LDO","RETH","STETH","WBTC","VVV","VULT",
+]);
+
+function isCrypto(symbol) {
+  // Strip exchange suffix: "BTC-USD" → "BTC", "ETH/USD" → "ETH"
+  const base = symbol.toUpperCase().replace(/-USD$/, "").replace(/\/USD$/, "");
+  return CRYPTO_TICKERS.has(base);
+}
 
 if (!PRIVATE_KEY) {
   console.error("[trader] AGENT_PRIVATE_KEY is required. Run: npm run setup");
@@ -149,9 +165,16 @@ console.log(`\n[trader] ══════════════════�
 console.log(`[trader] AgentSignal Trader — ${today}${isDryRun ? " [DRY RUN]" : ""}`);
 console.log(`[trader] ═══════════════════════════════════════`);
 
-const strategies = getActiveStrategies();
+const allStrategies = getActiveStrategies();
+const strategies = allStrategies.filter(s => {
+  if (cryptoOnly) return isCrypto(s.symbol);
+  if (stocksOnly) return !isCrypto(s.symbol);
+  return true;
+});
+
 if (!strategies.length) {
-  console.log("[trader] No active strategies. Activate one from the dashboard: npm run dashboard");
+  const scope = cryptoOnly ? "crypto" : stocksOnly ? "stock" : "active";
+  console.log(`[trader] No ${scope} strategies. Activate one from the dashboard: npm run dashboard`);
   process.exit(0);
 }
 

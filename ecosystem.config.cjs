@@ -7,11 +7,21 @@ module.exports = {
     {
       name: "trader",
       script: "node",
-      args: "trader.mjs",
+      // Stocks/ETFs: run once at market open (9:31 AM ET = 13:31 UTC), weekdays only
+      args: "trader.mjs --stocks-only",
       cwd: __dirname,
-      // 9:31 AM ET = 13:31 UTC on weekdays
-      // Adjust if you're running in a different timezone
       cron_restart: "31 13 * * 1-5",
+      autorestart: false,
+      watch: false,
+      env: { NODE_ENV: "production" },
+    },
+    {
+      name: "trader-crypto",
+      script: "node",
+      // Crypto: run every hour — markets are 24/7, react to signal flips same day
+      args: "trader.mjs --crypto-only",
+      cwd: __dirname,
+      cron_restart: "0 * * * *",
       autorestart: false,
       watch: false,
       env: { NODE_ENV: "production" },

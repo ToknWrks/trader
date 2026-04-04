@@ -29,29 +29,43 @@ const AGENT_SIGNAL_URL = process.env.AGENT_SIGNAL_URL ?? "https://agentsignal.ap
 
 // ── Schedule ──────────────────────────────────────────────────────────────────
 
-function parseSchedule() {
+function parseCron(cron) {
   try {
-    const content = readFileSync(resolve(__dirname, "ecosystem.config.cjs"), "utf8");
-    const match = content.match(/cron_restart:\s*["']([^"']+)["']/);
-    if (!match) return { cron: "—", label: "on schedule", detail: "Check ecosystem.config.cjs" };
-    const [, cron] = match;
     const [minute, hour, , , days] = cron.split(" ");
-    const utcH = parseInt(hour), utcM = parseInt(minute);
-    // Approximate ET (EDT = UTC-4, EST = UTC-5 — show both)
-    const edtH = utcH - 4, estH = utcH - 5;
-    const fmt = (h, m) => `${((h + 24) % 24) % 12 || 12}:${String(m).padStart(2,"0")} ${h % 24 >= 12 ? "PM" : "AM"}`;
+    const utcH = parseInt(hour);
+    if (isNaN(utcH)) {
+      // e.g. "0 * * * *" — hourly
+      return { label: "every hour", detail: `Cron: ${cron} — runs at the top of every hour, 24/7` };
+    }
+    const utcM = parseInt(minute);
+    const edtH = utcH - 4;
+    const fmt = (h, m) => `${((h + 24) % 24) % 12 || 12}:${String(m).padStart(2,"0")} ${((h + 24) % 24) >= 12 ? "PM" : "AM"}`;
     const daysLabel = days === "1-5" ? "weekdays" : days === "*" ? "every day" : `days ${days}`;
     return {
-      cron,
-      label: `${fmt(edtH, utcM)} ET / ${fmt(estH, utcM)} EST on ${daysLabel}`,
+      label: `${fmt(edtH, utcM)} ET on ${daysLabel}`,
       detail: `Cron: ${cron} — runs at ${hour}:${String(utcM).padStart(2,"0")} UTC on ${daysLabel}`,
     };
   } catch {
-    return { cron: "—", label: "on schedule", detail: "Could not read ecosystem.config.cjs" };
+    return { label: "on schedule", detail: `Cron: ${cron}` };
   }
 }
 
-const SCHEDULE = parseSchedule();
+function parseSchedules() {
+  try {
+    const content = readFileSync(resolve(__dirname, "ecosystem.config.cjs"), "utf8");
+    const matches = [...content.matchAll(/cron_restart:\s*["']([^"']+)["']/g)];
+    const stocksCron = matches[0]?.[1] ?? "31 13 * * 1-5";
+    const cryptoCron = matches[1]?.[1] ?? "0 * * * *";
+    return { stocks: parseCron(stocksCron), crypto: parseCron(cryptoCron) };
+  } catch {
+    return {
+      stocks: { label: "9:31 AM ET on weekdays", detail: "Stocks run at market open" },
+      crypto: { label: "every hour", detail: "Crypto runs hourly — 24/7 markets" },
+    };
+  }
+}
+
+const SCHEDULES = parseSchedules();
 
 import {
   getStrategies, getStrategy, upsertStrategy, setStrategyActive,
@@ -198,11 +212,17 @@ function shell(title, body, active = "") {
       <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">3.</span><span>If the signal has <strong>flipped</strong> (e.g. FLAT → LONG), a market order is placed on Hyperliquid.</span></div>
       <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">4.</span><span>If the signal hasn't changed, the trader holds — no order placed.</span></div>
     </div>
-    <div class="sched">⏱ Runs automatically: ${SCHEDULE.label}<br><span style="opacity:0.5">${SCHEDULE.detail}</span></div>
+    <div class="sched">
+      ⏱ <strong>Stocks/ETFs:</strong> ${SCHEDULES.stocks.label}<br>
+      ⏱ <strong>Crypto:</strong> ${SCHEDULES.crypto.label}<br>
+      <span style="opacity:0.5">Crypto runs hourly — 24/7 markets. Stocks run at market open.</span>
+    </div>
   </div>
 
   <script>
-    const SCHEDULE = ${JSON.stringify(SCHEDULE)};
+    const SCHEDULES = ${JSON.stringify(SCHEDULES)};
+    const CRYPTO_TICKERS = new Set(["BTC","ETH","SOL","BNB","XRP","ADA","AVAX","DOT","MATIC","POL","LINK","UNI","ATOM","LTC","DOGE","SHIB","TRX","TON","SUI","APT","OP","ARB","INJ","SEI","TIA","JUP","WIF","BONK","PEPE","NEAR","FIL","ICP","HBAR","VET","ALGO","XLM","XMR","ETC","BCH","AAVE","CRV","MKR","SNX","LDO","RETH","STETH","WBTC","VVV","VULT"]);
+    function isCrypto(symbol) { return CRYPTO_TICKERS.has(symbol.toUpperCase().replace(/-USD$/, "").replace(/\\/USD$/, "")); }
 
     function closeModal() {
       document.getElementById('toggleModal').classList.remove('open');
@@ -212,7 +232,8 @@ function shell(title, body, active = "") {
     });
 
     let _pendingToggle = null;
-    function showToggleModal(btn, id, active) {
+    function showToggleModal(btn, id, active, symbol) {
+      const sched = isCrypto(symbol) ? SCHEDULES.crypto : SCHEDULES.stocks;
       const title = active ? 'Activate Strategy' : 'Deactivate Strategy';
       const confirmClass = active ? 'modal-confirm-green' : 'modal-confirm-red';
       const confirmLabel = active ? 'Activate' : 'Deactivate';
@@ -225,7 +246,7 @@ function shell(title, body, active = "") {
           <div class="flow-step"><span class="num">3</span><span>If the signal has flipped (e.g. FLAT → LONG), it places a market order.</span></div>
           <div class="flow-step"><span class="num">4</span><span>If the signal hasn't changed, it holds — no order is placed.</span></div>
         </div>
-        <div class="modal-schedule">⏱ Next auto-run: \${SCHEDULE.label}<br><span style="opacity:0.6;font-size:0.7rem">\${SCHEDULE.detail}</span></div>
+        <div class="modal-schedule">⏱ Runs: \${sched.label}<br><span style="opacity:0.6;font-size:0.7rem">\${sched.detail}</span></div>
       \` : \`
         <p>The trader will <strong>stop executing trades</strong> for this strategy. Any open positions on Hyperliquid will remain open until you close them manually.</p>
       \`;
@@ -386,8 +407,8 @@ function strategiesPage() {
           </td>
           <td style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
             ${s.active
-              ? `<button class="btn btn-red" onclick="showToggleModal(this, '${s.id}', false)">Deactivate</button>`
-              : `<button class="btn btn-green" onclick="showToggleModal(this, '${s.id}', true)">Activate</button>`}
+              ? `<button class="btn btn-red" onclick="showToggleModal(this, '${s.id}', false, '${s.symbol}')">Deactivate</button>`
+              : `<button class="btn btn-green" onclick="showToggleModal(this, '${s.id}', true, '${s.symbol}')">Activate</button>`}
             ${sig !== "—" ? `<button class="btn ${execColor}" onclick="execStrategy(this, '${s.id}','${execLabel}','${sig === "FLAT" ? "close" : "open"}')">${execLabel}</button>` : ""}
             <button class="btn btn-red" onclick="deleteStrat('${s.id}')">Delete</button>
           </td>
