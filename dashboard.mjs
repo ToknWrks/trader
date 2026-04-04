@@ -192,11 +192,11 @@ function shell(title, body, active = "") {
   <!-- Status info popover -->
   <div class="info-popover" id="infoPopover">
     <strong>How it works</strong>
-    <div style="margin-top:0.5rem">
-      <div style="display:flex;gap:0.4rem;margin-bottom:0.3rem"><span style="color:#A8F1F7;font-weight:700">1.</span> Strategy activates — no order is placed yet.</div>
-      <div style="display:flex;gap:0.4rem;margin-bottom:0.3rem"><span style="color:#A8F1F7;font-weight:700">2.</span> Trader fetches the latest signal from agentsignal.app (pays $0.001 via x402).</div>
-      <div style="display:flex;gap:0.4rem;margin-bottom:0.3rem"><span style="color:#A8F1F7;font-weight:700">3.</span> If the signal has <strong>flipped</strong> (e.g. FLAT → LONG), a market order is placed on Hyperliquid.</div>
-      <div style="display:flex;gap:0.4rem"><span style="color:#A8F1F7;font-weight:700">4.</span> If signal hasn't changed, the trader holds and does nothing.</div>
+    <div style="margin-top:0.5rem;display:flex;flex-direction:column;gap:0.35rem">
+      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">1.</span><span>Strategy activates — no order is placed yet.</span></div>
+      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">2.</span><span>Trader fetches the latest signal from agentsignal.app (pays $0.001 via x402).</span></div>
+      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">3.</span><span>If the signal has <strong>flipped</strong> (e.g. FLAT → LONG), a market order is placed on Hyperliquid.</span></div>
+      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">4.</span><span>If the signal hasn't changed, the trader holds — no order placed.</span></div>
     </div>
     <div class="sched">⏱ Runs automatically: ${SCHEDULE.label}<br><span style="opacity:0.5">${SCHEDULE.detail}</span></div>
   </div>
