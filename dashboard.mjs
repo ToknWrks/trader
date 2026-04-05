@@ -77,7 +77,7 @@ import {
 
 const BASE_RPC = "https://mainnet.base.org";
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const X402_PRICE_USD = 0.001;
+const X402_PRICE_USD = 0.01;
 
 async function getBaseUsdcBalance(address) {
   try {
@@ -208,7 +208,7 @@ function shell(title, body, active = "") {
     <strong>How it works</strong>
     <div style="margin-top:0.5rem;display:flex;flex-direction:column;gap:0.35rem">
       <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">1.</span><span>Strategy activates — no order is placed yet.</span></div>
-      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">2.</span><span>Trader fetches the latest signal from agentsignal.app (pays $0.001 via x402).</span></div>
+      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">2.</span><span>Trader fetches the latest signal from agentsignal.app (pays $0.01 via x402).</span></div>
       <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">3.</span><span>If the signal has <strong>flipped</strong> (e.g. FLAT → LONG), a market order is placed on Hyperliquid.</span></div>
       <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">4.</span><span>If the signal hasn't changed, the trader holds — no order placed.</span></div>
     </div>

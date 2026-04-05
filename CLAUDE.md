@@ -49,7 +49,7 @@ Crypto strategies run hourly because Hyperliquid is a 24/7 market. Stock/ETF str
 
 ## Signal Flow
 
-1. Fetch signal from `AGENT_SIGNAL_URL/api/strategy/:id/signal` via x402 ($0.001 USDC on Base)
+1. Fetch signal from `AGENT_SIGNAL_URL/api/strategy/:id/signal` via x402 ($0.01 USDC on Base)
 2. Store in SQLite `signals` table
 3. Compare to prior signal — if unchanged, hold
 4. If flipped: FLAT→LONG = buy, LONG→FLAT = close, LONG→SHORT = close+short
@@ -63,7 +63,7 @@ Crypto strategies run hourly because Hyperliquid is a 24/7 market. Stock/ETF str
 
 ## x402 Payments
 
-- `$0.001` USDC per signal fetch, paid on Base mainnet
+- `$0.01` USDC per signal fetch, paid on Base mainnet
 - Requires USDC on Base at the `AGENT_PRIVATE_KEY` wallet address
 - Dashboard positions page shows current Base USDC balance + estimated total spend
 

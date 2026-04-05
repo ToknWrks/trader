@@ -9,7 +9,7 @@ Runs **locally on your machine or VPS**. Your private key never leaves your envi
 ```
 agentsignal.app          Your machine
 ────────────────         ──────────────────────────────
-Strategy signals   ←──  Fetches signal (pays $0.001 USDC via x402)
+Strategy signals   ←──  Fetches signal (pays $0.01 USDC via x402)
 COMPASS / RADAR          Executes on Hyperliquid perps
 Navigator                Local dashboard at localhost:4100
 ```
@@ -17,7 +17,7 @@ Navigator                Local dashboard at localhost:4100
 ## Requirements
 
 - Node.js 20+
-- A small amount of USDC on Base mainnet (for x402 signal payments — ~$0.001/day)
+- A small amount of USDC on Base mainnet (for x402 signal payments — ~$0.01/day)
 - A Hyperliquid account with funds
 
 ## Setup
@@ -77,4 +77,4 @@ Edit `ecosystem.config.cjs` to change the schedule.
 
 - Your `AGENT_PRIVATE_KEY` is stored in `.env` on your local machine only
 - The `.env` file and `data/` directory are in `.gitignore` — never committed
-- Signal fetches are paid with $0.001 USDC per request via the x402 protocol
+- Signal fetches are paid with $0.01 USDC per request via the x402 protocol
