@@ -187,8 +187,43 @@ function shell(title, body, active = "") {
       <a class="nav-link ${active === "strategies" ? "active" : ""}" href="/strategies">Strategies</a>
       <a class="nav-link ${active === "history" ? "active" : ""}" href="/history">History</a>
       <a class="nav-link" href="${AGENT_SIGNAL_URL}/navigator" target="_blank">Navigator ↗</a>
+      <span id="traderStatus" style="font-size:0.75rem;padding:0.25rem 0.75rem;border-radius:999px;border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.4);margin-left:0.5rem">checking…</span>
+      <button id="traderStartBtn" onclick="startTrader()" style="display:none;font-size:0.75rem;padding:0.25rem 0.75rem;border-radius:6px;border:1px solid rgba(168,241,247,0.3);background:rgba(168,241,247,0.08);color:#A8F1F7;cursor:pointer">▶ Start Trader</button>
     </div>
   </header>
+  <script>
+  async function checkTraderStatus() {
+    try {
+      const r = await fetch('/api/pm2-status');
+      const d = await r.json();
+      const pill = document.getElementById('traderStatus');
+      const btn = document.getElementById('traderStartBtn');
+      if (d.running) {
+        pill.textContent = '● Running';
+        pill.style.color = '#4ade80';
+        pill.style.borderColor = 'rgba(74,222,128,0.3)';
+        btn.style.display = 'none';
+      } else {
+        pill.textContent = '○ Stopped';
+        pill.style.color = 'rgba(255,255,255,0.4)';
+        pill.style.borderColor = 'rgba(255,255,255,0.1)';
+        btn.style.display = 'inline-block';
+      }
+    } catch { }
+  }
+  async function startTrader() {
+    const btn = document.getElementById('traderStartBtn');
+    btn.textContent = 'Starting…';
+    btn.disabled = true;
+    try {
+      await fetch('/api/pm2-start', { method: 'POST' });
+      setTimeout(checkTraderStatus, 2000);
+    } catch { }
+    finally { btn.disabled = false; }
+  }
+  checkTraderStatus();
+  setInterval(checkTraderStatus, 30000);
+  </script>
   <div class="container">${body}</div>
 
   <!-- Activate/Deactivate modal -->
@@ -648,6 +683,32 @@ const server = createServer(async (req, res) => {
       const body = await readBody();
       return json(await handleExecute(body).catch(e => ({ ok: false, error: e.message })));
     }
+    if (url === "/api/pm2-status" && method === "GET") {
+      try {
+        const { execSync } = await import("child_process");
+        const out = execSync("pm2 jlist 2>/dev/null", { encoding: "utf8" });
+        const list = JSON.parse(out);
+        const running = list.some(p =>
+          (p.name === "trader" || p.name === "trader-crypto") &&
+          p.pm2_env?.status === "online"
+        );
+        return json({ running });
+      } catch {
+        return json({ running: false });
+      }
+    }
+
+    if (url === "/api/pm2-start" && method === "POST") {
+      try {
+        const { execSync } = await import("child_process");
+        execSync("pm2 start ecosystem.config.cjs", { cwd: __dirname, encoding: "utf8" });
+        execSync("pm2 save", { encoding: "utf8" });
+        return json({ ok: true });
+      } catch (e) {
+        return json({ ok: false, error: e.message }, 500);
+      }
+    }
+
     if (url.startsWith("/api/strategy/") && method === "DELETE") {
       const id = url.replace("/api/strategy/", "");
       deleteStrategy(id);
