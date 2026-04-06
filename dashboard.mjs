@@ -216,9 +216,20 @@ function shell(title, body, active = "") {
     btn.textContent = 'Starting…';
     btn.disabled = true;
     try {
-      await fetch('/api/pm2-start', { method: 'POST' });
-      setTimeout(checkTraderStatus, 2000);
-    } catch { }
+      const r = await fetch('/api/pm2-start', { method: 'POST' });
+      const d = await r.json();
+      if (d.ok) {
+        btn.textContent = '✓ Started';
+        btn.style.color = '#4ade80';
+        setTimeout(() => { btn.textContent = '▶ Start Trader'; btn.style.color = '#A8F1F7'; checkTraderStatus(); }, 3000);
+      } else {
+        btn.textContent = '✗ Failed';
+        setTimeout(() => { btn.textContent = '▶ Start Trader'; }, 3000);
+      }
+    } catch {
+      btn.textContent = '✗ Error';
+      setTimeout(() => { btn.textContent = '▶ Start Trader'; }, 3000);
+    }
     finally { btn.disabled = false; }
   }
   checkTraderStatus();
