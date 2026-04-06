@@ -254,21 +254,8 @@ function shell(title, body, active = "") {
     </div>
   </div>
 
-  <!-- Status info popover -->
-  <div class="info-popover" id="infoPopover">
-    <strong>How it works</strong>
-    <div style="margin-top:0.5rem;display:flex;flex-direction:column;gap:0.35rem">
-      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">1.</span><span>Strategy activates — no order is placed yet.</span></div>
-      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">2.</span><span>Trader fetches the latest signal from agentsignal.app (pays $0.01 via x402).</span></div>
-      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">3.</span><span>If the signal has <strong>flipped</strong> (e.g. FLAT → LONG), a market order is placed on Hyperliquid.</span></div>
-      <div style="display:flex;gap:0.5rem"><span style="color:#A8F1F7;font-weight:700;min-width:1rem">4.</span><span>If the signal hasn't changed, the trader holds — no order placed.</span></div>
-    </div>
-    <div class="sched">
-      ⏱ <strong>Stocks/ETFs:</strong> ${SCHEDULES.stocks.label}<br>
-      ⏱ <strong>Crypto:</strong> ${SCHEDULES.crypto.label}<br>
-      <span style="opacity:0.5">Crypto runs hourly — 24/7 markets. Stocks run at market open.</span>
-    </div>
-  </div>
+  <!-- Strategy info popover -->
+  <div class="info-popover" id="infoPopover"></div>
 
   <script>
     const SCHEDULES = ${JSON.stringify(SCHEDULES)};
@@ -319,9 +306,25 @@ function shell(title, body, active = "") {
       else { btn.disabled = false; btn.textContent = active ? 'Activate' : 'Deactivate'; alert(d.error); }
     });
 
-    function toggleInfoPopover(btn) {
+    function renderCond(c) { return '<span style="color:#A8F1F7">' + c.source + '</span> ' + c.field + ' ' + c.op + ' ' + c.value; }
+    function renderRules(rs) { return rs.conditions.map(renderCond).join(' <span style="opacity:0.5">' + rs.operator + '</span> '); }
+    function showStrategyInfo(stratJson) {
+      const s = JSON.parse(stratJson);
+      const sched = isCrypto(s.symbol) ? SCHEDULES.crypto : SCHEDULES.stocks;
+      const entry = renderRules(typeof s.entry === 'string' ? JSON.parse(s.entry) : s.entry);
+      const exit = renderRules(typeof s.exit === 'string' ? JSON.parse(s.exit) : s.exit);
+      const size = s.position_size_usd ? '$' + s.position_size_usd : 'default size';
       const pop = document.getElementById('infoPopover');
+      pop.innerHTML = '<strong>' + s.name + '</strong>'
+        + '<div style="margin:0.4rem 0 0;font-family:monospace;font-size:0.7rem;color:rgba(255,255,255,0.35);word-break:break-all">' + s.id + '</div>'
+        + '<div style="margin-top:0.75rem;display:flex;flex-direction:column;gap:0.4rem">'
+        + '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Symbol</span><br>' + s.symbol + ' · ' + s.leverage + 'x · ' + size + '</div>'
+        + '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Entry</span><br>' + entry + '</div>'
+        + '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Exit</span><br>' + exit + '</div>'
+        + '</div>'
+        + '<div class="sched">⏱ ' + sched.label + '</div>';
       if (pop.classList.contains('open')) { pop.classList.remove('open'); return; }
+      const btn = event.target.closest('.info-btn');
       const rect = btn.getBoundingClientRect();
       pop.style.top = (rect.bottom + 8 + window.scrollY) + 'px';
       pop.style.left = Math.min(rect.left, window.innerWidth - 340) + 'px';
@@ -333,6 +336,15 @@ function shell(title, body, active = "") {
         pop.classList.remove('open');
       }
     });
+
+    async function copyId(id, btn) {
+      await navigator.clipboard.writeText(id);
+      const orig = btn.textContent;
+      btn.textContent = '✓';
+      btn.style.color = '#4ade80';
+      btn.style.borderColor = 'rgba(74,222,128,0.3)';
+      setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.style.borderColor = ''; }, 1500);
+    }
   </script>
 </body>
 </html>`;
@@ -446,7 +458,12 @@ function strategiesPage() {
         const execLabel = sig === "LONG" ? `Open Long (${s.leverage}x)` : sig === "SHORT" ? `Open Short (${s.leverage}x)` : sig === "FLAT" ? "Close Position" : "Execute";
         const execColor = sig === "LONG" ? "btn-green" : sig === "SHORT" ? "btn-red" : "btn-red";
         return `<tr>
-          <td><strong>${s.name}</strong><br><span style="font-size:0.7rem;color:rgba(255,255,255,0.3)">${s.id.slice(0,8)}...</span></td>
+          <td>
+            <strong>${s.name}</strong>
+            <br>
+            <span style="font-size:0.7rem;color:rgba(255,255,255,0.3);font-family:monospace">${s.id.slice(0,8)}…</span>
+            <button onclick="copyId('${s.id}', this)" style="background:none;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:rgba(255,255,255,0.35);cursor:pointer;font-size:0.6rem;padding:0.1rem 0.35rem;margin-left:0.25rem;vertical-align:middle" title="Copy full ID">copy</button>
+          </td>
           <td class="cyan">${s.symbol}</td>
           <td>${sig !== "—" ? `<span class="${sigClass}">${sig}</span>` : "—"}${latest?.date ? `<br><span style="font-size:0.65rem;color:rgba(255,255,255,0.25)">${latest.date}</span>` : ""}</td>
           <td>${s.position_size_usd ? "$" + s.position_size_usd : `$${process.env.HL_POSITION_SIZE_USD ?? 10} <span style="font-size:0.65rem;color:rgba(255,255,255,0.3)">(default)</span>`}</td>
@@ -455,6 +472,7 @@ function strategiesPage() {
             ${s.active
               ? `<span class="badge-active">● ACTIVE</span>`
               : `<span class="badge-inactive">○ INACTIVE</span>`}
+            <button class="info-btn" onclick="showStrategyInfo(${JSON.stringify(JSON.stringify(s))})" title="Strategy details"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
           </td>
           <td style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
             ${s.active
@@ -474,7 +492,7 @@ function strategiesPage() {
     </div>
     <div class="card">
       <table>
-        <thead><tr><th>Strategy</th><th>Symbol</th><th>Signal</th><th>Size</th><th>Leverage</th><th>Status <button class="info-btn" onclick="toggleInfoPopover(this)" title="How it works"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></th><th>Actions</th></tr></thead>
+        <thead><tr><th>Strategy</th><th>Symbol</th><th>Signal</th><th>Size</th><th>Leverage</th><th>Status</th><th>Actions</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
