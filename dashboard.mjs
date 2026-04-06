@@ -203,8 +203,13 @@ function shell(title, body, active = "") {
         pill.style.color = '#4ade80';
         pill.style.borderColor = 'rgba(74,222,128,0.3)';
         btn.style.display = 'none';
+      } else if (d.scheduled) {
+        pill.textContent = '● Scheduled';
+        pill.style.color = '#A8F1F7';
+        pill.style.borderColor = 'rgba(168,241,247,0.3)';
+        btn.style.display = 'none';
       } else {
-        pill.textContent = '○ Stopped';
+        pill.textContent = '○ Not started';
         pill.style.color = 'rgba(255,255,255,0.4)';
         pill.style.borderColor = 'rgba(255,255,255,0.1)';
         btn.style.display = 'inline-block';
@@ -703,11 +708,14 @@ const server = createServer(async (req, res) => {
           });
         });
         const list = JSON.parse(out);
+        const scheduled = list.some(p =>
+          (p.name === "trader" || p.name === "trader-crypto")
+        );
         const running = list.some(p =>
           (p.name === "trader" || p.name === "trader-crypto") &&
           p.pm2_env?.status === "online"
         );
-        return json({ running });
+        return json({ scheduled, running });
       } catch {
         return json({ running: false });
       }
