@@ -706,7 +706,7 @@ const server = createServer(async (req, res) => {
       try {
         const { exec } = await import("child_process");
         await new Promise((resolve, reject) => {
-          exec(`/opt/homebrew/bin/pm2 start ${__dirname}/ecosystem.config.cjs --only trader,trader-crypto`, { timeout: 15000 }, (err) => {
+          exec(`/opt/homebrew/bin/pm2 restart trader trader-crypto`, { timeout: 15000 }, (err) => {
             if (err) reject(err); else resolve();
           });
         });
