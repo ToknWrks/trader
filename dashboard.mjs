@@ -686,7 +686,7 @@ const server = createServer(async (req, res) => {
     if (url === "/api/pm2-status" && method === "GET") {
       try {
         const { execSync } = await import("child_process");
-        const out = execSync("pm2 jlist 2>/dev/null", { encoding: "utf8" });
+        const out = execSync("/opt/homebrew/bin/pm2 jlist 2>/dev/null", { encoding: "utf8" });
         const list = JSON.parse(out);
         const running = list.some(p =>
           (p.name === "trader" || p.name === "trader-crypto") &&
@@ -701,8 +701,8 @@ const server = createServer(async (req, res) => {
     if (url === "/api/pm2-start" && method === "POST") {
       try {
         const { execSync } = await import("child_process");
-        execSync("pm2 start ecosystem.config.cjs", { cwd: __dirname, encoding: "utf8" });
-        execSync("pm2 save", { encoding: "utf8" });
+        execSync("/opt/homebrew/bin/pm2 start ecosystem.config.cjs", { cwd: __dirname, encoding: "utf8" });
+        execSync("/opt/homebrew/bin/pm2 save", { encoding: "utf8" });
         return json({ ok: true });
       } catch (e) {
         return json({ ok: false, error: e.message }, 500);
