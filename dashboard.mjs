@@ -639,7 +639,7 @@ function strategiesPage() {
         const latest = getLatestSignal(s.id);
         const sig = latest?.signal ?? "—";
         const sigClass = sig === "LONG" ? "badge-long" : sig === "SHORT" ? "badge-short" : "badge-flat";
-        const size = s.position_size_usd ? "$" + s.position_size_usd : "$" + (process.env.HL_POSITION_SIZE_USD ?? 10);
+        const size = s.position_size_usd ? "$" + s.position_size_usd : "$" + (process.env.HL_POSITION_SIZE_USD ?? 10) + " (default)";
         const tv = tvSymbol(s.symbol);
         const sdJson = JSON.stringify(s).replace(/"/g, '&quot;');
         return `
@@ -913,9 +913,12 @@ function settingsPage(saved = false, error = "") {
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:1rem;margin-bottom:1rem">
 
 
+        ${section("General", "⚙️", `
+          ${field("Default Position Size (USD)", "HL_POSITION_SIZE_USD", val("HL_POSITION_SIZE_USD") || "10", "text", "Per-trade size used when a strategy has no size override")}
+        `)}
+
         ${section("Hyperliquid", "⚡", `
           ${field("Private Key", "AGENT_PRIVATE_KEY", val("AGENT_PRIVATE_KEY"), "password", "0x-prefixed EVM key — trading + x402 payments")}
-          ${field("Default Position Size (USD)", "HL_POSITION_SIZE_USD", val("HL_POSITION_SIZE_USD") || "10", "text", "Per-trade size when strategy has no override")}
           <div id="walletInfo" style="font-size:0.72rem;color:rgba(255,255,255,0.3);padding:0.5rem 0.75rem;background:rgba(255,255,255,0.03);border-radius:6px;display:none">
             Wallet: <span id="walletAddr" style="font-family:monospace;color:rgba(168,241,247,0.7)"></span>
           </div>
