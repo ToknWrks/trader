@@ -18,10 +18,10 @@ module.exports = {
     {
       name: "trader-crypto",
       script: "node",
-      // Crypto: run every hour — markets are 24/7, react to signal flips same day
+      // Crypto: heartbeat every 5 min — each strategy runs on its own interval
       args: "trader.mjs --crypto-only",
       cwd: __dirname,
-      cron_restart: "0 * * * *",
+      cron_restart: "*/5 * * * *",
       autorestart: false,
       watch: false,
       env: { NODE_ENV: "production" },

@@ -23,6 +23,9 @@ db.exec(`
     symbol            TEXT NOT NULL DEFAULT 'BTC-USD',
     leverage          INTEGER NOT NULL DEFAULT 1,
     position_size_usd REAL,
+    exchange          TEXT NOT NULL DEFAULT 'hyperliquid',
+    interval_minutes  INTEGER NOT NULL DEFAULT 60,
+    last_run_at       TEXT,
     active            INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -47,6 +50,7 @@ db.exec(`
     size        REAL,
     price       REAL,
     leverage    INTEGER,
+    pnl         REAL,
     result_json TEXT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -66,16 +70,89 @@ export function getStrategy(id) {
   return db.prepare("SELECT * FROM strategies WHERE id = ?").get(id);
 }
 
-export function upsertStrategy({ id, name, symbol, leverage, position_size_usd }) {
+export function upsertStrategy({ id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct }) {
   db.prepare(`
-    INSERT INTO strategies (id, name, symbol, leverage, position_size_usd)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO strategies (id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       symbol = excluded.symbol,
       leverage = excluded.leverage,
-      position_size_usd = excluded.position_size_usd
-  `).run(id, name, symbol, leverage ?? 1, position_size_usd ?? null);
+      position_size_usd = excluded.position_size_usd,
+      exchange = excluded.exchange,
+      interval_minutes = excluded.interval_minutes,
+      tp_pct = excluded.tp_pct,
+      trail_pct = excluded.trail_pct
+  `).run(id, name, symbol, leverage ?? 1, position_size_usd ?? null, exchange ?? "hyperliquid", interval_minutes ?? 60, tp_pct ?? null, trail_pct ?? null);
+}
+
+export function touchStrategyRun(id) {
+  db.prepare("UPDATE strategies SET last_run_at = datetime('now') WHERE id = ?").run(id);
+}
+
+export function isStrategyDue(id) {
+  const s = db.prepare("SELECT interval_minutes, last_run_at FROM strategies WHERE id = ?").get(id);
+  if (!s) return false;
+  if (!s.last_run_at) return true;
+  const elapsed = (Date.now() - new Date(s.last_run_at + "Z").getTime()) / 60000;
+  return elapsed >= s.interval_minutes;
+}
+
+// Migrate existing DB
+try { db.exec("ALTER TABLE strategies ADD COLUMN exchange TEXT NOT NULL DEFAULT 'hyperliquid'"); } catch {}
+try { db.exec("ALTER TABLE strategies ADD COLUMN interval_minutes INTEGER NOT NULL DEFAULT 60"); } catch {}
+try { db.exec("ALTER TABLE strategies ADD COLUMN last_run_at TEXT"); } catch {}
+try { db.exec("ALTER TABLE strategies ADD COLUMN tp_pct REAL"); } catch {}
+try { db.exec("ALTER TABLE strategies ADD COLUMN trail_pct REAL"); } catch {}
+
+// ── TP / Trail state (one row per open position) ──────────────────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tp_state (
+    strategy_id   TEXT PRIMARY KEY,
+    entry_price   REAL NOT NULL,
+    tp_price      REAL NOT NULL,
+    trail_pct     REAL NOT NULL,
+    trail_mode    INTEGER NOT NULL DEFAULT 0,
+    high_water    REAL,
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+export function setTpState({ strategy_id, entry_price, tp_price, trail_pct }) {
+  db.prepare(`
+    INSERT INTO tp_state (strategy_id, entry_price, tp_price, trail_pct, trail_mode, high_water)
+    VALUES (?, ?, ?, ?, 0, NULL)
+    ON CONFLICT(strategy_id) DO UPDATE SET
+      entry_price = excluded.entry_price,
+      tp_price    = excluded.tp_price,
+      trail_pct   = excluded.trail_pct,
+      trail_mode  = 0,
+      high_water  = NULL,
+      updated_at  = datetime('now')
+  `).run(strategy_id, entry_price, tp_price, trail_pct);
+}
+
+export function getTpState(strategy_id) {
+  return db.prepare("SELECT * FROM tp_state WHERE strategy_id = ?").get(strategy_id);
+}
+
+export function updateTpTrailMode(strategy_id, high_water) {
+  db.prepare(`
+    UPDATE tp_state SET trail_mode = 1, high_water = ?, updated_at = datetime('now')
+    WHERE strategy_id = ?
+  `).run(high_water, strategy_id);
+}
+
+export function updateTpHighWater(strategy_id, high_water) {
+  db.prepare(`
+    UPDATE tp_state SET high_water = ?, updated_at = datetime('now')
+    WHERE strategy_id = ?
+  `).run(high_water, strategy_id);
+}
+
+export function clearTpState(strategy_id) {
+  db.prepare("DELETE FROM tp_state WHERE strategy_id = ?").run(strategy_id);
 }
 
 export function setStrategyActive(id, active) {
@@ -86,16 +163,52 @@ export function deleteStrategy(id) {
   db.prepare("DELETE FROM strategies WHERE id = ?").run(id);
 }
 
-// ── Signals ───────────────────────────────────────────────────────────────────
+// ── Signal events (flip history feed) ────────────────────────────────────────
+
+try {
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS signal_events (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      strategy_id TEXT NOT NULL,
+      signal      TEXT NOT NULL,
+      prev_signal TEXT,
+      price       REAL,
+      notes       TEXT,
+      created_at  TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+} catch {}
+
+export function insertSignalEvent({ strategy_id, signal, prev_signal, price, notes }) {
+  db.prepare(`
+    INSERT INTO signal_events (strategy_id, signal, prev_signal, price, notes)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(strategy_id, signal, prev_signal ?? null, price ?? null, notes ?? null);
+}
+
+export function getRecentSignalEvents(hours = 48) {
+  return db.prepare(`
+    SELECT e.*, s.name as strategy_name, s.symbol, s.leverage
+    FROM signal_events e
+    JOIN strategies s ON s.id = e.strategy_id
+    WHERE e.created_at >= datetime('now', '-${hours} hours')
+    ORDER BY e.created_at DESC
+  `).all();
+}
+
+// ── Signals (current state — one row per strategy per day) ────────────────────
 
 export function upsertSignal({ strategy_id, date, signal, price, notes }) {
+  // Add updated_at column if it doesn't exist yet
+  try { db.prepare("ALTER TABLE signals ADD COLUMN updated_at TEXT").run(); } catch {}
   db.prepare(`
-    INSERT INTO signals (strategy_id, date, signal, price, notes)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO signals (strategy_id, date, signal, price, notes, updated_at)
+    VALUES (?, ?, ?, ?, ?, datetime('now'))
     ON CONFLICT(strategy_id, date) DO UPDATE SET
       signal = excluded.signal,
       price = excluded.price,
-      notes = excluded.notes
+      notes = excluded.notes,
+      updated_at = datetime('now')
   `).run(strategy_id, date, signal, price ?? null, notes ?? null);
 }
 
@@ -117,6 +230,42 @@ export function countSignals() {
   return db.prepare("SELECT COUNT(*) as total FROM signals").get().total;
 }
 
+// ── Signal fetch log (one row per actual x402 call) ───────────────────────────
+
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS signal_fetches (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      strategy_id TEXT NOT NULL,
+      network     TEXT,
+      cost_usd    REAL NOT NULL DEFAULT 0.01,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+} catch {}
+
+export function logFetch({ strategy_id, network, cost_usd = 0.01 }) {
+  db.prepare(`
+    INSERT INTO signal_fetches (strategy_id, network, cost_usd)
+    VALUES (?, ?, ?)
+  `).run(strategy_id, network ?? null, cost_usd);
+}
+
+export function countFetchesToday() {
+  return db.prepare(`
+    SELECT COUNT(*) as total, COALESCE(SUM(cost_usd), 0) as spend
+    FROM signal_fetches
+    WHERE date(created_at) = date('now')
+  `).get();
+}
+
+export function countFetchesTotal() {
+  return db.prepare(`
+    SELECT COUNT(*) as total, COALESCE(SUM(cost_usd), 0) as spend
+    FROM signal_fetches
+  `).get();
+}
+
 export function getSignalHistory(strategy_id, limit = 30) {
   return db.prepare(`
     SELECT * FROM signals WHERE strategy_id = ?
@@ -124,14 +273,27 @@ export function getSignalHistory(strategy_id, limit = 30) {
   `).all(strategy_id, limit);
 }
 
+export function getRecentSignals(hours = 48) {
+  return db.prepare(`
+    SELECT sig.*, s.name as strategy_name, s.symbol, s.leverage
+    FROM signals sig
+    JOIN strategies s ON s.id = sig.strategy_id
+    WHERE sig.created_at >= datetime('now', '-${hours} hours')
+    ORDER BY sig.created_at DESC
+  `).all();
+}
+
 // ── Trades ────────────────────────────────────────────────────────────────────
 
-export function insertTrade({ strategy_id, action, asset, size, price, leverage, result }) {
+export function insertTrade({ strategy_id, action, asset, size, price, leverage, pnl, result }) {
   db.prepare(`
-    INSERT INTO trades (strategy_id, action, asset, size, price, leverage, result_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(strategy_id, action, asset, size ?? null, price ?? null, leverage ?? null, result ? JSON.stringify(result) : null);
+    INSERT INTO trades (strategy_id, action, asset, size, price, leverage, pnl, result_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(strategy_id, action, asset, size ?? null, price ?? null, leverage ?? null, pnl ?? null, result ? JSON.stringify(result) : null);
 }
+
+// Migrate existing DB: add pnl column if it doesn't exist yet
+try { db.exec("ALTER TABLE trades ADD COLUMN pnl REAL"); } catch {}
 
 export function getTradeHistory(strategy_id, limit = 30) {
   return db.prepare(`
