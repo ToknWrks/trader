@@ -5,7 +5,7 @@
  */
 
 import { createServer } from "http";
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -25,7 +25,7 @@ function loadEnv() {
 loadEnv();
 
 const PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY;
-const AGENT_SIGNAL_URL = process.env.AGENT_SIGNAL_URL ?? "https://agentsignal.app";
+function getSignalUrl() { return process.env.AGENT_SIGNAL_URL ?? "https://agentsignal.app"; }
 
 // ── Schedule ──────────────────────────────────────────────────────────────────
 
@@ -70,24 +70,51 @@ const SCHEDULES = parseSchedules();
 import {
   getStrategies, getStrategy, upsertStrategy, setStrategyActive,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
-  countSignals,
+  countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents,
 } from "./db.mjs";
 
-// ── Base USDC balance ─────────────────────────────────────────────────────────
+// ── x402 network config ───────────────────────────────────────────────────────
 
-const BASE_RPC = "https://mainnet.base.org";
-const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const X402_NETWORKS = {
+  "eip155:8453":  { label: "Base",               viemChain: "base",        rpc: "https://mainnet.base.org" },
+  "eip155:1":     { label: "Ethereum",            viemChain: "mainnet",     rpc: "https://eth.llamarpc.com" },
+  "eip155:42161": { label: "Arbitrum",            viemChain: "arbitrum",    rpc: "https://arb1.arbitrum.io/rpc" },
+  "eip155:137":   { label: "Polygon",             viemChain: "polygon",     rpc: "https://polygon-rpc.com" },
+  "eip155:43114": { label: "Avalanche",           viemChain: "avalanche",   rpc: "https://api.avax.network/ext/bc/C/rpc" },
+  "eip155:84532": { label: "Base Sepolia (test)", viemChain: "baseSepolia", rpc: "https://sepolia.base.org" },
+};
+
+function getPaymentNetwork() {
+  return process.env.X402_PAYMENT_NETWORK || "eip155:8453";
+}
+
+// ── Network-aware USDC balance ────────────────────────────────────────────────
+
 const X402_PRICE_USD = 0.01;
 
-async function getBaseUsdcBalance(address) {
+// USDC contract addresses per network
+const USDC_ADDRESSES = {
+  "eip155:8453":  "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // Base
+  "eip155:1":     "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // Ethereum
+  "eip155:42161": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", // Arbitrum
+  "eip155:137":   "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", // Polygon
+  "eip155:43114": "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E", // Avalanche
+  "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e", // Base Sepolia
+};
+
+async function getNetworkUsdcBalance(address) {
+  const network = getPaymentNetwork();
+  const networkCfg = X402_NETWORKS[network];
+  const usdcAddress = USDC_ADDRESSES[network];
+  if (!networkCfg || !usdcAddress) return null;
   try {
     const padded = address.toLowerCase().replace("0x", "").padStart(64, "0");
-    const res = await fetch(BASE_RPC, {
+    const res = await fetch(networkCfg.rpc, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         jsonrpc: "2.0", id: 1, method: "eth_call",
-        params: [{ to: USDC_BASE, data: "0x70a08231" + padded }, "latest"],
+        params: [{ to: usdcAddress, data: "0x70a08231" + padded }, "latest"],
       }),
     });
     const { result } = await res.json();
@@ -154,6 +181,10 @@ strong { color: #fafafa; }
 .modal-confirm-green:hover { background:rgba(74,222,128,0.2); }
 .modal-confirm-red { background:rgba(248,113,113,0.12); border:1px solid rgba(248,113,113,0.35); color:#f87171; border-radius:7px; padding:0.45rem 1rem; font-size:0.82rem; font-weight:600; cursor:pointer; }
 .modal-confirm-red:hover { background:rgba(248,113,113,0.2); }
+.network-card { display:flex; align-items:center; justify-content:space-between; padding:0.65rem 0.9rem; border:1px solid rgba(255,255,255,0.08); border-radius:8px; cursor:pointer; font-size:0.82rem; color:rgba(255,255,255,0.6); transition:border-color 0.15s,background 0.15s; }
+.network-card:hover { border-color:rgba(255,255,255,0.18); background:rgba(255,255,255,0.03); }
+.network-card.selected { border-color:rgba(168,241,247,0.5); background:rgba(168,241,247,0.06); color:#fafafa; }
+.network-card.selected::after { content:"✓"; color:#A8F1F7; font-weight:700; font-size:0.85rem; }
 .info-btn { background:none; border:none; color:#A8F1F7; cursor:pointer; padding:0 0.35rem; vertical-align:middle; transition:opacity 0.15s; line-height:1; }
 .info-btn:hover { opacity:0.7; }
 .info-btn svg { display:inline-block; vertical-align:middle; }
@@ -165,6 +196,31 @@ strong { color: #fafafa; }
 .pos-short { background: rgba(248,113,113,0.1); color: #f87171; border: 1px solid rgba(248,113,113,0.25); padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.75rem; font-weight: 700; }
 input, select { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; color: #e4e4e7; padding: 0.4rem 0.6rem; font-size: 0.8rem; outline: none; }
 input:focus, select:focus { border-color: rgba(168,241,247,0.4); }
+.acc-item { border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; margin-bottom: 0.75rem; overflow: hidden; }
+.acc-header { padding: 0.9rem 1.1rem; cursor: pointer; display: flex; align-items: center; gap: 0.75rem; background: rgba(255,255,255,0.03); user-select: none; }
+.acc-header:hover { background: rgba(255,255,255,0.06); }
+.acc-item.open { border-color: rgba(168,241,247,0.2); }
+.acc-item.open .acc-header { background: rgba(168,241,247,0.04); }
+.acc-chevron { color: rgba(255,255,255,0.3); transition: transform 0.2s; flex-shrink: 0; }
+.acc-item.open .acc-chevron { transform: rotate(180deg); }
+.acc-body { border-top: 1px solid rgba(255,255,255,0.08); display: none; }
+.acc-item.open .acc-body { display: block; }
+.notif-feed { display: flex; flex-direction: column; gap: 0.5rem; }
+.notif { display: flex; align-items: center; gap: 0.85rem; padding: 0.75rem 1rem; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; }
+.notif-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.notif-dot.long  { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.5); }
+.notif-dot.flat  { background: rgba(255,255,255,0.25); }
+.notif-dot.short { background: #f87171; box-shadow: 0 0 6px rgba(248,113,113,0.5); }
+.notif-body { flex: 1; min-width: 0; }
+.notif-top { display: flex; align-items: baseline; gap: 0.5rem; }
+.notif-name { font-size: 0.82rem; font-weight: 600; color: #fafafa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.notif-sig { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.05em; padding: 0.1rem 0.45rem; border-radius: 4px; }
+.notif-sig.long  { background: rgba(74,222,128,0.12); color: #4ade80; border: 1px solid rgba(74,222,128,0.25); }
+.notif-sig.flat  { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.4); border: 1px solid rgba(255,255,255,0.1); }
+.notif-sig.short { background: rgba(248,113,113,0.12); color: #f87171; border: 1px solid rgba(248,113,113,0.25); }
+.notif-meta { font-size: 0.72rem; color: rgba(255,255,255,0.35); margin-top: 0.2rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.notif-price { font-size: 0.82rem; color: rgba(255,255,255,0.5); flex-shrink: 0; text-align: right; }
+.notif-time { font-size: 0.68rem; color: rgba(255,255,255,0.25); }
 `;
 
 function shell(title, body, active = "") {
@@ -174,19 +230,22 @@ function shell(title, body, active = "") {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>${title} — AgentSignal Trader</title>
+  <link rel="icon" href="${getSignalUrl()}/icon.png" type="image/png" />
   <style>${CSS}</style>
 </head>
 <body>
   <header>
     <div class="logo">
-      <img src="${AGENT_SIGNAL_URL}/agentsignal-logo.png" alt="" onerror="this.style.display='none'" />
+      <img src="${getSignalUrl()}/icon.png" alt="" onerror="this.style.display='none'" />
       AgentSignal Trader
     </div>
     <div class="nav-links">
       <a class="nav-link ${active === "positions" ? "active" : ""}" href="/positions">Positions</a>
       <a class="nav-link ${active === "strategies" ? "active" : ""}" href="/strategies">Strategies</a>
+      <a class="nav-link ${active === "signals" ? "active" : ""}" href="/signals">Signals</a>
       <a class="nav-link ${active === "history" ? "active" : ""}" href="/history">History</a>
-      <a class="nav-link" href="${AGENT_SIGNAL_URL}/navigator" target="_blank">Navigator ↗</a>
+      <a class="nav-link ${active === "settings" ? "active" : ""}" href="/settings">Settings</a>
+      <a class="nav-link" href="${getSignalUrl()}/navigator" target="_blank">Navigator ↗</a>
       <span id="traderStatus" style="font-size:0.75rem;padding:0.25rem 0.75rem;border-radius:999px;border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.4);margin-left:0.5rem">checking…</span>
       <button id="traderStartBtn" onclick="startTrader()" style="display:none;font-size:0.75rem;padding:0.25rem 0.75rem;border-radius:6px;border:1px solid rgba(168,241,247,0.3);background:rgba(168,241,247,0.08);color:#A8F1F7;cursor:pointer">▶ Start Trader</button>
     </div>
@@ -254,6 +313,49 @@ function shell(title, body, active = "") {
     </div>
   </div>
 
+  <!-- Run strategy modal -->
+  <div class="modal-overlay" id="runModal">
+    <div class="modal">
+      <div class="modal-title" id="runModalTitle"></div>
+      <div class="modal-body" id="runModalBody"></div>
+      <div class="modal-actions">
+        <button class="modal-cancel" onclick="document.getElementById('runModal').classList.remove('open')">Cancel</button>
+        <button id="runModalConfirm" class="modal-confirm-green">▶ Run Now</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Open position modal -->
+  <div class="modal-overlay" id="openModal">
+    <div class="modal">
+      <div class="modal-title" id="openModalTitle"></div>
+      <div class="modal-body" id="openModalBody"></div>
+      <div class="modal-actions">
+        <button class="modal-cancel" onclick="document.getElementById('openModal').classList.remove('open')">Cancel</button>
+        <button id="openModalConfirm" class="modal-confirm-green">Place Order</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Network picker modal -->
+  <div class="modal-overlay" id="networkModal" onclick="if(event.target===this)document.getElementById('networkModal').classList.remove('open')">
+    <div class="modal" style="max-width:380px">
+      <div class="modal-title">Payment Network</div>
+      <div class="modal-body">
+        Select the chain your wallet holds USDC on.
+        <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:1rem">
+          ${Object.entries(X402_NETWORKS).map(([id, n]) =>
+            `<div class="network-card" data-network-id="${id}" onclick="selectNetwork('${id}')">${n.label}</div>`
+          ).join("")}
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-cancel" onclick="document.getElementById('networkModal').classList.remove('open')">Cancel</button>
+        <button class="modal-confirm-green" onclick="confirmNetwork()">Confirm</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Strategy info popover -->
   <div class="info-popover" id="infoPopover"></div>
 
@@ -265,6 +367,24 @@ function shell(title, body, active = "") {
     function closeModal() {
       document.getElementById('toggleModal').classList.remove('open');
     }
+
+    // Network picker
+    const NETWORK_LABELS = ${JSON.stringify(Object.fromEntries(Object.entries(X402_NETWORKS).map(([id, n]) => [id, n.label])))};
+    let _pendingNetwork = document.getElementById('x402NetworkInput')?.value || 'eip155:8453';
+    function selectNetwork(id) {
+      _pendingNetwork = id;
+      document.querySelectorAll('.network-card').forEach(c => c.classList.toggle('selected', c.dataset.networkId === id));
+    }
+    function confirmNetwork() {
+      document.getElementById('x402NetworkInput').value = _pendingNetwork;
+      document.getElementById('x402NetworkDisplay').textContent = NETWORK_LABELS[_pendingNetwork] || _pendingNetwork;
+      document.getElementById('networkModal').classList.remove('open');
+    }
+    // Mark current selection when modal opens
+    document.getElementById('networkModal').addEventListener('click', function() {
+      const current = document.getElementById('x402NetworkInput')?.value;
+      if (current) document.querySelectorAll('.network-card').forEach(c => c.classList.toggle('selected', c.dataset.networkId === current));
+    }, true);
     document.getElementById('toggleModal').addEventListener('click', function(e) {
       if (e.target === this) closeModal();
     });
@@ -306,29 +426,52 @@ function shell(title, body, active = "") {
       else { btn.disabled = false; btn.textContent = active ? 'Activate' : 'Deactivate'; alert(d.error); }
     });
 
-    function renderCond(c) { return '<span style="color:#A8F1F7">' + c.source + '</span> ' + c.field + ' ' + c.op + ' ' + c.value; }
-    function renderRules(rs) { return rs.conditions.map(renderCond).join(' <span style="opacity:0.5">' + rs.operator + '</span> '); }
-    function showStrategyInfo(stratJson) {
-      const s = JSON.parse(stratJson);
+    function renderCond(c) {
+      return '<span style="color:#A8F1F7">' + (c.source || '') + '</span> ' + (c.field || '') + ' ' + (c.op || '') + ' ' + (c.value !== undefined ? c.value : '');
+    }
+    function renderRules(rs) {
+      if (!rs || !Array.isArray(rs.conditions) || !rs.conditions.length) return '<span style="color:rgba(255,255,255,0.3)">—</span>';
+      return rs.conditions.map(renderCond).join(' <span style="opacity:0.4">' + rs.operator + '</span> ');
+    }
+    document.addEventListener('click', function(e) {
+      const btn = e.target.closest('.strategy-info-btn');
+      if (btn) showStrategyInfo(btn);
+    });
+    async function showStrategyInfo(btn) {
+      const s = JSON.parse(btn.dataset.strategy);
       const sched = isCrypto(s.symbol) ? SCHEDULES.crypto : SCHEDULES.stocks;
-      const entry = renderRules(typeof s.entry === 'string' ? JSON.parse(s.entry) : s.entry);
-      const exit = renderRules(typeof s.exit === 'string' ? JSON.parse(s.exit) : s.exit);
-      const size = s.position_size_usd ? '$' + s.position_size_usd : 'default size';
+      const size = s.position_size_usd ? '$' + s.position_size_usd : 'default';
+      const AGENT_SIGNAL_URL = '${getSignalUrl()}';
       const pop = document.getElementById('infoPopover');
-      pop.innerHTML = '<strong>' + s.name + '</strong>'
-        + '<div style="margin:0.4rem 0 0;font-family:monospace;font-size:0.7rem;color:rgba(255,255,255,0.35);word-break:break-all">' + s.id + '</div>'
-        + '<div style="margin-top:0.75rem;display:flex;flex-direction:column;gap:0.4rem">'
-        + '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Symbol</span><br>' + s.symbol + ' · ' + s.leverage + 'x · ' + size + '</div>'
-        + '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Entry</span><br>' + entry + '</div>'
-        + '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Exit</span><br>' + exit + '</div>'
-        + '</div>'
-        + '<div class="sched">⏱ ' + sched.label + '</div>';
-      if (pop.classList.contains('open')) { pop.classList.remove('open'); return; }
-      const btn = event.target.closest('.info-btn');
+
+      // Position and show with loading state
+      if (pop.classList.contains('open') && pop._stratId === s.id) { pop.classList.remove('open'); return; }
+      pop._stratId = s.id;
       const rect = btn.getBoundingClientRect();
       pop.style.top = (rect.bottom + 8 + window.scrollY) + 'px';
       pop.style.left = Math.min(rect.left, window.innerWidth - 340) + 'px';
+      pop.innerHTML = '<span style="color:rgba(255,255,255,0.3);font-size:0.75rem">Loading…</span>';
       pop.classList.add('open');
+
+      // Fetch full strategy via local proxy (avoids CORS)
+      let entry = null, exit = null;
+      try {
+        const res = await fetch('/api/strategy-details/' + s.id);
+        if (res.ok) {
+          const full = await res.json();
+          entry = typeof full.entry === 'string' ? JSON.parse(full.entry) : full.entry;
+          exit  = typeof full.exit  === 'string' ? JSON.parse(full.exit)  : full.exit;
+        }
+      } catch {}
+
+      pop.innerHTML = '<strong>' + s.name + '</strong>'
+        + '<div style="margin:0.4rem 0 0;font-family:monospace;font-size:0.7rem;color:rgba(255,255,255,0.35);word-break:break-all">' + s.id + '</div>'
+        + '<div style="margin-top:0.75rem;display:flex;flex-direction:column;gap:0.5rem">'
+        + '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Symbol</span><br>' + s.symbol + ' · ' + s.leverage + 'x · ' + size + '</div>'
+        + (entry ? '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Entry</span><br><span style="font-size:0.75rem">' + renderRules(entry) + '</span></div>' : '')
+        + (exit  ? '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Exit</span><br><span style="font-size:0.75rem">'  + renderRules(exit)  + '</span></div>' : '')
+        + '</div>'
+        + '<div class="sched">⏱ ' + sched.label + '</div>';
     }
     document.addEventListener('click', function(e) {
       const pop = document.getElementById('infoPopover');
@@ -348,6 +491,37 @@ function shell(title, body, active = "") {
   </script>
 </body>
 </html>`;
+}
+
+// ── Env helpers ───────────────────────────────────────────────────────────────
+
+const ENV_PATH = resolve(__dirname, ".env");
+
+function readEnv() {
+  try { return readFileSync(ENV_PATH, "utf8"); } catch { return ""; }
+}
+
+function getEnvValue(key) {
+  const m = readEnv().match(new RegExp(`^${key}=(.*)$`, "m"));
+  return m ? m[1].trim().replace(/^["']|["']$/g, "") : "";
+}
+
+function writeEnvValues(updates) {
+  let src = readEnv();
+  for (const [key, val] of Object.entries(updates)) {
+    if (!val && val !== "false") continue; // skip blanks (don't clear existing)
+    const line = `${key}=${val}`;
+    if (new RegExp(`^${key}=`, "m").test(src)) {
+      src = src.replace(new RegExp(`^${key}=.*$`, "m"), line);
+    } else {
+      src = src.trimEnd() + "\n" + line + "\n";
+    }
+  }
+  writeFileSync(ENV_PATH, src, "utf8");
+  // Reload into process.env immediately
+  for (const [key, val] of Object.entries(updates)) {
+    if (val) process.env[key] = val;
+  }
 }
 
 // ── Pages ─────────────────────────────────────────────────────────────────────
@@ -379,12 +553,14 @@ async function positionsPage() {
   const usdcSpot = parseFloat(spotData?.balances?.find(b => b.coin === "USDC")?.total ?? "0");
 
   // x402 spend stats
-  const totalFetches = countSignals();
-  const totalSpend = (totalFetches * X402_PRICE_USD).toFixed(3);
+  const fetchesToday = countFetchesToday();
+  const fetchesTotal = countFetchesTotal();
   const wallet = PRIVATE_KEY
     ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
     : null;
-  const baseUsdc = wallet ? await getBaseUsdcBalance(wallet.address) : null;
+  const networkUsdc = wallet ? await getNetworkUsdcBalance(wallet.address) : null;
+  const payNetwork = getPaymentNetwork();
+  const payNetworkLabel = X402_NETWORKS[payNetwork]?.label ?? payNetwork;
 
   const stats = `
     <div class="stat-row">
@@ -424,14 +600,15 @@ async function positionsPage() {
         <tbody>${posRows}</tbody>
       </table>
     </div>
-    <p class="section-label" style="margin-top:2rem">x402 Signal Spend</p>
+    <p class="section-label" style="margin-top:2rem">x402 Signal Spend · <span style="color:rgba(255,255,255,0.35);font-size:0.65rem;text-transform:none;letter-spacing:0">${payNetworkLabel}</span></p>
     <div class="stat-row">
-      <div class="stat"><div class="label">Total Fetches</div><div class="value">${totalFetches.toLocaleString()}</div></div>
-      <div class="stat"><div class="label">Estimated Spend</div><div class="value cyan">$${totalSpend}</div></div>
-      <div class="stat"><div class="label">Base USDC Balance</div><div class="value ${baseUsdc !== null && baseUsdc < 0.05 ? "red" : ""}">${baseUsdc !== null ? "$" + baseUsdc.toFixed(4) : "—"}</div></div>
-      <div class="stat"><div class="label">Cost Per Fetch</div><div class="value" style="font-size:0.9rem;color:rgba(255,255,255,0.5)">$${X402_PRICE_USD}</div></div>
+      <div class="stat"><div class="label">Today's Fetches</div><div class="value">${fetchesToday.total.toLocaleString()}</div></div>
+      <div class="stat"><div class="label">Today's Spend</div><div class="value cyan">$${fetchesToday.spend.toFixed(3)}</div></div>
+      <div class="stat"><div class="label">All-Time Fetches</div><div class="value" style="font-size:0.95rem">${fetchesTotal.total.toLocaleString()}</div></div>
+      <div class="stat"><div class="label">All-Time Spend</div><div class="value" style="font-size:0.95rem">$${fetchesTotal.spend.toFixed(2)}</div></div>
+      <div class="stat"><div class="label">${payNetworkLabel} USDC</div><div class="value ${networkUsdc !== null && networkUsdc < 0.05 ? "red" : "cyan"}">${networkUsdc !== null ? "$" + networkUsdc.toFixed(4) : "—"}</div></div>
     </div>
-    ${baseUsdc !== null && baseUsdc < 0.05 ? `<p style="font-size:0.78rem;color:#f87171;margin-bottom:1.5rem">⚠️ Low Base USDC — top up to continue fetching signals.</p>` : ""}
+    ${networkUsdc !== null && networkUsdc < 0.05 ? `<p style="font-size:0.78rem;color:#f87171;margin-bottom:1.5rem">⚠️ Low ${payNetworkLabel} USDC — top up to continue fetching signals.</p>` : ""}
     <p class="hint">Auto-refreshes every 30s · <a href="/positions">Refresh now</a></p>
     <script>
       setTimeout(() => location.reload(), 30000);
@@ -447,72 +624,200 @@ async function positionsPage() {
   `, "positions");
 }
 
+function tvSymbol(symbol) {
+  const base = symbol.replace(/-USD$/i, "").replace(/\/USD$/i, "").toUpperCase();
+  const crypto = { BTC:"BINANCE:BTCUSDT",ETH:"BINANCE:ETHUSDT",SOL:"BINANCE:SOLUSDT",BNB:"BINANCE:BNBUSDT",XRP:"BINANCE:XRPUSDT",ADA:"BINANCE:ADAUSDT",AVAX:"BINANCE:AVAXUSDT",DOGE:"BINANCE:DOGEUSDT",LINK:"BINANCE:LINKUSDT",DOT:"BINANCE:DOTUSDT",MATIC:"BINANCE:MATICUSDT",POL:"BINANCE:POLUSDT",UNI:"BINANCE:UNIUSDT",ATOM:"BINANCE:ATOMUSDT",LTC:"BINANCE:LTCUSDT",SHIB:"BINANCE:SHIBUSDT",TRX:"BINANCE:TRXUSDT",SUI:"BINANCE:SUIUSDT",APT:"BINANCE:APTUSDT",INJ:"BINANCE:INJUSDT",NEAR:"BINANCE:NEARUSDT",ARB:"BINANCE:ARBUSDT",OP:"BINANCE:OPUSDT",WIF:"BINANCE:WIFUSDT",PEPE:"BINANCE:PEPEUSDT",BONK:"BINANCE:BONKUSDT" };
+  const stocks = { SPY:"AMEX:SPY",QQQ:"NASDAQ:QQQ",IWM:"AMEX:IWM",GLD:"AMEX:GLD",AAPL:"NASDAQ:AAPL",TSLA:"NASDAQ:TSLA",NVDA:"NASDAQ:NVDA",MSFT:"NASDAQ:MSFT",AMZN:"NASDAQ:AMZN",GOOGL:"NASDAQ:GOOGL" };
+  return crypto[base] || stocks[base] || base;
+}
+
 function strategiesPage() {
   const strategies = getStrategies();
 
-  const rows = strategies.length
+  const cards = strategies.length
     ? strategies.map(s => {
         const latest = getLatestSignal(s.id);
         const sig = latest?.signal ?? "—";
         const sigClass = sig === "LONG" ? "badge-long" : sig === "SHORT" ? "badge-short" : "badge-flat";
-        const execLabel = sig === "LONG" ? `Open Long (${s.leverage}x)` : sig === "SHORT" ? `Open Short (${s.leverage}x)` : sig === "FLAT" ? "Close Position" : "Execute";
-        const execColor = sig === "LONG" ? "btn-green" : sig === "SHORT" ? "btn-red" : "btn-red";
-        return `<tr>
-          <td>
-            <strong>${s.name}</strong>
-            <br>
-            <span style="font-size:0.7rem;color:rgba(255,255,255,0.3);font-family:monospace">${s.id.slice(0,8)}…</span>
-            <button onclick="copyId('${s.id}', this)" style="background:none;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:rgba(255,255,255,0.35);cursor:pointer;font-size:0.6rem;padding:0.1rem 0.35rem;margin-left:0.25rem;vertical-align:middle" title="Copy full ID">copy</button>
-          </td>
-          <td class="cyan">${s.symbol}</td>
-          <td>${sig !== "—" ? `<span class="${sigClass}">${sig}</span>` : "—"}${latest?.date ? `<br><span style="font-size:0.65rem;color:rgba(255,255,255,0.25)">${latest.date}</span>` : ""}</td>
-          <td>${s.position_size_usd ? "$" + s.position_size_usd : `$${process.env.HL_POSITION_SIZE_USD ?? 10} <span style="font-size:0.65rem;color:rgba(255,255,255,0.3)">(default)</span>`}</td>
-          <td>${s.leverage}x</td>
-          <td>
-            ${s.active
-              ? `<span class="badge-active">● ACTIVE</span>`
-              : `<span class="badge-inactive">○ INACTIVE</span>`}
-            <button class="info-btn" onclick="showStrategyInfo(${JSON.stringify(JSON.stringify(s))})" title="Strategy details"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
-          </td>
-          <td style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
-            ${s.active
-              ? `<button class="btn btn-red" onclick="showToggleModal(this, '${s.id}', false, '${s.symbol}')">Deactivate</button>`
-              : `<button class="btn btn-green" onclick="showToggleModal(this, '${s.id}', true, '${s.symbol}')">Activate</button>`}
-            ${sig !== "—" ? `<button class="btn ${execColor}" onclick="execStrategy(this, '${s.id}','${execLabel}','${sig === "FLAT" ? "close" : "open"}')">${execLabel}</button>` : ""}
-            <button class="btn btn-red" onclick="deleteStrat('${s.id}')">Delete</button>
-          </td>
-        </tr>`;
+        const size = s.position_size_usd ? "$" + s.position_size_usd : "$" + (process.env.HL_POSITION_SIZE_USD ?? 10);
+        const tv = tvSymbol(s.symbol);
+        const sdJson = JSON.stringify(s).replace(/"/g, '&quot;');
+        return `
+        <div class="acc-item" id="acc-${s.id}">
+          <div class="acc-header" onclick="toggleAcc('${s.id}', event)">
+            <svg class="acc-chevron" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            <div style="flex:1;min-width:0">
+              <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap">
+                <strong style="font-size:0.95rem">${s.name}</strong>
+                <span class="cyan" style="font-size:0.8rem">${s.symbol}</span>
+                ${sig !== "—" ? `<span class="${sigClass}">${sig}</span>` : ""}
+                ${s.active ? `<span class="badge-active">● AUTO</span>` : `<span class="badge-inactive">○ INACTIVE</span>`}
+              </div>
+              <div style="margin-top:0.3rem;font-size:0.72rem;color:rgba(255,255,255,0.35);display:flex;gap:1rem;flex-wrap:wrap">
+                <span>${s.leverage}x leverage · ${size} · ${s.exchange === "kraken" ? "Kraken" : s.exchange === "alpaca" ? "Alpaca" : "Hyperliquid"} · every ${s.interval_minutes >= 1440 ? "day" : s.interval_minutes + "min"}${s.tp_pct ? ` · TP ${s.tp_pct}% → trail ${s.trail_pct ?? 0.5}%` : ""}</span>
+                ${latest?.date ? `<span>Signal: ${latest.date}</span>` : ""}
+                <span style="font-family:monospace">${s.id.slice(0,8)}…
+                  <button onclick="copyId('${s.id}', this);event.stopPropagation()" style="background:none;border:1px solid rgba(255,255,255,0.1);border-radius:3px;color:rgba(255,255,255,0.3);cursor:pointer;font-size:0.6rem;padding:0.05rem 0.3rem;margin-left:0.2rem;vertical-align:middle">copy</button>
+                </span>
+                <button class="info-btn strategy-info-btn" data-strategy="${sdJson}" title="Conditions" onclick="showStrategyInfo(this);event.stopPropagation()"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
+              </div>
+            </div>
+            <div style="display:flex;gap:0.4rem;align-items:center;flex-shrink:0" onclick="event.stopPropagation()">
+              ${s.active
+                ? `<button class="btn btn-red" onclick="showToggleModal(this, '${s.id}', false, '${s.symbol}')">Deactivate</button>`
+                : `<button class="btn btn-green" onclick="showToggleModal(this, '${s.id}', true, '${s.symbol}')">Activate</button>`}
+              <button class="btn btn-cyan" onclick="runNow(this, '${s.id}', '${s.name.replace(/'/g, "\\'")}')">▶ Run Now</button>
+              <button class="btn btn-green" onclick="openPosition(this, '${s.id}', 'buy', '${s.symbol}')">Open Long</button>
+              <button class="btn btn-red" onclick="openPosition(this, '${s.id}', 'sell', '${s.symbol}')">Open Short</button>
+              <button class="btn btn-red" onclick="deleteStrat('${s.id}')">✕</button>
+            </div>
+          </div>
+          <div class="acc-body" id="acc-body-${s.id}"></div>
+        </div>`;
       }).join("")
-    : `<tr><td colspan="7" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No strategies yet. <a href="/add-strategy">Add one →</a></td></tr>`;
+    : `<div style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:2rem">No strategies yet. <a href="/add-strategy">Add one →</a></div>`;
 
   return shell("Strategies", `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem">
       <p class="section-label" style="margin:0">Strategies</p>
       <a href="/add-strategy" class="nav-link btn-cyan" style="font-size:0.78rem;padding:0.3rem 0.75rem;border-radius:6px;border:1px solid rgba(168,241,247,0.3);color:#A8F1F7">+ Add Strategy</a>
     </div>
-    <div class="card">
-      <table>
-        <thead><tr><th>Strategy</th><th>Symbol</th><th>Signal</th><th>Size</th><th>Leverage</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>
+    ${cards}
     <script>
-      async function execStrategy(btn, id, label, type) {
-        const msg = (type === 'close' ? 'Close position?' : 'Open position?') + '\\n\\n' + label;
-        if (!confirm(msg)) return;
-        btn.disabled = true; btn.textContent = 'Executing...';
-        const res = await fetch('/api/execute', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id}) });
-        const d = await res.json();
-        if (d.ok) { btn.textContent = '✓ Done'; btn.style.color='#4ade80'; setTimeout(()=>location.reload(),1500); }
-        else { btn.disabled = false; btn.textContent = label; alert(d.error); }
+    const TV_SYMBOLS = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, tvSymbol(s.symbol)])))};
+
+    function toggleAcc(id, e) {
+      const item = document.getElementById('acc-' + id);
+      const body = document.getElementById('acc-body-' + id);
+      const isOpen = item.classList.contains('open');
+      item.classList.toggle('open');
+      if (!isOpen && !body.querySelector('iframe')) {
+        const tv = TV_SYMBOLS[id] || 'BINANCE:BTCUSDT';
+        body.innerHTML = '<iframe src="https://www.tradingview.com/widgetembed/?symbol=' + encodeURIComponent(tv) + '&interval=15&theme=dark&style=1&hide_side_toolbar=0&allow_symbol_change=1&save_image=0&locale=en&hide_legend=0&hide_volume=0" width="100%" height="480" frameborder="0" allowtransparency="true" scrolling="no" style="display:block"></iframe>';
       }
-      async function deleteStrat(id) {
-        if (!confirm('Remove this strategy from the trader?\\n\\nThis does not close any open positions.')) return;
-        await fetch('/api/strategy/' + id, { method: 'DELETE' });
-        location.reload();
-      }
+    }
+    function runNow(btn, id, name) {
+      document.getElementById('runModalTitle').textContent = '▶ Run Strategy — ' + name;
+      document.getElementById('runModalBody').innerHTML =
+        '<p>Fetches the latest live signal from AgentSignal and executes a trade if the signal has flipped.</p>' +
+        '<div class="flow" style="margin-top:0.75rem">' +
+          '<div class="flow-step"><span class="num">1</span><span>Fetch live signal (may cost $0.01 via x402)</span></div>' +
+          '<div class="flow-step"><span class="num">2</span><span>Compare to last recorded signal</span></div>' +
+          '<div class="flow-step"><span class="num">3</span><span>Execute trade only if signal has flipped</span></div>' +
+        '</div>';
+      const confirmBtn = document.getElementById('runModalConfirm');
+      confirmBtn.textContent = '▶ Run Now';
+      confirmBtn.disabled = false;
+      confirmBtn.onclick = async () => {
+        confirmBtn.textContent = 'Running…';
+        confirmBtn.disabled = true;
+        document.getElementById('runModal').classList.remove('open');
+        btn.textContent = 'Running…'; btn.disabled = true;
+        try {
+          const res = await fetch('/api/run', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id}) });
+          const d = await res.json();
+          if (d.ok) {
+            btn.textContent = '✓'; btn.style.color = '#4ade80';
+            // Show result in modal
+            document.getElementById('runModalTitle').textContent = '✓ Done';
+            document.getElementById('runModalBody').innerHTML = '<p style="color:#4ade80">' + d.action + '</p>';
+            document.getElementById('runModal').classList.add('open');
+            document.getElementById('runModalConfirm').style.display = 'none';
+            document.querySelector('#runModal .modal-cancel').textContent = 'Close';
+            setTimeout(() => location.reload(), 2500);
+          } else {
+            btn.disabled = false; btn.textContent = '▶ Run Now';
+            document.getElementById('runModalTitle').textContent = '✗ Error';
+            document.getElementById('runModalBody').innerHTML = '<p style="color:#f87171">' + d.error + '</p>';
+            document.getElementById('runModal').classList.add('open');
+            document.getElementById('runModalConfirm').style.display = 'none';
+            document.querySelector('#runModal .modal-cancel').textContent = 'Close';
+          }
+        } catch (e) {
+          btn.disabled = false; btn.textContent = '▶ Run Now';
+        }
+        confirmBtn.disabled = false;
+      };
+      document.getElementById('runModalConfirm').style.display = '';
+      document.querySelector('#runModal .modal-cancel').textContent = 'Cancel';
+      document.getElementById('runModal').classList.add('open');
+    }
+    function openPosition(btn, id, side, symbol) {
+      const label = side === 'buy' ? 'Open Long' : 'Open Short';
+      const color = side === 'buy' ? '#4ade80' : '#f87171';
+      const confirmCls = side === 'buy' ? 'modal-confirm-green' : 'modal-confirm-red';
+      document.getElementById('openModalTitle').textContent = label + ' — ' + symbol;
+      document.getElementById('openModalBody').innerHTML =
+        '<p>This places a <strong>market order immediately</strong>, regardless of the current signal.</p>' +
+        '<div class="flow" style="margin-top:0.75rem">' +
+          '<div class="flow-step"><span class="num">1</span><span>Any existing position will be closed first</span></div>' +
+          '<div class="flow-step"><span class="num">2</span><span>A new ' + label.toLowerCase() + ' market order will be placed</span></div>' +
+        '</div>';
+      const confirmBtn = document.getElementById('openModalConfirm');
+      confirmBtn.textContent = label;
+      confirmBtn.className = confirmCls;
+      confirmBtn.onclick = async () => {
+        confirmBtn.textContent = 'Placing order…';
+        confirmBtn.disabled = true;
+        document.getElementById('openModal').classList.remove('open');
+        btn.textContent = 'Executing…'; btn.disabled = true;
+        try {
+          const res = await fetch('/api/open', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id, side}) });
+          const d = await res.json();
+          if (d.ok) { btn.textContent = '✓'; btn.style.color = color; setTimeout(() => location.reload(), 1500); }
+          else { btn.disabled = false; btn.textContent = label; alert('Error: ' + d.error); }
+        } catch { btn.disabled = false; btn.textContent = label; }
+        confirmBtn.disabled = false;
+      };
+      document.getElementById('openModal').classList.add('open');
+    }
+    async function deleteStrat(id) {
+      if (!confirm('Remove this strategy from the trader?\\n\\nThis does not close any open positions.')) return;
+      await fetch('/api/strategy/' + id, { method: 'DELETE' });
+      location.reload();
+    }
     </script>
   `, "strategies");
+}
+
+function signalsPage() {
+  const signals = getRecentSignalEvents(48);
+
+  function timeAgo(createdAt) {
+    const diffMs = Date.now() - new Date(createdAt + "Z").getTime();
+    const m = Math.floor(diffMs / 60000);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  }
+
+  const feed = signals.length
+    ? signals.map(s => {
+        const sigClass = s.signal === "LONG" ? "long" : s.signal === "SHORT" ? "short" : "flat";
+        const price = s.price ? "$" + parseFloat(s.price).toLocaleString(undefined, { maximumFractionDigits: 0 }) : "—";
+        const notes = s.notes ? `<div class="notif-meta">${s.notes}</div>` : "";
+        return `<div class="notif">
+          <div class="notif-dot ${sigClass}"></div>
+          <div class="notif-body">
+            <div class="notif-top">
+              <span class="notif-name">${s.strategy_name}</span>
+              <span class="notif-sig ${sigClass}">${s.prev_signal ? s.prev_signal + " → " : ""}${s.signal}</span>
+            </div>
+            ${notes}
+          </div>
+          <div class="notif-price">
+            <div>${price}</div>
+            <div class="notif-time">${timeAgo(s.updated_at ?? s.created_at)}</div>
+          </div>
+        </div>`;
+      }).join("")
+    : `<div style="color:rgba(255,255,255,0.25);font-style:italic;padding:1.5rem 0;text-align:center;font-size:0.82rem">No signals in the last 48 hours</div>`;
+
+  return shell("Signals", `
+    <p class="section-label">Signal Feed — Last 48 Hours</p>
+    <div class="notif-feed">${feed}</div>
+  `, "signals");
 }
 
 function historyPage() {
@@ -522,14 +827,19 @@ function historyPage() {
   const tradeRows = trades.length
     ? trades.map(t => {
         const isEntry = t.action.startsWith("ENTERED") || t.action.startsWith("SHORTED");
+        const pnl = t.pnl != null ? parseFloat(t.pnl) : null;
+        const pnlStr = pnl != null
+          ? `<span style="color:${pnl >= 0 ? "#4ade80" : "#f87171"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</span>`
+          : "—";
         return `<tr>
           <td>${t.created_at.slice(0, 16)}</td>
           <td>${t.strategy_name ?? t.strategy_id.slice(0,8)}</td>
           <td style="color:${isEntry ? "#4ade80" : "#f87171"}">${t.action}</td>
           <td>${t.price ? "$" + parseFloat(t.price).toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
+          <td>${pnlStr}</td>
         </tr>`;
       }).join("")
-    : `<tr><td colspan="4" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No trades yet</td></tr>`;
+    : `<tr><td colspan="5" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No trades yet</td></tr>`;
 
   const sigSections = strategies.map(s => {
     const sigs = getSignalHistory(s.id, 20);
@@ -556,7 +866,7 @@ function historyPage() {
     <p class="section-label">Trade Log</p>
     <div class="card">
       <table>
-        <thead><tr><th>Time</th><th>Strategy</th><th>Action</th><th>Price</th></tr></thead>
+        <thead><tr><th>Time</th><th>Strategy</th><th>Action</th><th>Price</th><th>P&amp;L</th></tr></thead>
         <tbody>${tradeRows}</tbody>
       </table>
     </div>
@@ -564,12 +874,132 @@ function historyPage() {
   `, "history");
 }
 
+function settingsPage(saved = false, error = "") {
+  const val = (key) => getEnvValue(key);
+
+  function field(label, name, value, type = "text", hint = "") {
+    const isSecret = type === "password";
+    const id = `field_${name}`;
+    return `<div>
+      <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">${label}</label>
+      <div style="position:relative;display:flex;gap:0.4rem;align-items:center">
+        <input id="${id}" name="${name}" type="${isSecret ? "password" : "text"}"
+          value="${value.replace(/"/g, "&quot;")}"
+          placeholder="${isSecret ? "••••••••••••••••" : ""}"
+          autocomplete="off" style="width:100%;font-family:${isSecret ? "monospace" : "inherit"}" />
+        ${isSecret ? `<button type="button" onclick="toggleSecret('${id}')" style="background:none;border:1px solid rgba(255,255,255,0.1);border-radius:5px;color:rgba(255,255,255,0.4);cursor:pointer;padding:0.35rem 0.55rem;font-size:0.7rem;white-space:nowrap;flex-shrink:0">Show</button>` : ""}
+      </div>
+      ${hint ? `<div style="font-size:0.68rem;color:rgba(255,255,255,0.3);margin-top:0.25rem">${hint}</div>` : ""}
+    </div>`;
+  }
+
+  function section(title, icon, fields) {
+    return `<div class="card" style="margin-bottom:1rem">
+      <div style="font-size:0.8rem;font-weight:700;color:#fafafa;margin-bottom:1rem;display:flex;align-items:center;gap:0.5rem">
+        <span style="font-size:1rem">${icon}</span>${title}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:0.85rem">${fields}</div>
+    </div>`;
+  }
+
+  return shell("Settings", `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem">
+      <p class="section-label" style="margin:0">Settings</p>
+    </div>
+    ${saved ? `<div style="color:#4ade80;font-size:0.82rem;margin-bottom:1rem;padding:0.6rem 0.85rem;background:rgba(74,222,128,0.08);border:1px solid rgba(74,222,128,0.2);border-radius:8px">✓ Settings saved. Restart the trader processes for key changes to take effect.</div>` : ""}
+    ${error ? `<div style="color:#f87171;font-size:0.82rem;margin-bottom:1rem">${error}</div>` : ""}
+    <form method="POST" action="/settings">
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:1rem;margin-bottom:1rem">
+
+
+        ${section("Hyperliquid", "⚡", `
+          ${field("Private Key", "AGENT_PRIVATE_KEY", val("AGENT_PRIVATE_KEY"), "password", "0x-prefixed EVM key — trading + x402 payments")}
+          ${field("Default Position Size (USD)", "HL_POSITION_SIZE_USD", val("HL_POSITION_SIZE_USD") || "10", "text", "Per-trade size when strategy has no override")}
+          <div id="walletInfo" style="font-size:0.72rem;color:rgba(255,255,255,0.3);padding:0.5rem 0.75rem;background:rgba(255,255,255,0.03);border-radius:6px;display:none">
+            Wallet: <span id="walletAddr" style="font-family:monospace;color:rgba(168,241,247,0.7)"></span>
+          </div>
+        `)}
+
+        ${section("Kraken", "🦀", `
+          ${field("API Key", "KRAKEN_API_KEY", val("KRAKEN_API_KEY"), "text", `kraken.com → Security → API — enable Trade`)}
+          ${field("API Secret", "KRAKEN_API_SECRET", val("KRAKEN_API_SECRET"), "password", "Base64-encoded, shown once at creation")}
+        `)}
+
+        ${section("Alpaca", "🦙", `
+          ${field("API Key", "ALPACA_API_KEY", val("ALPACA_API_KEY"), "text", `alpaca.markets → Your Account → API Keys`)}
+          ${field("API Secret", "ALPACA_API_SECRET", val("ALPACA_API_SECRET"), "password", "Shown once at creation")}
+          <div>
+            <label style="display:flex;align-items:center;gap:0.6rem;cursor:pointer;font-size:0.82rem;color:rgba(255,255,255,0.6)">
+              <input type="checkbox" name="ALPACA_PAPER" value="true" ${val("ALPACA_PAPER") === "true" ? "checked" : ""} style="width:auto;accent-color:#A8F1F7" />
+              Paper trading mode <span style="font-size:0.7rem;color:rgba(255,255,255,0.3)">(paper-api.alpaca.markets)</span>
+            </label>
+          </div>
+        `)}
+
+        ${(function() {
+          const current = getPaymentNetwork();
+          const currentLabel = X402_NETWORKS[current]?.label ?? current;
+          return section("Signal Payments (x402)", "💳", `
+            <input type="hidden" name="X402_PAYMENT_NETWORK" id="x402NetworkInput" value="${current}" />
+            <div>
+              <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Payment Network</label>
+              <button type="button" onclick="document.getElementById('networkModal').classList.add('open')"
+                style="width:100%;display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#fafafa;font-size:0.85rem;padding:0.45rem 0.75rem;cursor:pointer;text-align:left">
+                <span id="x402NetworkDisplay">${currentLabel}</span>
+                <span style="color:rgba(255,255,255,0.3);font-size:0.75rem">Change ›</span>
+              </button>
+              <div style="font-size:0.68rem;color:rgba(255,255,255,0.3);margin-top:0.25rem">Your wallet must hold USDC on this network to pay for signal fetches.</div>
+            </div>
+          `);
+        })()}
+
+      </div>
+
+      <div style="display:flex;gap:0.75rem;margin-top:0.5rem">
+        <button type="submit" style="background:#A8F1F7;color:#09090b;border:none;border-radius:8px;padding:0.6rem 1.5rem;font-weight:700;cursor:pointer;font-size:0.875rem">
+          Save Settings
+        </button>
+        <a href="/strategies" style="display:inline-flex;align-items:center;padding:0.6rem 1rem;font-size:0.82rem;color:rgba(255,255,255,0.4);border:1px solid rgba(255,255,255,0.1);border-radius:8px;text-decoration:none">Cancel</a>
+      </div>
+    </form>
+
+    <script>
+    function toggleSecret(id) {
+      const el = document.getElementById(id);
+      const btn = el.nextElementSibling;
+      if (el.type === 'password') { el.type = 'text'; btn.textContent = 'Hide'; }
+      else { el.type = 'password'; btn.textContent = 'Show'; }
+    }
+    // Derive wallet address from private key if ethers is available
+    const pkField = document.getElementById('field_AGENT_PRIVATE_KEY');
+    async function updateWalletInfo() {
+      const pk = pkField.value.trim();
+      if (!pk.startsWith('0x') || pk.length !== 66) {
+        document.getElementById('walletInfo').style.display = 'none';
+        return;
+      }
+      try {
+        const res = await fetch('/api/wallet-address', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ pk }) });
+        const d = await res.json();
+        if (d.address) {
+          document.getElementById('walletAddr').textContent = d.address;
+          document.getElementById('walletInfo').style.display = 'block';
+        }
+      } catch {}
+    }
+    pkField?.addEventListener('change', updateWalletInfo);
+    updateWalletInfo();
+    </script>
+  `, "settings");
+}
+
 function addStrategyPage(error = "") {
   return shell("Add Strategy", `
     <p class="section-label">Add Strategy</p>
     <div class="card" style="max-width:480px">
       <p style="font-size:0.85rem;color:rgba(255,255,255,0.5);margin-bottom:1.25rem">
-        Find your strategy ID at <a href="${AGENT_SIGNAL_URL}/navigator" target="_blank">agentsignal.app/navigator</a>
+        Find your strategy ID at <a href="${getSignalUrl()}/navigator" target="_blank">agentsignal.app/navigator</a>
         → Load & Edit → copy the ID from the Live Signal URL.
       </p>
       ${error ? `<p style="color:#f87171;font-size:0.8rem;margin-bottom:1rem">${error}</p>` : ""}
@@ -599,6 +1029,39 @@ function addStrategyPage(error = "") {
             </select>
           </div>
         </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem">
+          <div>
+            <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Exchange</label>
+            <select name="exchange" style="width:100%">
+              <option value="hyperliquid">Hyperliquid (perps)</option>
+              <option value="kraken">Kraken (spot / margin)</option>
+              <option value="alpaca">Alpaca (stocks / crypto)</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Check Every</label>
+            <select name="interval_minutes" style="width:100%">
+              <option value="15">15 minutes</option>
+              <option value="30">30 minutes</option>
+              <option value="60" selected>1 hour</option>
+              <option value="120">2 hours</option>
+              <option value="240">4 hours</option>
+              <option value="1440">Daily</option>
+            </select>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem">
+          <div>
+            <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Take Profit %</label>
+            <input name="tp_pct" type="number" step="0.5" min="0.5" placeholder="e.g. 5 (optional)" style="width:100%" />
+            <p style="font-size:0.68rem;color:rgba(255,255,255,0.25);margin:0.25rem 0 0">% gain before trail activates</p>
+          </div>
+          <div>
+            <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Trail Stop %</label>
+            <input name="trail_pct" type="number" step="0.1" min="0.1" placeholder="e.g. 0.5 (optional)" style="width:100%" />
+            <p style="font-size:0.68rem;color:rgba(255,255,255,0.25);margin:0.25rem 0 0">% drop from peak to close</p>
+          </div>
+        </div>
         <button type="submit" style="background:#A8F1F7;color:#09090b;border:none;border-radius:8px;padding:0.6rem 1.25rem;font-weight:600;cursor:pointer;font-size:0.875rem;margin-top:0.25rem">
           Add Strategy
         </button>
@@ -612,8 +1075,10 @@ function addStrategyPage(error = "") {
 async function handleClose(body) {
   if (!PRIVATE_KEY) return { ok: false, error: "AGENT_PRIVATE_KEY not set" };
   const { asset } = JSON.parse(body);
-  const { closePosition } = await import("./hyperliquid.mjs");
-  const result = await closePosition(PRIVATE_KEY, asset);
+  // Force-close always uses Hyperliquid (Positions page only shows HL positions)
+  const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
+  const exch = new HyperliquidExchange(PRIVATE_KEY);
+  const result = await exch.closePosition(asset);
   return { ok: true, asset, result };
 }
 
@@ -669,6 +1134,166 @@ async function handleExecute(body) {
   return { ok: true, action };
 }
 
+async function handleRun(body) {
+  if (!PRIVATE_KEY) return { ok: false, error: "AGENT_PRIVATE_KEY not set" };
+  const { id } = JSON.parse(body);
+  const strategy = getStrategy(id);
+  if (!strategy) return { ok: false, error: "Strategy not found" };
+
+  // Fetch live signal
+  const { x402Client } = await import("@x402/core/client");
+  const { decodePaymentRequiredHeader, encodePaymentSignatureHeader } = await import("@x402/core/http");
+  const { ExactEvmScheme } = await import("@x402/evm/exact/client");
+  const { toClientEvmSigner } = await import("@x402/evm");
+  const { createPublicClient, http } = await import("viem");
+  const { privateKeyToAccount } = await import("viem/accounts");
+  const allChains = await import("viem/chains");
+
+  const account = privateKeyToAccount(PRIVATE_KEY);
+  const client = new x402Client();
+
+  const url = `${getSignalUrl()}/api/strategy/${id}/signal`;
+  let signalData = null;
+  try {
+    const probe = await fetch(url);
+    console.log(`[run-strategy] probe status: ${probe.status}`);
+    if (probe.ok) {
+      signalData = await probe.json();
+    } else if (probe.status === 402) {
+      const rawHeader = probe.headers.get("X-PAYMENT-REQUIRED");
+      if (!rawHeader) throw new Error("No X-PAYMENT-REQUIRED header");
+      const paymentRequired = decodePaymentRequiredHeader(rawHeader);
+
+      // Network comes from the server's 402 response — no local setting needed
+      const serverNetwork = paymentRequired.accepts?.[0]?.network ?? paymentRequired.accepts?.network;
+      const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS[getPaymentNetwork()] ?? X402_NETWORKS["eip155:42161"];
+      const chain = allChains[networkCfg.viemChain];
+      const publicClient = createPublicClient({ chain, transport: http(networkCfg.rpc) });
+      const signer = toClientEvmSigner(account, publicClient);
+      client.register(serverNetwork, new ExactEvmScheme(signer));
+
+      const paymentPayload = await client.createPaymentPayload(paymentRequired);
+      const paid = await fetch(url, { headers: { "X-PAYMENT": encodePaymentSignatureHeader(paymentPayload) } });
+      console.log(`[run-strategy] paid status: ${paid.status}`);
+      if (paid.ok) {
+        signalData = await paid.json();
+      } else {
+        const errBody = await paid.text().catch(() => "");
+        throw new Error(`Payment rejected (${paid.status}): ${errBody.slice(0, 200)}`);
+      }
+    } else {
+      throw new Error(`Unexpected probe status: ${probe.status}`);
+    }
+  } catch (err) {
+    console.error(`[run-strategy] signal fetch error:`, err.message);
+    return { ok: false, error: `Could not fetch signal: ${err.message}` };
+  }
+  if (!signalData) return { ok: false, error: "Could not fetch signal from AgentSignal" };
+
+  const signal = signalData.signal;
+  const price  = signalData.price ?? null;
+  const priorSignal = getLatestSignal(id);
+
+  // Build notes from scores (same logic as trader.mjs)
+  const c = signalData.compass;
+  const scoreNotes = [
+    c?.score            != null ? `COMPASS:${c.score}` : null,
+    c?.radar_score      != null ? `RADAR:${c.radar_score}` : null,
+    c?.crypto_radar_score != null ? `CRYPTO:${c.crypto_radar_score}` : null,
+  ].filter(Boolean).join(" | ");
+
+  // Save signal
+  const { upsertSignal } = await import("./db.mjs");
+  upsertSignal({ strategy_id: id, signal, price, date: signalData.date ?? new Date().toISOString().slice(0,10), notes: scoreNotes || null });
+
+  // Only execute on flip (or first ever signal that's actionable)
+  const prev = priorSignal?.signal ?? null;
+  const isFlip = signal !== prev;
+  const shouldAct = isFlip && (signal === "LONG" || signal === "SHORT" || (signal === "FLAT" && prev !== null));
+  if (!shouldAct) return { ok: true, action: `Signal is ${signal} (no change from ${prev ?? "none"}) — no trade executed` };
+
+  // Execute trade via exchange abstraction
+  const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
+  const { KrakenExchange } = await import("./exchanges/kraken.mjs");
+  const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
+  const exch = strategy.exchange === "kraken"
+    ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
+    : strategy.exchange === "alpaca"
+    ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
+    : new HyperliquidExchange(PRIVATE_KEY);
+
+  const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
+  const leverage = strategy.leverage ?? 1;
+  const sizeUsd  = strategy.position_size_usd ?? parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
+  const midPrice = await exch.getMidPrice(asset);
+  const positionSize = parseFloat((sizeUsd / midPrice).toFixed(5));
+  const position = await exch.getPosition(asset);
+  const currentSize  = parseFloat(position?.szi ?? "0");
+  const entryPrice   = parseFloat(position?.entryPx ?? "0");
+  const isLong       = currentSize > 0;
+  const isFlat       = currentSize === 0;
+
+  let action = "HOLD";
+  let pnl    = null;
+  if (signal === "LONG" && isFlat) {
+    await exch.setLeverage(asset, leverage);
+    await exch.placeMarketOrder(asset, "buy", positionSize);
+    action = `ENTERED LONG ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
+  } else if (signal === "FLAT" && !isFlat) {
+    if (entryPrice > 0) {
+      const dir = isLong ? 1 : -1;
+      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize) * leverage * dir).toFixed(2));
+    }
+    await exch.closePosition(asset);
+    action = `CLOSED ${Math.abs(currentSize)} ${asset} @ ~$${midPrice.toLocaleString()}`;
+  } else if (signal === "SHORT" && !isFlat) {
+    if (entryPrice > 0 && isLong) {
+      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize) * leverage).toFixed(2));
+    }
+    await exch.closePosition(asset);
+    await exch.setLeverage(asset, leverage);
+    await exch.placeMarketOrder(asset, "sell", positionSize);
+    action = `SHORTED ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
+  }
+
+  const { insertTrade } = await import("./db.mjs");
+  insertTrade({ strategy_id: id, action, asset, size: positionSize, price: midPrice, leverage, pnl });
+  return { ok: true, action };
+}
+
+async function handleOpen(body) {
+  const { id, side } = JSON.parse(body);
+  if (side !== "buy" && side !== "sell") return { ok: false, error: "side must be buy or sell" };
+  const strategy = getStrategy(id);
+  if (!strategy) return { ok: false, error: "Strategy not found" };
+
+  const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
+  const { KrakenExchange } = await import("./exchanges/kraken.mjs");
+  const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
+  const exch = strategy.exchange === "kraken"
+    ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
+    : strategy.exchange === "alpaca"
+    ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
+    : new HyperliquidExchange(PRIVATE_KEY);
+
+  const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
+  const leverage = strategy.leverage ?? 1;
+  const sizeUsd  = strategy.position_size_usd ?? parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
+  const midPrice = await exch.getMidPrice(asset);
+  const positionSize = parseFloat((sizeUsd / midPrice).toFixed(5));
+  const position = await exch.getPosition(asset);
+  const currentSize = parseFloat(position?.szi ?? "0");
+
+  if (currentSize !== 0) await exch.closePosition(asset);
+  await exch.setLeverage(asset, leverage);
+  await exch.placeMarketOrder(asset, side, positionSize);
+  const action = `${side === "buy" ? "ENTERED LONG" : "SHORTED"} ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x) [manual]`;
+
+  const { insertTrade } = await import("./db.mjs");
+  insertTrade({ strategy_id: id, action, asset, size: positionSize, price: midPrice, leverage });
+  return { ok: true, action };
+}
+
 // ── Server ────────────────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
@@ -686,7 +1311,29 @@ const server = createServer(async (req, res) => {
 
     if (url === "/positions") return send(await positionsPage());
     if (url === "/strategies") return send(strategiesPage());
+    if (url === "/signals") return send(signalsPage());
     if (url === "/history") return send(historyPage());
+    if (url === "/settings" && method === "GET") return send(settingsPage());
+    if (url === "/settings" && method === "POST") {
+      const body = await readBody();
+      const params = new URLSearchParams(body);
+      const updates = {};
+      for (const key of ["AGENT_PRIVATE_KEY","HL_POSITION_SIZE_USD",
+                          "KRAKEN_API_KEY","KRAKEN_API_SECRET",
+                          "ALPACA_API_KEY","ALPACA_API_SECRET",
+                          "X402_PAYMENT_NETWORK"]) {
+        const v = params.get(key)?.trim();
+        if (v) updates[key] = v;
+      }
+      // Checkbox — present = true, absent = false
+      updates["ALPACA_PAPER"] = params.get("ALPACA_PAPER") === "true" ? "true" : "false";
+      try {
+        writeEnvValues(updates);
+        return send(settingsPage(true));
+      } catch (e) {
+        return send(settingsPage(false, e.message));
+      }
+    }
 
     if (url === "/add-strategy" && method === "GET") return send(addStrategyPage());
     if (url === "/add-strategy" && method === "POST") {
@@ -700,6 +1347,10 @@ const server = createServer(async (req, res) => {
         symbol: (params.get("symbol") || "BTC-USD").toUpperCase(),
         leverage: parseInt(params.get("leverage") ?? "1") || 1,
         position_size_usd: params.get("position_size_usd") ? parseFloat(params.get("position_size_usd")) : null,
+        exchange: params.get("exchange") || "hyperliquid",
+        interval_minutes: parseInt(params.get("interval_minutes") ?? "60") || 60,
+        tp_pct: params.get("tp_pct") ? parseFloat(params.get("tp_pct")) : null,
+        trail_pct: params.get("trail_pct") ? parseFloat(params.get("trail_pct")) : null,
       });
       return redirect("/strategies");
     }
@@ -716,6 +1367,14 @@ const server = createServer(async (req, res) => {
     if (url === "/api/execute" && method === "POST") {
       const body = await readBody();
       return json(await handleExecute(body).catch(e => ({ ok: false, error: e.message })));
+    }
+    if (url === "/api/run" && method === "POST") {
+      const body = await readBody();
+      return json(await handleRun(body).catch(e => ({ ok: false, error: e.message })));
+    }
+    if (url === "/api/open" && method === "POST") {
+      const body = await readBody();
+      return json(await handleOpen(body).catch(e => ({ ok: false, error: e.message })));
     }
     if (url === "/api/pm2-status" && method === "GET") {
       try {
@@ -758,6 +1417,26 @@ const server = createServer(async (req, res) => {
       const id = url.replace("/api/strategy/", "");
       deleteStrategy(id);
       return json({ ok: true });
+    }
+
+    if (url.startsWith("/api/strategy-details/") && method === "GET") {
+      const id = url.replace("/api/strategy-details/", "");
+      try {
+        const r = await fetch(`${getSignalUrl()}/api/strategy/${id}`);
+        const data = await r.json();
+        return json(data, r.status);
+      } catch (e) {
+        return json({ error: e.message }, 500);
+      }
+    }
+
+    if (url === "/api/wallet-address" && method === "POST") {
+      try {
+        const { pk } = JSON.parse(await readBody());
+        const { privateKeyToAccount } = await import("viem/accounts");
+        const account = privateKeyToAccount(pk);
+        return json({ address: account.address });
+      } catch { return json({ error: "Invalid key" }, 400); }
     }
 
     redirect("/positions");
