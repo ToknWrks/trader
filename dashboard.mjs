@@ -646,14 +646,26 @@ async function positionsPage() {
     <p class="hint">Auto-refreshes every 30s · <a href="/positions">Refresh now</a></p>
     <script>
       setTimeout(() => location.reload(), 30000);
-      async function closePos(btn, asset, exchange) {
+      function closePos(btn, asset, exchange) {
         const exchLabel = exchange === 'alpaca' ? 'Alpaca' : 'Hyperliquid';
-        if (!confirm('Force close ' + asset + ' position on ' + exchLabel + '?')) return;
-        btn.textContent = 'Closing...'; btn.disabled = true;
-        const res = await fetch('/api/close', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({asset, exchange}) });
-        const d = await res.json();
-        if (d.ok) { btn.textContent = 'Closed ✓'; btn.style.color='#4ade80'; setTimeout(()=>location.reload(),1500); }
-        else { btn.textContent = 'Error'; btn.disabled = false; alert(d.error); }
+        document.getElementById('openModalTitle').textContent = 'Force Exit — ' + asset;
+        document.getElementById('openModalBody').innerHTML =
+          '<p>This will immediately close the <strong>' + asset + '</strong> position on <strong>' + exchLabel + '</strong> at market price.</p>';
+        const confirmBtn = document.getElementById('openModalConfirm');
+        confirmBtn.textContent = 'Force Exit';
+        confirmBtn.className = 'modal-confirm-red';
+        confirmBtn.onclick = async () => {
+          confirmBtn.textContent = 'Closing…';
+          confirmBtn.disabled = true;
+          document.getElementById('openModal').classList.remove('open');
+          btn.textContent = 'Closing…'; btn.disabled = true;
+          const res = await fetch('/api/close', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({asset, exchange}) });
+          const d = await res.json();
+          if (d.ok) { btn.textContent = 'Closed ✓'; btn.style.color='#4ade80'; setTimeout(()=>location.reload(),1500); }
+          else { btn.textContent = 'Error'; btn.disabled = false; alert(d.error); }
+          confirmBtn.disabled = false;
+        };
+        document.getElementById('openModal').classList.add('open');
       }
     </script>
   `, "positions");
