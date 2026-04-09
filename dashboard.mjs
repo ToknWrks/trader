@@ -77,7 +77,6 @@ import {
 
 const X402_NETWORKS = {
   "eip155:8453":  { label: "Base",               viemChain: "base",        rpc: "https://mainnet.base.org" },
-  "eip155:84532": { label: "Base Sepolia (test)", viemChain: "baseSepolia", rpc: "https://sepolia.base.org" },
 };
 
 function getPaymentNetwork() {
