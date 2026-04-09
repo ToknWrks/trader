@@ -77,10 +77,6 @@ import {
 
 const X402_NETWORKS = {
   "eip155:8453":  { label: "Base",               viemChain: "base",        rpc: "https://mainnet.base.org" },
-  "eip155:1":     { label: "Ethereum",            viemChain: "mainnet",     rpc: "https://eth.llamarpc.com" },
-  "eip155:42161": { label: "Arbitrum",            viemChain: "arbitrum",    rpc: "https://arb1.arbitrum.io/rpc" },
-  "eip155:137":   { label: "Polygon",             viemChain: "polygon",     rpc: "https://polygon-rpc.com" },
-  "eip155:43114": { label: "Avalanche",           viemChain: "avalanche",   rpc: "https://api.avax.network/ext/bc/C/rpc" },
   "eip155:84532": { label: "Base Sepolia (test)", viemChain: "baseSepolia", rpc: "https://sepolia.base.org" },
 };
 
@@ -527,7 +523,7 @@ function writeEnvValues(updates) {
 // ── Pages ─────────────────────────────────────────────────────────────────────
 
 async function positionsPage() {
-  let hlData = null, spotData = null;
+  let hlData = null, spotData = null, alpacaPositions = [];
   try {
     const wallet = PRIVATE_KEY
       ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
@@ -546,6 +542,17 @@ async function positionsPage() {
       ]);
     }
   } catch {}
+
+  // Fetch Alpaca positions if credentials are set
+  if (process.env.ALPACA_API_KEY && process.env.ALPACA_API_SECRET) {
+    try {
+      const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
+      const alp = new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true");
+      alpacaPositions = await alp._request("GET", "/v2/positions") ?? [];
+    } catch (e) {
+      console.error("[dashboard] Alpaca positions fetch error:", e.message);
+    }
+  }
 
   const positions = (hlData?.assetPositions ?? []).filter(p => parseFloat(p.position?.szi ?? "0") !== 0);
   const accountValue = parseFloat(hlData?.marginSummary?.accountValue ?? "0");
@@ -584,22 +591,50 @@ async function positionsPage() {
           <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
           <td>$${parseFloat(pos.positionValue ?? "0").toFixed(2)}</td>
           <td class="red">${liqPx > 0 ? "$" + liqPx.toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
-          <td><button class="btn btn-red" onclick="closePos(this, '${pos.coin}')">Force Exit</button></td>
+          <td><button class="btn btn-red" onclick="closePos(this, '${pos.coin}', 'hyperliquid')">Force Exit</button></td>
         </tr>`;
       }).join("")
     : `<tr><td colspan="8" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No open positions</td></tr>`;
+
+  const alpacaRows = alpacaPositions.length
+    ? alpacaPositions.map(p => {
+        const qty = parseFloat(p.qty ?? "0");
+        const isLong = p.side === "long" || qty > 0;
+        const pnl = parseFloat(p.unrealized_pl ?? "0");
+        const entryPx = parseFloat(p.avg_entry_price ?? "0");
+        const mktVal = parseFloat(p.market_value ?? "0");
+        return `<tr>
+          <td><strong>${p.symbol}</strong></td>
+          <td><span class="${isLong ? "pos-long" : "pos-short"}">${isLong ? "▲ LONG" : "▼ SHORT"}</span></td>
+          <td>${Math.abs(qty)}</td>
+          <td>$${entryPx.toLocaleString(undefined, {maximumFractionDigits: 4})}</td>
+          <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
+          <td>$${mktVal.toFixed(2)}</td>
+          <td class="red">—</td>
+          <td><button class="btn btn-red" onclick="closePos(this, '${p.symbol}', 'alpaca')">Force Exit</button></td>
+        </tr>`;
+      }).join("")
+    : null;
 
   return shell("Positions", `
     ${!PRIVATE_KEY ? '<p style="color:#f87171;margin-bottom:1rem">⚠️ AGENT_PRIVATE_KEY not set — run <code>npm run setup</code></p>' : ""}
     <p class="section-label">Account</p>
     ${stats}
-    <p class="section-label">Open Positions</p>
+    <p class="section-label">Hyperliquid Positions</p>
     <div class="card">
       <table>
         <thead><tr><th>Asset</th><th>Side</th><th>Size</th><th>Entry</th><th>Unrealized P&L</th><th>Value</th><th>Liq. Price</th><th></th></tr></thead>
         <tbody>${posRows}</tbody>
       </table>
     </div>
+    ${alpacaRows !== null ? `
+    <p class="section-label" style="margin-top:1.5rem">Alpaca Positions${process.env.ALPACA_PAPER === "true" ? ' <span style="font-size:0.65rem;color:rgba(255,255,255,0.35);text-transform:none;letter-spacing:0">(paper)</span>' : ""}</p>
+    <div class="card">
+      <table>
+        <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Unrealized P&L</th><th>Market Value</th><th>Liq. Price</th><th></th></tr></thead>
+        <tbody>${alpacaRows || `<tr><td colspan="8" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No open positions</td></tr>`}</tbody>
+      </table>
+    </div>` : ""}
     <p class="section-label" style="margin-top:2rem">x402 Signal Spend · <span style="color:rgba(255,255,255,0.35);font-size:0.65rem;text-transform:none;letter-spacing:0">${payNetworkLabel}</span></p>
     <div class="stat-row">
       <div class="stat"><div class="label">Today's Fetches</div><div class="value">${fetchesToday.total.toLocaleString()}</div></div>
@@ -612,10 +647,11 @@ async function positionsPage() {
     <p class="hint">Auto-refreshes every 30s · <a href="/positions">Refresh now</a></p>
     <script>
       setTimeout(() => location.reload(), 30000);
-      async function closePos(btn, asset) {
-        if (!confirm('Force close ' + asset + ' position on Hyperliquid?')) return;
+      async function closePos(btn, asset, exchange) {
+        const exchLabel = exchange === 'alpaca' ? 'Alpaca' : 'Hyperliquid';
+        if (!confirm('Force close ' + asset + ' position on ' + exchLabel + '?')) return;
         btn.textContent = 'Closing...'; btn.disabled = true;
-        const res = await fetch('/api/close', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({asset}) });
+        const res = await fetch('/api/close', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({asset, exchange}) });
         const d = await res.json();
         if (d.ok) { btn.textContent = 'Closed ✓'; btn.style.color='#4ade80'; setTimeout(()=>location.reload(),1500); }
         else { btn.textContent = 'Error'; btn.disabled = false; alert(d.error); }
@@ -686,14 +722,49 @@ function strategiesPage() {
     <script>
     const TV_SYMBOLS = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, tvSymbol(s.symbol)])))};
 
-    function toggleAcc(id, e) {
+    const FIELD_TO_STUDY = {
+      rsi:        'RSI@tv-basicstudies',
+      above_ma:   'MASimple@tv-basicstudies',
+      above_ema:  'MAExp@tv-basicstudies',
+      macd_cross: 'MACD@tv-basicstudies',
+      bb_upper:   'BB@tv-basicstudies',
+      bb_lower:   'BB@tv-basicstudies',
+      stoch_k:    'Stochastic@tv-basicstudies',
+      adx:        'ADX@tv-basicstudies',
+      above_pp:   'Pivot Points Standard@tv-basicstudies',
+      below_pp:   'Pivot Points Standard@tv-basicstudies',
+      above_r1:   'Pivot Points Standard@tv-basicstudies',
+      below_s1:   'Pivot Points Standard@tv-basicstudies',
+    };
+
+    async function toggleAcc(id, e) {
       const item = document.getElementById('acc-' + id);
       const body = document.getElementById('acc-body-' + id);
       const isOpen = item.classList.contains('open');
       item.classList.toggle('open');
       if (!isOpen && !body.querySelector('iframe')) {
         const tv = TV_SYMBOLS[id] || 'BINANCE:BTCUSDT';
-        body.innerHTML = '<iframe src="https://www.tradingview.com/widgetembed/?symbol=' + encodeURIComponent(tv) + '&interval=15&theme=dark&style=1&hide_side_toolbar=0&allow_symbol_change=1&save_image=0&locale=en&hide_legend=0&hide_volume=0" width="100%" height="480" frameborder="0" allowtransparency="true" scrolling="no" style="display:block"></iframe>';
+
+        // Derive up to 2 indicator studies from strategy conditions
+        let studies = [];
+        try {
+          const res = await fetch('/api/strategy-details/' + id);
+          if (res.ok) {
+            const full = await res.json();
+            const entry = typeof full.entry === 'string' ? JSON.parse(full.entry) : full.entry;
+            const exit  = typeof full.exit  === 'string' ? JSON.parse(full.exit)  : full.exit;
+            const allConds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
+            const seen = new Set();
+            for (const c of allConds) {
+              const study = FIELD_TO_STUDY[c.field];
+              if (study && !seen.has(study)) { seen.add(study); studies.push(study); }
+              if (studies.length >= 2) break;
+            }
+          }
+        } catch {}
+
+        const studyParams = studies.map(s => '&studies=' + encodeURIComponent(s)).join('');
+        body.innerHTML = '<iframe src="https://www.tradingview.com/widgetembed/?symbol=' + encodeURIComponent(tv) + '&interval=15&theme=dark&style=1&hide_side_toolbar=0&allow_symbol_change=1&save_image=0&locale=en&hide_legend=0&hide_volume=0' + studyParams + '" width="100%" height="480" frameborder="0" allowtransparency="true" scrolling="no" style="display:block"></iframe>';
       }
     }
     function runNow(btn, id, name) {
@@ -795,14 +866,18 @@ function signalsPage() {
   const feed = signals.length
     ? signals.map(s => {
         const sigClass = s.signal === "LONG" ? "long" : s.signal === "SHORT" ? "short" : "flat";
+        const isCheck = s.type === "check";
         const price = s.price ? "$" + parseFloat(s.price).toLocaleString(undefined, { maximumFractionDigits: 0 }) : "—";
         const notes = s.notes ? `<div class="notif-meta">${s.notes}</div>` : "";
-        return `<div class="notif">
-          <div class="notif-dot ${sigClass}"></div>
+        const label = isCheck
+          ? `<span class="notif-sig ${sigClass}" style="opacity:0.5">${s.signal} ✓</span>`
+          : `<span class="notif-sig ${sigClass}">${s.prev_signal ? s.prev_signal + " → " : ""}${s.signal}</span>`;
+        return `<div class="notif" style="${isCheck ? "opacity:0.6" : ""}">
+          <div class="notif-dot ${sigClass}" style="${isCheck ? "opacity:0.4" : ""}"></div>
           <div class="notif-body">
             <div class="notif-top">
               <span class="notif-name">${s.strategy_name}</span>
-              <span class="notif-sig ${sigClass}">${s.prev_signal ? s.prev_signal + " → " : ""}${s.signal}</span>
+              ${label}
             </div>
             ${notes}
           </div>
@@ -821,25 +896,73 @@ function signalsPage() {
 }
 
 function historyPage() {
-  const trades = getAllRecentTrades(50);
+  const trades = getAllRecentTrades(100);
   const strategies = getStrategies();
 
-  const tradeRows = trades.length
-    ? trades.map(t => {
-        const isEntry = t.action.startsWith("ENTERED") || t.action.startsWith("SHORTED");
-        const pnl = t.pnl != null ? parseFloat(t.pnl) : null;
-        const pnlStr = pnl != null
-          ? `<span style="color:${pnl >= 0 ? "#4ade80" : "#f87171"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</span>`
-          : "—";
-        return `<tr>
-          <td>${t.created_at.slice(0, 16)}</td>
-          <td>${t.strategy_name ?? t.strategy_id.slice(0,8)}</td>
-          <td style="color:${isEntry ? "#4ade80" : "#f87171"}">${t.action}</td>
-          <td>${t.price ? "$" + parseFloat(t.price).toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
-          <td>${pnlStr}</td>
-        </tr>`;
-      }).join("")
-    : `<tr><td colspan="5" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No trades yet</td></tr>`;
+  // Build exchange map: strategyId → exchange
+  const stratMap = {};
+  for (const s of strategies) stratMap[s.id] = s.exchange ?? "hyperliquid";
+
+  const isPaper = process.env.ALPACA_PAPER === "true";
+
+  // Split trades into live vs paper
+  const liveTrades = trades.filter(t => {
+    const exchange = stratMap[t.strategy_id] ?? "hyperliquid";
+    return !(exchange === "alpaca" && isPaper);
+  });
+  const paperTrades = trades.filter(t => {
+    const exchange = stratMap[t.strategy_id] ?? "hyperliquid";
+    return exchange === "alpaca" && isPaper;
+  });
+
+  function calcStats(tList) {
+    const closedTrades = tList.filter(t => t.pnl != null);
+    const totalPnl = closedTrades.reduce((sum, t) => sum + parseFloat(t.pnl), 0);
+    const winners = closedTrades.filter(t => parseFloat(t.pnl) > 0).length;
+    const winRate = closedTrades.length > 0 ? Math.round((winners / closedTrades.length) * 100) : null;
+    return { totalPnl, winRate, tradeCount: tList.length, closedCount: closedTrades.length };
+  }
+
+  function renderStatBar(stats, id) {
+    const pnlColor = stats.totalPnl >= 0 ? "#4ade80" : "#f87171";
+    const pnlStr = stats.closedCount > 0
+      ? `<span style="color:${pnlColor};font-weight:600">${stats.totalPnl >= 0 ? "+" : ""}$${stats.totalPnl.toFixed(2)}</span>`
+      : `<span style="color:rgba(255,255,255,0.3)">—</span>`;
+    const wrStr = stats.winRate != null
+      ? `<span style="color:rgba(255,255,255,0.7)">${stats.winRate}%</span>`
+      : `<span style="color:rgba(255,255,255,0.3)">—</span>`;
+    return `<div id="${id}" style="display:flex;gap:2rem;padding:0.75rem 1rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;margin-bottom:0.75rem;font-size:0.8rem">
+      <div><span style="color:rgba(255,255,255,0.4);margin-right:0.4rem">Total P&amp;L</span>${pnlStr}</div>
+      <div><span style="color:rgba(255,255,255,0.4);margin-right:0.4rem">Win Rate</span>${wrStr}</div>
+      <div><span style="color:rgba(255,255,255,0.4);margin-right:0.4rem">Trades</span><span style="color:rgba(255,255,255,0.7)">${stats.tradeCount}</span></div>
+    </div>`;
+  }
+
+  function renderTradeTable(tList, emptyMsg) {
+    const rows = tList.length
+      ? tList.map(t => {
+          const isEntry = t.action.startsWith("ENTERED") || t.action.startsWith("SHORTED");
+          const pnl = t.pnl != null ? parseFloat(t.pnl) : null;
+          const pnlStr = pnl != null
+            ? `<span style="color:${pnl >= 0 ? "#4ade80" : "#f87171"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</span>`
+            : "—";
+          return `<tr>
+            <td>${t.created_at.slice(0, 16)}</td>
+            <td>${t.strategy_name ?? t.strategy_id.slice(0,8)}</td>
+            <td style="color:${isEntry ? "#4ade80" : "#f87171"}">${t.action}</td>
+            <td>${t.price ? "$" + parseFloat(t.price).toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
+            <td>${pnlStr}</td>
+          </tr>`;
+        }).join("")
+      : `<tr><td colspan="5" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">${emptyMsg}</td></tr>`;
+    return `<table>
+      <thead><tr><th>Time</th><th>Strategy</th><th>Action</th><th>Price</th><th>P&amp;L</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  }
+
+  const liveStats = calcStats(liveTrades);
+  const paperStats = calcStats(paperTrades);
 
   const sigSections = strategies.map(s => {
     const sigs = getSignalHistory(s.id, 20);
@@ -863,13 +986,42 @@ function historyPage() {
   }).join("");
 
   return shell("History", `
-    <p class="section-label">Trade Log</p>
-    <div class="card">
-      <table>
-        <thead><tr><th>Time</th><th>Strategy</th><th>Action</th><th>Price</th><th>P&amp;L</th></tr></thead>
-        <tbody>${tradeRows}</tbody>
-      </table>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem">
+      <p class="section-label" style="margin:0">Trade Log</p>
+      <div style="display:flex;gap:0.25rem;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:0.2rem">
+        <button onclick="switchTab('live')" id="tab-live"
+          style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:#A8F1F7;color:#000">
+          Live
+        </button>
+        <button onclick="switchTab('paper')" id="tab-paper"
+          style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">
+          Paper
+        </button>
+      </div>
     </div>
+
+    <div id="pane-live">
+      ${renderStatBar(liveStats, "stats-live")}
+      <div class="card">${renderTradeTable(liveTrades, "No live trades yet")}</div>
+    </div>
+
+    <div id="pane-paper" style="display:none">
+      ${renderStatBar(paperStats, "stats-paper")}
+      <div class="card">${renderTradeTable(paperTrades, "No paper trades yet")}</div>
+    </div>
+
+    <script>
+      function switchTab(tab) {
+        const isLive = tab === 'live';
+        document.getElementById('pane-live').style.display = isLive ? '' : 'none';
+        document.getElementById('pane-paper').style.display = isLive ? 'none' : '';
+        document.getElementById('tab-live').style.background = isLive ? '#A8F1F7' : 'transparent';
+        document.getElementById('tab-live').style.color = isLive ? '#000' : 'rgba(255,255,255,0.5)';
+        document.getElementById('tab-paper').style.background = isLive ? 'transparent' : '#A8F1F7';
+        document.getElementById('tab-paper').style.color = isLive ? 'rgba(255,255,255,0.5)' : '#000';
+      }
+    </script>
+
     ${sigSections}
   `, "history");
 }
@@ -1076,9 +1228,15 @@ function addStrategyPage(error = "") {
 // ── API handlers ──────────────────────────────────────────────────────────────
 
 async function handleClose(body) {
+  const { asset, exchange } = JSON.parse(body);
+  if (exchange === "alpaca") {
+    if (!process.env.ALPACA_API_KEY) return { ok: false, error: "ALPACA_API_KEY not set" };
+    const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
+    const alp = new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true");
+    const result = await alp.closePosition(asset);
+    return { ok: true, asset, result };
+  }
   if (!PRIVATE_KEY) return { ok: false, error: "AGENT_PRIVATE_KEY not set" };
-  const { asset } = JSON.parse(body);
-  // Force-close always uses Hyperliquid (Positions page only shows HL positions)
   const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
   const exch = new HyperliquidExchange(PRIVATE_KEY);
   const result = await exch.closePosition(asset);

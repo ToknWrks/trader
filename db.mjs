@@ -163,7 +163,7 @@ export function deleteStrategy(id) {
   db.prepare("DELETE FROM strategies WHERE id = ?").run(id);
 }
 
-// ── Signal events (flip history feed) ────────────────────────────────────────
+// ── Signal events (feed — every fetch) ───────────────────────────────────────
 
 try {
   db.prepare(`
@@ -174,16 +174,20 @@ try {
       prev_signal TEXT,
       price       REAL,
       notes       TEXT,
+      type        TEXT DEFAULT 'flip',
       created_at  TEXT DEFAULT (datetime('now'))
     )
   `).run();
 } catch {}
 
-export function insertSignalEvent({ strategy_id, signal, prev_signal, price, notes }) {
+// Add type column to existing DBs
+try { db.prepare("ALTER TABLE signal_events ADD COLUMN type TEXT DEFAULT 'flip'").run(); } catch {}
+
+export function insertSignalEvent({ strategy_id, signal, prev_signal, price, notes, type = "flip" }) {
   db.prepare(`
-    INSERT INTO signal_events (strategy_id, signal, prev_signal, price, notes)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(strategy_id, signal, prev_signal ?? null, price ?? null, notes ?? null);
+    INSERT INTO signal_events (strategy_id, signal, prev_signal, price, notes, type)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(strategy_id, signal, prev_signal ?? null, price ?? null, notes ?? null, type);
 }
 
 export function getRecentSignalEvents(hours = 48) {

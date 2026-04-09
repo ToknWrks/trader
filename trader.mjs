@@ -132,16 +132,21 @@ async function fetchSignal(strategyId) {
     if (probe.status !== 402) throw new Error(`Signal API ${probe.status}`);
 
     // Step 2: decode payment requirement — network comes FROM the server's 402 response
-    const rawHeader = probe.headers.get("X-PAYMENT-REQUIRED");
-    if (!rawHeader) throw new Error("No X-PAYMENT-REQUIRED header in 402 response");
+    // x402 v2 uses "payment-required"; v1 used "X-PAYMENT-REQUIRED" — try both
+    const rawHeader = probe.headers.get("payment-required") ?? probe.headers.get("X-PAYMENT-REQUIRED");
+    if (!rawHeader) throw new Error("No payment-required header in 402 response");
     const paymentRequired = decodePaymentRequiredHeader(rawHeader);
 
     // Step 3: resolve network from the server's requirement (not from local settings)
     const serverNetwork = paymentRequired.accepts?.[0]?.network ?? paymentRequired.accepts?.network;
-    const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS[getPaymentNetwork()] ?? X402_NETWORKS["eip155:42161"];
+    const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS[getPaymentNetwork()] ?? X402_NETWORKS["eip155:8453"];
     const chain = allChains[networkCfg.viemChain];
     const walletClient = createWalletClient({ account, chain, transport: http(networkCfg.rpc) });
-    const evmScheme = new ExactEvmScheme(walletClient);
+
+    // ExactEvmScheme reads signer.address directly — viem wallet client exposes it
+    // via account.address so we surface it at the top level
+    const signer = Object.assign(walletClient, { address: account.address });
+    const evmScheme = new ExactEvmScheme(signer);
     client.register(serverNetwork, evmScheme);
 
     console.log(`[trader] 💳 Paying on ${networkCfg.label ?? serverNetwork}`);
@@ -151,8 +156,18 @@ async function fetchSignal(strategyId) {
     const paymentHeader = encodePaymentSignatureHeader(paymentPayload);
 
     // Step 5: retry with payment
-    const res = await fetch(url, { headers: { "X-PAYMENT": paymentHeader } });
-    if (!res.ok) throw new Error(`Signal API ${res.status} after payment`);
+    // x402 v2 server reads "payment-signature" (core server extractPayment)
+    const res = await fetch(url, { headers: { "payment-signature": paymentHeader } });
+    if (!res.ok) {
+      const errHeader = res.headers.get("payment-required") ?? res.headers.get("X-PAYMENT-REQUIRED") ?? "";
+      try {
+        const decoded = errHeader ? JSON.parse(Buffer.from(errHeader, "base64").toString()) : {};
+        console.error(`[trader] x402 verify rejected (${res.status}):`, JSON.stringify(decoded));
+      } catch {
+        console.error(`[trader] x402 verify rejected (${res.status}): raw=`, errHeader.slice(0, 300));
+      }
+      throw new Error(`Signal API ${res.status} after payment`);
+    }
     const data = await res.json();
     console.log(`[trader] ✅ Signal fetched for ${strategyId}: ${data.signal}`);
     logFetch({ strategy_id: strategyId, network: serverNetwork, cost_usd: 0.01 });
@@ -361,6 +376,14 @@ for (const strategy of strategies) {
 
   if (!signalChanged) {
     console.log(`[trader] ⚪ Signal unchanged (${signal}) — holding`);
+    insertSignalEvent({
+      strategy_id: strategy.id,
+      signal,
+      prev_signal: priorSignal?.signal ?? null,
+      price,
+      notes: scoreNotes || null,
+      type: "check",
+    });
     // Still check TP/trail even when signal hasn't changed
     if (signal === "LONG") await checkTpTrail(strategy);
     continue;
@@ -373,6 +396,7 @@ for (const strategy of strategies) {
     prev_signal: priorSignal?.signal ?? null,
     price,
     notes: scoreNotes || null,
+    type: "flip",
   });
 
   console.log(`[trader] 🔄 Signal flip: ${priorSignal?.signal ?? "N/A"} → ${signal}`);
