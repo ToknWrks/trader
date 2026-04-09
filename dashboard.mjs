@@ -1228,17 +1228,43 @@ function addStrategyPage(error = "") {
 
 async function handleClose(body) {
   const { asset, exchange } = JSON.parse(body);
+
+  // Find matching strategy for trade record
+  const strategy = getStrategies().find(s =>
+    s.symbol.replace(/-USD$/, "").replace(/\/USD$/, "") === asset &&
+    (s.exchange ?? "hyperliquid") === (exchange ?? "hyperliquid")
+  );
+
   if (exchange === "alpaca") {
     if (!process.env.ALPACA_API_KEY) return { ok: false, error: "ALPACA_API_KEY not set" };
     const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
     const alp = new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true");
+    const position = await alp.getPosition(asset).catch(() => null);
     const result = await alp.closePosition(asset);
+    if (strategy && position) {
+      const size = Math.abs(parseFloat(position?.szi ?? "0"));
+      const entryPx = parseFloat(position?.entryPx ?? "0");
+      const midPrice = await alp.getMidPrice(asset).catch(() => 0);
+      const pnl = size && entryPx ? parseFloat(((midPrice - entryPx) * size).toFixed(2)) : null;
+      const { insertTrade } = await import("./db.mjs");
+      insertTrade({ strategy_id: strategy.id, action: `CLOSED ${asset} @ ~$${midPrice.toLocaleString()} [manual]`, asset, size, price: midPrice, leverage: strategy.leverage ?? 1, pnl });
+    }
     return { ok: true, asset, result };
   }
+
   if (!PRIVATE_KEY) return { ok: false, error: "AGENT_PRIVATE_KEY not set" };
   const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
   const exch = new HyperliquidExchange(PRIVATE_KEY);
+  const position = await exch.getPosition(asset).catch(() => null);
+  const midPrice = await exch.getMidPrice(asset).catch(() => 0);
   const result = await exch.closePosition(asset);
+  if (strategy && position) {
+    const size = Math.abs(parseFloat(position?.szi ?? "0"));
+    const entryPx = parseFloat(position?.entryPx ?? "0");
+    const pnl = size && entryPx ? parseFloat(((midPrice - entryPx) * size * (strategy.leverage ?? 1)).toFixed(2)) : null;
+    const { insertTrade } = await import("./db.mjs");
+    insertTrade({ strategy_id: strategy.id, action: `CLOSED ${asset} @ ~$${midPrice.toLocaleString()} [manual]`, asset, size, price: midPrice, leverage: strategy.leverage ?? 1, pnl });
+  }
   return { ok: true, asset, result };
 }
 
