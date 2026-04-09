@@ -181,12 +181,42 @@ async function fetchSignal(strategyId) {
 // ── TP / Trail stop monitor ───────────────────────────────────────────────────
 
 async function checkTpTrail(strategy) {
-  const state = getTpState(strategy.id);
-  if (!state) return false; // no TP configured for this position
-
   const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
   const exchange = getExchange(strategy);
-  const price    = await exchange.getMidPrice(asset);
+
+  // Check actual position on exchange — not signal state
+  const position    = await exchange.getPosition(asset);
+  const positionSzi = parseFloat(position?.szi ?? "0");
+
+  // No open position — clear stale TP state and bail
+  if (positionSzi === 0) {
+    clearTpState(strategy.id);
+    return false;
+  }
+
+  let state = getTpState(strategy.id);
+
+  // Position exists but no TP state (e.g. manual entry) — auto-initialize
+  if (!state && strategy.tp_pct) {
+    const entryPrice = parseFloat(position?.entryPx ?? "0");
+    if (entryPrice > 0) {
+      const tpPrice = positionSzi > 0
+        ? entryPrice * (1 + strategy.tp_pct / 100)
+        : entryPrice * (1 - strategy.tp_pct / 100);
+      setTpState({
+        strategy_id: strategy.id,
+        entry_price: entryPrice,
+        tp_price:    tpPrice,
+        trail_pct:   strategy.trail_pct ?? 1,
+      });
+      state = getTpState(strategy.id);
+      console.log(`[trader] 📊 Auto-initialized TP for ${strategy.name}: entry $${entryPrice.toLocaleString()} → TP $${tpPrice.toLocaleString()}`);
+    }
+  }
+
+  if (!state) return false;
+
+  const price = await exchange.getMidPrice(asset);
   if (!price) return false;
 
   if (!state.trail_mode) {
@@ -384,8 +414,8 @@ for (const strategy of strategies) {
       notes: scoreNotes || null,
       type: "check",
     });
-    // Still check TP/trail even when signal hasn't changed
-    if (signal === "LONG") await checkTpTrail(strategy);
+    // Check TP/trail based on actual exchange position, not signal
+    await checkTpTrail(strategy);
     continue;
   }
 
