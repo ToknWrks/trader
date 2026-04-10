@@ -522,7 +522,7 @@ function writeEnvValues(updates) {
 // ── Pages ─────────────────────────────────────────────────────────────────────
 
 async function positionsPage() {
-  let hlData = null, spotData = null, alpacaPositions = [];
+  let hlData = null, spotData = null, alpacaPositions = [], coinbaseAccounts = [];
   try {
     const wallet = PRIVATE_KEY
       ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
@@ -550,6 +550,19 @@ async function positionsPage() {
       alpacaPositions = await alp._request("GET", "/v2/positions") ?? [];
     } catch (e) {
       console.error("[dashboard] Alpaca positions fetch error:", e.message);
+    }
+  }
+
+  // Fetch Coinbase accounts if credentials are set
+  if (process.env.COINBASE_API_KEY && process.env.COINBASE_API_SECRET && process.env.COINBASE_API_PASSPHRASE) {
+    try {
+      const { CoinbaseExchange } = await import("./exchanges/coinbase.mjs");
+      const cb = new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE);
+      const data = await cb._request("GET", "/api/v3/brokerage/accounts");
+      // Only show accounts with a non-trivial balance
+      coinbaseAccounts = (data?.accounts ?? []).filter(a => parseFloat(a.available_balance?.value ?? "0") > 0.00001);
+    } catch (e) {
+      console.error("[dashboard] Coinbase accounts fetch error:", e.message);
     }
   }
 
@@ -634,6 +647,22 @@ async function positionsPage() {
         <tbody>${alpacaRows || `<tr><td colspan="8" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No open positions</td></tr>`}</tbody>
       </table>
     </div>` : ""}
+    ${coinbaseAccounts.length > 0 ? `
+    <p class="section-label" style="margin-top:1.5rem">Coinbase Balances</p>
+    <div class="card">
+      <table>
+        <thead><tr><th>Currency</th><th>Available</th><th>Hold</th></tr></thead>
+        <tbody>${coinbaseAccounts.map(a => {
+          const avail = parseFloat(a.available_balance?.value ?? "0");
+          const hold  = parseFloat(a.hold?.value ?? "0");
+          return `<tr>
+            <td style="font-weight:600">${a.currency}</td>
+            <td>${avail.toFixed(8)}</td>
+            <td style="color:rgba(255,255,255,0.35)">${hold > 0 ? hold.toFixed(8) : "—"}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table>
+    </div>` : (process.env.COINBASE_API_KEY ? `<p class="hint" style="margin-top:1rem">Coinbase connected — no non-zero balances found.</p>` : "")}
     <p class="section-label" style="margin-top:2rem">x402 Signal Spend · <span style="color:rgba(255,255,255,0.35);font-size:0.65rem;text-transform:none;letter-spacing:0">${payNetworkLabel}</span></p>
     <div class="stat-row">
       <div class="stat"><div class="label">Today's Fetches</div><div class="value">${fetchesToday.total.toLocaleString()}</div></div>
@@ -647,7 +676,7 @@ async function positionsPage() {
     <script>
       setTimeout(() => location.reload(), 30000);
       function closePos(btn, asset, exchange) {
-        const exchLabel = exchange === 'alpaca' ? 'Alpaca' : 'Hyperliquid';
+        const exchLabel = exchange === 'alpaca' ? 'Alpaca' : exchange === 'kraken' ? 'Kraken' : exchange === 'coinbase' ? 'Coinbase' : 'Hyperliquid';
         document.getElementById('openModalTitle').textContent = 'Force Exit — ' + asset;
         document.getElementById('openModalBody').innerHTML =
           '<p>This will immediately close the <strong>' + asset + '</strong> position on <strong>' + exchLabel + '</strong> at market price.</p>';
@@ -1103,6 +1132,12 @@ function settingsPage(saved = false, error = "") {
           </div>
         `)}
 
+        ${section("Coinbase", "🔵", `
+          ${field("API Key", "COINBASE_API_KEY", val("COINBASE_API_KEY"), "text", `coinbase.com → Settings → API → New API Key — enable View + Trade`)}
+          ${field("API Secret", "COINBASE_API_SECRET", val("COINBASE_API_SECRET"), "password", "Shown once at creation")}
+          ${field("Passphrase", "COINBASE_API_PASSPHRASE", val("COINBASE_API_PASSPHRASE"), "password", "Set when creating the API key")}
+        `)}
+
         ${(function() {
           const current = getPaymentNetwork();
           const currentLabel = X402_NETWORKS[current]?.label ?? current;
@@ -1202,6 +1237,7 @@ function addStrategyPage(error = "") {
               <option value="hyperliquid">Hyperliquid (perps)</option>
               <option value="kraken">Kraken (spot / margin)</option>
               <option value="alpaca">Alpaca (stocks / crypto)</option>
+              <option value="coinbase">Coinbase (spot crypto)</option>
             </select>
           </div>
           <div>
@@ -1519,6 +1555,7 @@ const server = createServer(async (req, res) => {
       for (const key of ["AGENT_PRIVATE_KEY","HL_POSITION_SIZE_USD",
                           "KRAKEN_API_KEY","KRAKEN_API_SECRET",
                           "ALPACA_API_KEY","ALPACA_API_SECRET",
+                          "COINBASE_API_KEY","COINBASE_API_SECRET","COINBASE_API_PASSPHRASE",
                           "X402_PAYMENT_NETWORK"]) {
         const v = params.get(key)?.trim();
         if (v) updates[key] = v;

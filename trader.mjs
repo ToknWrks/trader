@@ -34,9 +34,12 @@ loadEnv();
 const PRIVATE_KEY       = process.env.AGENT_PRIVATE_KEY?.trim();
 const KRAKEN_API_KEY    = process.env.KRAKEN_API_KEY?.trim();
 const KRAKEN_API_SECRET = process.env.KRAKEN_API_SECRET?.trim();
-const ALPACA_API_KEY    = process.env.ALPACA_API_KEY?.trim();
-const ALPACA_API_SECRET = process.env.ALPACA_API_SECRET?.trim();
-const ALPACA_PAPER      = process.env.ALPACA_PAPER === "true";
+const ALPACA_API_KEY         = process.env.ALPACA_API_KEY?.trim();
+const ALPACA_API_SECRET      = process.env.ALPACA_API_SECRET?.trim();
+const ALPACA_PAPER           = process.env.ALPACA_PAPER === "true";
+const COINBASE_API_KEY        = process.env.COINBASE_API_KEY?.trim();
+const COINBASE_API_SECRET     = process.env.COINBASE_API_SECRET?.trim();
+const COINBASE_API_PASSPHRASE = process.env.COINBASE_API_PASSPHRASE?.trim();
 const AGENT_SIGNAL_URL  = process.env.AGENT_SIGNAL_URL ?? "https://agentsignal.app";
 
 // ── x402 network config ───────────────────────────────────────────────────────
@@ -90,6 +93,7 @@ import {
 import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
 import { KrakenExchange } from "./exchanges/kraken.mjs";
 import { AlpacaExchange } from "./exchanges/alpaca.mjs";
+import { CoinbaseExchange } from "./exchanges/coinbase.mjs";
 
 function getExchange(strategy) {
   const exch = strategy.exchange ?? "hyperliquid";
@@ -100,6 +104,10 @@ function getExchange(strategy) {
   if (exch === "alpaca") {
     if (!ALPACA_API_KEY || !ALPACA_API_SECRET) throw new Error("ALPACA_API_KEY and ALPACA_API_SECRET are required for Alpaca strategies");
     return new AlpacaExchange(ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER);
+  }
+  if (exch === "coinbase") {
+    if (!COINBASE_API_KEY || !COINBASE_API_SECRET || !COINBASE_API_PASSPHRASE) throw new Error("COINBASE_API_KEY, COINBASE_API_SECRET, and COINBASE_API_PASSPHRASE are required for Coinbase strategies");
+    return new CoinbaseExchange(COINBASE_API_KEY, COINBASE_API_SECRET, COINBASE_API_PASSPHRASE);
   }
   if (!PRIVATE_KEY) throw new Error("AGENT_PRIVATE_KEY is required for Hyperliquid strategies");
   return new HyperliquidExchange(PRIVATE_KEY);
