@@ -255,6 +255,14 @@ export function logFetch({ strategy_id, network, cost_usd = 0.01 }) {
   `).run(strategy_id, network ?? null, cost_usd);
 }
 
+export function getYtdPnl() {
+  const year = new Date().getFullYear().toString();
+  const row = db.prepare(
+    "SELECT COALESCE(SUM(pnl), 0) as total FROM trades WHERE pnl IS NOT NULL AND date LIKE ?"
+  ).get(`${year}-%`);
+  return row?.total ?? 0;
+}
+
 export function countFetchesToday() {
   return db.prepare(`
     SELECT COUNT(*) as total, COALESCE(SUM(cost_usd), 0) as spend
@@ -304,6 +312,19 @@ export function getTradeHistory(strategy_id, limit = 30) {
     SELECT * FROM trades WHERE strategy_id = ?
     ORDER BY created_at DESC LIMIT ?
   `).all(strategy_id, limit);
+}
+
+// Returns price from the most recent ENTERED trade for an asset (for spot PnL)
+export function getLastEntry(asset) {
+  return db.prepare(`
+    SELECT price, leverage FROM trades
+    WHERE asset = ? AND action LIKE 'ENTERED%'
+    ORDER BY created_at DESC LIMIT 1
+  `).get(asset) ?? null;
+}
+
+export function getLastEntryPrice(asset) {
+  return getLastEntry(asset)?.price ?? null;
 }
 
 export function getAllRecentTrades(limit = 50) {

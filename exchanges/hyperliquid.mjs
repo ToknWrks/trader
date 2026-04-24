@@ -7,8 +7,11 @@ import {
   getMidPrice as hlGetMidPrice,
   getPosition as hlGetPosition,
   placeMarketOrder as hlPlaceOrder,
+  placeLimitOrder as hlPlaceLimitOrder,
   closePosition as hlClose,
   setLeverage as hlSetLeverage,
+  getOpenOrders as hlGetOpenOrders,
+  cancelOrder as hlCancelOrder,
 } from "../hyperliquid.mjs";
 
 export class HyperliquidExchange {
@@ -34,6 +37,18 @@ export class HyperliquidExchange {
 
   async placeMarketOrder(asset, side, size) {
     return hlPlaceOrder(this.privateKey, asset, side, size);
+  }
+
+  async placeLimitOrder(asset, side, size, limitPrice) {
+    return hlPlaceLimitOrder(this.privateKey, asset, side, size, limitPrice);
+  }
+
+  async getOpenOrders() {
+    return hlGetOpenOrders(this.address);
+  }
+
+  async cancelOrder(orderId, asset) {
+    return hlCancelOrder(this.privateKey, asset, orderId);
   }
 
   async closePosition(asset) {

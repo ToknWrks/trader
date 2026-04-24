@@ -70,7 +70,7 @@ const SCHEDULES = parseSchedules();
 import {
   getStrategies, getStrategy, upsertStrategy, setStrategyActive,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
-  countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents,
+  countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents, getYtdPnl,
 } from "./db.mjs";
 
 // ── x402 network config ───────────────────────────────────────────────────────
@@ -134,6 +134,13 @@ header { background: #09090b; border-bottom: 1px solid rgba(255,255,255,0.07); p
 .nav-link:hover, .nav-link.active { color: #A8F1F7; border-color: rgba(168,241,247,0.2); background: rgba(168,241,247,0.05); }
 .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
 .section-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(255,255,255,0.5); margin-bottom: 0.85rem; }
+details.accordion { margin-bottom: 1.5rem; }
+details.accordion > summary { list-style: none; display: flex; align-items: center; gap: 0.5rem; cursor: pointer; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(255,255,255,0.5); margin-bottom: 0; padding: 0.4rem 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.06); user-select: none; }
+details.accordion > summary::-webkit-details-marker { display: none; }
+details.accordion > summary::before { content: "▶"; font-size: 0.55rem; transition: transform 0.15s; display: inline-block; }
+details.accordion[open] > summary::before { transform: rotate(90deg); }
+details.accordion > summary:hover { color: rgba(255,255,255,0.75); }
+details.accordion[open] > summary { margin-bottom: 0.85rem; }
 .card { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
 .card h2 { font-size: 1rem; font-weight: 600; color: #fafafa; letter-spacing: -0.02em; margin-bottom: 1.25rem; }
 table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
@@ -235,6 +242,7 @@ function shell(title, body, active = "") {
       AgentSignal Trader
     </div>
     <div class="nav-links">
+      <a class="nav-link ${active === "portfolio" ? "active" : ""}" href="/portfolio">Portfolio</a>
       <a class="nav-link ${active === "positions" ? "active" : ""}" href="/positions">Positions</a>
       <a class="nav-link ${active === "strategies" ? "active" : ""}" href="/strategies">Strategies</a>
       <a class="nav-link ${active === "signals" ? "active" : ""}" href="/signals">Signals</a>
@@ -521,13 +529,13 @@ function writeEnvValues(updates) {
 
 // ── Pages ─────────────────────────────────────────────────────────────────────
 
-async function positionsPage() {
-  let hlData = null, spotData = null, alpacaPositions = [], coinbaseAccounts = [];
+async function portfolioPage() {
+  let hlData = null, spotData = null, coinbaseAccounts = [], coinbaseUsdValues = {}, krakenBalances = {}, krakenUsdValues = {}, openOrders = [];
+
   try {
     const wallet = PRIVATE_KEY
       ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
       : null;
-
     if (wallet) {
       [hlData, spotData] = await Promise.all([
         fetch("https://api.hyperliquid.xyz/info", {
@@ -539,10 +547,245 @@ async function positionsPage() {
           body: JSON.stringify({ type: "spotClearinghouseState", user: wallet.address }),
         }).then(r => r.json()).catch(() => null),
       ]);
+      // HL open orders
+      try {
+        const { getOpenOrders: hlGetOO } = await import("./hyperliquid.mjs");
+        const hlOrders = await hlGetOO(wallet.address);
+        openOrders.push(...hlOrders.map(o => ({ ...o, exchange: "Hyperliquid" })));
+      } catch (e) { console.error("[dashboard] HL open orders:", e.message); }
     }
   } catch {}
 
-  // Fetch Alpaca positions if credentials are set
+  // Fetch Kraken balances + USD values
+  if (process.env.KRAKEN_API_KEY && process.env.KRAKEN_API_SECRET) {
+    try {
+      const { KrakenExchange } = await import("./exchanges/kraken.mjs");
+      const kr = new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET);
+      const raw = await kr._balance();
+      krakenBalances = Object.fromEntries(
+        Object.entries(raw ?? {}).filter(([, v]) => parseFloat(v) > 0.00001)
+      );
+      const krakenKeyToDisplay = key =>
+        key === "XXBT" ? "BTC" : key === "XETH" ? "ETH" : key === "ZUSD" ? "USD" : key.replace(/^[XZ]/, "");
+      await Promise.all(Object.entries(krakenBalances).map(async ([key, val]) => {
+        const display = krakenKeyToDisplay(key);
+        const amount = parseFloat(val);
+        if (display === "USD" || display === "USDC" || display === "USDT") {
+          krakenUsdValues[key] = amount;
+        } else {
+          try {
+            krakenUsdValues[key] = amount * await kr.getMidPrice(display);
+          } catch { krakenUsdValues[key] = null; }
+        }
+      }));
+      // Kraken open orders
+      try {
+        const krOrders = await kr.getOpenOrders();
+        openOrders.push(...krOrders.map(o => ({ ...o, exchange: "Kraken" })));
+      } catch (e) { console.error("[dashboard] Kraken open orders:", e.message); }
+    } catch (e) {
+      console.error("[dashboard] Kraken balance fetch error:", e.message);
+    }
+  }
+
+  // Fetch Coinbase accounts + USD values
+  if (process.env.COINBASE_API_KEY && process.env.COINBASE_API_SECRET) {
+    try {
+      const { CoinbaseExchange } = await import("./exchanges/coinbase.mjs");
+      const cb = new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE);
+      const data = await cb._request("GET", "/api/v3/brokerage/accounts");
+      coinbaseAccounts = (data?.accounts ?? []).filter(a => parseFloat(a.available_balance?.value ?? "0") > 0.00001);
+      await Promise.all(coinbaseAccounts.map(async a => {
+        const avail = parseFloat(a.available_balance?.value ?? "0");
+        if (a.currency === "USD" || a.currency === "USDC" || a.currency === "USDT") {
+          coinbaseUsdValues[a.currency] = (coinbaseUsdValues[a.currency] ?? 0) + avail;
+        } else {
+          try {
+            coinbaseUsdValues[a.uuid] = avail * await cb.getMidPrice(a.currency);
+          } catch { coinbaseUsdValues[a.uuid] = null; }
+        }
+      }));
+      // Coinbase open orders
+      try {
+        const cbOrders = await cb.getOpenOrders();
+        openOrders.push(...cbOrders.map(o => ({ ...o, exchange: "Coinbase" })));
+      } catch (e) { console.error("[dashboard] Coinbase open orders:", e.message); }
+    } catch (e) {
+      console.error("[dashboard] Coinbase accounts fetch error:", e.message);
+    }
+  }
+
+  // Fetch Alpaca open orders
+  if (process.env.ALPACA_API_KEY && process.env.ALPACA_API_SECRET) {
+    try {
+      const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
+      const alp = new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true");
+      const alpOrders = await alp.getOpenOrders();
+      openOrders.push(...alpOrders.map(o => ({ ...o, exchange: "Alpaca" })));
+    } catch (e) { console.error("[dashboard] Alpaca open orders:", e.message); }
+  }
+
+  const accountValue = parseFloat(hlData?.marginSummary?.accountValue ?? "0");
+  const withdrawable = parseFloat(hlData?.withdrawable ?? "0");
+  const usdcSpot = parseFloat(spotData?.balances?.find(b => b.coin === "USDC")?.total ?? "0");
+
+  const fetchesToday = countFetchesToday();
+  const fetchesTotal = countFetchesTotal();
+  const wallet = PRIVATE_KEY
+    ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
+    : null;
+  const networkUsdc = wallet ? await getNetworkUsdcBalance(wallet.address) : null;
+  const payNetwork = getPaymentNetwork();
+  const payNetworkLabel = X402_NETWORKS[payNetwork]?.label ?? payNetwork;
+
+  // ── Summary calculations ────────────────────────────────────────────────────
+  const cbTotalUsd = Object.values(coinbaseUsdValues).reduce((s, v) => s + (v ?? 0), 0);
+  const krTotalUsd = Object.values(krakenUsdValues).reduce((s, v) => s + (v ?? 0), 0);
+  const totalValue = accountValue + usdcSpot + cbTotalUsd + krTotalUsd;
+
+  // Liquid USDC/USD across all exchanges
+  const cbUsdcTotal = coinbaseAccounts
+    .filter(a => a.currency === "USD" || a.currency === "USDC" || a.currency === "USDT")
+    .reduce((s, a) => s + parseFloat(a.available_balance?.value ?? "0"), 0);
+  const krUsdcTotal = Object.entries(krakenBalances)
+    .filter(([k]) => ["ZUSD","USDC","USDT"].includes(k))
+    .reduce((s, [, v]) => s + parseFloat(v), 0);
+  const totalUsdc = withdrawable + usdcSpot + cbUsdcTotal + krUsdcTotal;
+
+  // YTD P&L
+  const ytdPnl = getYtdPnl();
+  const startingValue = totalValue - ytdPnl;
+  const ytdPct = startingValue > 0 ? (ytdPnl / startingValue) * 100 : 0;
+  const ytdSign = ytdPnl >= 0 ? "+" : "";
+
+  return shell("Portfolio", `
+    ${!PRIVATE_KEY ? '<p style="color:#f87171;margin-bottom:1rem">⚠️ AGENT_PRIVATE_KEY not set — run <code>npm run setup</code></p>' : ""}
+    <div class="stat-row" style="margin-bottom:2rem">
+      <div class="stat">
+        <div class="label">Total Value</div>
+        <div class="value">$${totalValue.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</div>
+      </div>
+      <div class="stat">
+        <div class="label">USDC Balance</div>
+        <div class="value cyan">$${totalUsdc.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</div>
+      </div>
+      <div class="stat">
+        <div class="label">YTD P&amp;L</div>
+        <div class="value ${ytdPnl >= 0 ? "green" : "red"}">${ytdSign}$${Math.abs(ytdPnl).toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})} <span style="font-size:0.75em;opacity:0.7">(${ytdSign}${ytdPct.toFixed(1)}%)</span></div>
+      </div>
+    </div>
+    ${accountValue > 0 || usdcSpot > 0 ? `
+    <details class="accordion" open>
+      <summary>Hyperliquid</summary>
+      <div class="card">
+        <table>
+          <thead><tr><th>Asset</th><th>Value (USD)</th></tr></thead>
+          <tbody>
+            ${accountValue > 0.01 ? `<tr><td style="font-weight:600">Perp Account</td><td>$${accountValue.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>` : ""}
+            ${usdcSpot > 0.001 ? `<tr><td style="font-weight:600">Spot USDC</td><td>$${usdcSpot.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>` : ""}
+          </tbody>
+        </table>
+      </div>
+    </details>` : ""}
+    ${coinbaseAccounts.length > 0 ? `
+    <details class="accordion" open>
+      <summary>Coinbase</summary>
+      <div class="card">
+        <table>
+          <thead><tr><th>Currency</th><th>Available</th><th>Hold</th><th>Value (USD)</th></tr></thead>
+          <tbody>${coinbaseAccounts.map(a => {
+            const avail = parseFloat(a.available_balance?.value ?? "0");
+            const hold  = parseFloat(a.hold?.value ?? "0");
+            const isUsd = a.currency === "USD" || a.currency === "USDC" || a.currency === "USDT";
+            const usdVal = isUsd ? coinbaseUsdValues[a.currency] : coinbaseUsdValues[a.uuid];
+            return `<tr>
+              <td style="font-weight:600">${a.currency}</td>
+              <td>${avail.toFixed(3)}</td>
+              <td style="color:rgba(255,255,255,0.35)">${hold > 0 ? hold.toFixed(3) : "—"}</td>
+              <td>${usdVal != null ? "$" + usdVal.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) : "—"}</td>
+            </tr>`;
+          }).join("")}</tbody>
+        </table>
+      </div>
+    </details>` : (process.env.COINBASE_API_KEY ? `<p class="hint">Coinbase connected — no non-zero balances found.</p>` : "")}
+    ${Object.keys(krakenBalances).length > 0 ? `
+    <details class="accordion" open>
+      <summary>Kraken</summary>
+      <div class="card">
+        <table>
+          <thead><tr><th>Asset</th><th>Balance</th><th>Value (USD)</th></tr></thead>
+          <tbody>${Object.entries(krakenBalances).map(([key, val]) => {
+            const display = key === "XXBT" ? "BTC" : key === "XETH" ? "ETH" : key === "ZUSD" ? "USD" : key.replace(/^[XZ]/, "");
+            const usdVal = krakenUsdValues[key];
+            return `<tr>
+              <td style="font-weight:600">${display}</td>
+              <td>${parseFloat(val).toFixed(3)}</td>
+              <td>${usdVal != null ? "$" + usdVal.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) : "—"}</td>
+            </tr>`;
+          }).join("")}</tbody>
+        </table>
+      </div>
+    </details>` : (process.env.KRAKEN_API_KEY ? `<p class="hint">Kraken connected — no non-zero balances found.</p>` : "")}
+    <details class="accordion"${openOrders.length > 0 ? " open" : ""} style="margin-top:1.5rem">
+      <summary>Open Orders${openOrders.length > 0 ? ` <span style="font-size:0.65rem;font-weight:400;text-transform:none;letter-spacing:0;color:rgba(168,241,247,0.7);margin-left:0.4rem">${openOrders.length}</span>` : ""}</summary>
+      ${openOrders.length > 0 ? `
+      <div class="card">
+        <table>
+          <thead><tr><th>Exchange</th><th>Asset</th><th>Side</th><th>Size</th><th>Limit Price</th><th></th></tr></thead>
+          <tbody>${openOrders.map(o => `<tr>
+            <td style="color:rgba(255,255,255,0.4);font-size:0.78rem">${o.exchange}</td>
+            <td style="font-weight:600">${o.asset}</td>
+            <td><span class="${o.side === "buy" ? "pos-long" : "pos-short"}">${o.side === "buy" ? "▲ BUY" : "▼ SELL"}</span></td>
+            <td>${o.size.toFixed(4)}</td>
+            <td>$${o.limitPrice.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+            <td><button class="btn btn-red" onclick="cancelOrder('${o.exchange}','${o.id}','${o.asset}',this)">Cancel</button></td>
+          </tr>`).join("")}</tbody>
+        </table>
+      </div>` : `<p class="hint">No open limit orders across connected exchanges.</p>`}
+    </details>
+    <p class="section-label" style="margin-top:2rem">x402 Signal Spend · <span style="color:rgba(255,255,255,0.35);font-size:0.65rem;text-transform:none;letter-spacing:0">${payNetworkLabel}</span></p>
+    <div class="stat-row">
+      <div class="stat"><div class="label">Today's Fetches</div><div class="value">${fetchesToday.total.toLocaleString()}</div></div>
+      <div class="stat"><div class="label">Today's Spend</div><div class="value cyan">$${fetchesToday.spend.toFixed(3)}</div></div>
+      <div class="stat"><div class="label">All-Time Fetches</div><div class="value" style="font-size:0.95rem">${fetchesTotal.total.toLocaleString()}</div></div>
+      <div class="stat"><div class="label">All-Time Spend</div><div class="value" style="font-size:0.95rem">$${fetchesTotal.spend.toFixed(2)}</div></div>
+      <div class="stat"><div class="label">${payNetworkLabel} USDC</div><div class="value ${networkUsdc !== null && networkUsdc < 0.05 ? "red" : "cyan"}">${networkUsdc !== null ? "$" + networkUsdc.toFixed(4) : "—"}</div></div>
+    </div>
+    ${networkUsdc !== null && networkUsdc < 0.05 ? `<p style="font-size:0.78rem;color:#f87171;margin-bottom:1.5rem">⚠️ Low ${payNetworkLabel} USDC — top up to continue fetching signals.</p>` : ""}
+    <p class="hint">Auto-refreshes every 30s · <a href="/portfolio">Refresh now</a></p>
+    <script>
+      setTimeout(() => location.reload(), 30000);
+      async function cancelOrder(exchange, orderId, asset, btn) {
+        if (!confirm('Cancel this ' + asset + ' limit order on ' + exchange + '?')) return;
+        btn.textContent = 'Cancelling…'; btn.disabled = true;
+        const res = await fetch('/api/cancel-order', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ exchange, orderId, asset }) });
+        const d = await res.json();
+        if (d.ok) { btn.textContent = 'Cancelled ✓'; setTimeout(() => location.reload(), 800); }
+        else { btn.textContent = 'Error'; btn.disabled = false; alert(d.error); }
+      }
+    </script>
+  `, "portfolio");
+}
+
+async function positionsPage() {
+  let hlData = null, hlSpotData = null, alpacaPositions = [];
+
+  try {
+    const wallet = PRIVATE_KEY
+      ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
+      : null;
+    if (wallet) {
+      const hlFetch = (type) => fetch("https://api.hyperliquid.xyz/info", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type, user: wallet.address }),
+      }).then(r => r.json()).catch(() => null);
+      [hlData, hlSpotData] = await Promise.all([
+        hlFetch("clearinghouseState"),
+        hlFetch("spotClearinghouseState"),
+      ]);
+    }
+  } catch {}
+
   if (process.env.ALPACA_API_KEY && process.env.ALPACA_API_SECRET) {
     try {
       const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
@@ -553,125 +796,102 @@ async function positionsPage() {
     }
   }
 
-  // Fetch Coinbase accounts if credentials are set
-  if (process.env.COINBASE_API_KEY && process.env.COINBASE_API_SECRET && process.env.COINBASE_API_PASSPHRASE) {
-    try {
-      const { CoinbaseExchange } = await import("./exchanges/coinbase.mjs");
-      const cb = new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE);
-      const data = await cb._request("GET", "/api/v3/brokerage/accounts");
-      // Only show accounts with a non-trivial balance
-      coinbaseAccounts = (data?.accounts ?? []).filter(a => parseFloat(a.available_balance?.value ?? "0") > 0.00001);
-    } catch (e) {
-      console.error("[dashboard] Coinbase accounts fetch error:", e.message);
-    }
-  }
+  const hlPositions = (hlData?.assetPositions ?? []).filter(p => parseFloat(p.position?.szi ?? "0") !== 0);
 
-  const positions = (hlData?.assetPositions ?? []).filter(p => parseFloat(p.position?.szi ?? "0") !== 0);
-  const accountValue = parseFloat(hlData?.marginSummary?.accountValue ?? "0");
-  const withdrawable = parseFloat(hlData?.withdrawable ?? "0");
-  const usdcSpot = parseFloat(spotData?.balances?.find(b => b.coin === "USDC")?.total ?? "0");
+  // Spot balances: exclude USDC and truly negligible amounts (<$0.01)
+  const hlSpotBalances = (hlSpotData?.balances ?? []).filter(b =>
+    b.coin !== "USDC" && parseFloat(b.total ?? "0") > 0 && parseFloat(b.entryNtl ?? "0") >= 0.01
+  );
+  // Fetch mid prices and entry prices for spot holdings
+  const { getMidPrice: hlGetMid } = await import("./hyperliquid.mjs").catch(() => ({}));
+  const { getLastEntry } = await import("./db.mjs");
+  const spotEntries = {}, spotMids = {};
+  await Promise.all(hlSpotBalances.map(async b => {
+    try { spotMids[b.coin] = await hlGetMid(b.coin); } catch {}
+    const entry = getLastEntry(b.coin);
+    if (entry) spotEntries[b.coin] = entry;
+  }));
 
-  // x402 spend stats
-  const fetchesToday = countFetchesToday();
-  const fetchesTotal = countFetchesTotal();
-  const wallet = PRIVATE_KEY
-    ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
-    : null;
-  const networkUsdc = wallet ? await getNetworkUsdcBalance(wallet.address) : null;
-  const payNetwork = getPaymentNetwork();
-  const payNetworkLabel = X402_NETWORKS[payNetwork]?.label ?? payNetwork;
+  const allRows = [
+    ...hlSpotBalances.map(b => {
+      const size = parseFloat(b.total);
+      const mid = spotMids[b.coin] ?? 0;
+      const entry = spotEntries[b.coin];
+      const entryPx = entry?.price ?? 0;
+      const leverage = entry?.leverage ?? 1;
+      const value = (size * mid).toFixed(2);
+      const pnl = entryPx > 0 && mid > 0 ? ((mid - entryPx) * size * leverage) : null;
+      const pnlCell = pnl !== null
+        ? `<span class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</span>`
+        : `<span style="color:rgba(255,255,255,0.35)">—</span>`;
+      const label = leverage > 1 ? `Hyperliquid Spot ${leverage}x` : "Hyperliquid Spot";
+      const isDust = parseFloat(b.entryNtl ?? "0") < 1.0;
+      const closeBtn = isDust
+        ? `<span style="color:rgba(255,255,255,0.25);font-size:0.75rem">dust</span>`
+        : `<button class="btn btn-red" onclick="closePos(this, '${b.coin}', 'hyperliquid')">Force Exit</button>`;
+      return `<tr>
+        <td style="color:rgba(255,255,255,0.4);font-size:0.78rem">${label}</td>
+        <td><strong>${b.coin}</strong></td>
+        <td><span class="pos-long">▲ LONG</span></td>
+        <td>${size}${isDust ? ' <span style="color:rgba(255,255,255,0.3);font-size:0.7rem">(dust)</span>' : ""}</td>
+        <td>$${entryPx > 0 ? entryPx.toLocaleString(undefined, {maximumFractionDigits: 4}) : "—"}</td>
+        <td>${pnlCell}</td>
+        <td>$${value}</td>
+        <td class="red">—</td>
+        <td>${closeBtn}</td>
+      </tr>`;
+    }),
+    ...hlPositions.map(p => {
+      const pos = p.position;
+      const size = parseFloat(pos.szi);
+      const isLong = size > 0;
+      const pnl = parseFloat(pos.unrealizedPnl ?? "0");
+      const liqPx = parseFloat(pos.liquidationPx ?? "0");
+      return `<tr>
+        <td style="color:rgba(255,255,255,0.4);font-size:0.78rem">Hyperliquid</td>
+        <td><strong>${pos.coin}</strong></td>
+        <td><span class="${isLong ? "pos-long" : "pos-short"}">${isLong ? "▲ LONG" : "▼ SHORT"}</span></td>
+        <td>${Math.abs(size)}</td>
+        <td>$${parseFloat(pos.entryPx ?? "0").toLocaleString(undefined, {maximumFractionDigits: 2})}</td>
+        <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
+        <td>$${parseFloat(pos.positionValue ?? "0").toFixed(2)}</td>
+        <td class="red">${liqPx > 0 ? "$" + liqPx.toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
+        <td><button class="btn btn-red" onclick="closePos(this, '${pos.coin}', 'hyperliquid')">Force Exit</button></td>
+      </tr>`;
+    }),
+    ...alpacaPositions.map(p => {
+      const qty = parseFloat(p.qty ?? "0");
+      const isLong = p.side === "long" || qty > 0;
+      const pnl = parseFloat(p.unrealized_pl ?? "0");
+      const entryPx = parseFloat(p.avg_entry_price ?? "0");
+      const mktVal = parseFloat(p.market_value ?? "0");
+      const label = `Alpaca${process.env.ALPACA_PAPER === "true" ? " (paper)" : ""}`;
+      return `<tr>
+        <td style="color:rgba(255,255,255,0.4);font-size:0.78rem">${label}</td>
+        <td><strong>${p.symbol}</strong></td>
+        <td><span class="${isLong ? "pos-long" : "pos-short"}">${isLong ? "▲ LONG" : "▼ SHORT"}</span></td>
+        <td>${Math.abs(qty)}</td>
+        <td>$${entryPx.toLocaleString(undefined, {maximumFractionDigits: 4})}</td>
+        <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
+        <td>$${mktVal.toFixed(2)}</td>
+        <td class="red">—</td>
+        <td><button class="btn btn-red" onclick="closePos(this, '${p.symbol}', 'alpaca')">Force Exit</button></td>
+      </tr>`;
+    }),
+  ];
 
-  const stats = `
-    <div class="stat-row">
-      <div class="stat"><div class="label">Account Value</div><div class="value">$${accountValue.toFixed(2)}</div></div>
-      <div class="stat"><div class="label">Spot USDC</div><div class="value cyan">$${usdcSpot.toFixed(2)}</div></div>
-      <div class="stat"><div class="label">Withdrawable</div><div class="value">$${withdrawable.toFixed(2)}</div></div>
-    </div>`;
-
-  const posRows = positions.length
-    ? positions.map(p => {
-        const pos = p.position;
-        const size = parseFloat(pos.szi);
-        const isLong = size > 0;
-        const pnl = parseFloat(pos.unrealizedPnl ?? "0");
-        const liqPx = parseFloat(pos.liquidationPx ?? "0");
-        return `<tr>
-          <td><strong>${pos.coin}</strong></td>
-          <td><span class="${isLong ? "pos-long" : "pos-short"}">${isLong ? "▲ LONG" : "▼ SHORT"}</span></td>
-          <td>${Math.abs(size)}</td>
-          <td>$${parseFloat(pos.entryPx ?? "0").toLocaleString(undefined, {maximumFractionDigits: 2})}</td>
-          <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
-          <td>$${parseFloat(pos.positionValue ?? "0").toFixed(2)}</td>
-          <td class="red">${liqPx > 0 ? "$" + liqPx.toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
-          <td><button class="btn btn-red" onclick="closePos(this, '${pos.coin}', 'hyperliquid')">Force Exit</button></td>
-        </tr>`;
-      }).join("")
-    : `<tr><td colspan="8" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No open positions</td></tr>`;
-
-  const alpacaRows = alpacaPositions.length
-    ? alpacaPositions.map(p => {
-        const qty = parseFloat(p.qty ?? "0");
-        const isLong = p.side === "long" || qty > 0;
-        const pnl = parseFloat(p.unrealized_pl ?? "0");
-        const entryPx = parseFloat(p.avg_entry_price ?? "0");
-        const mktVal = parseFloat(p.market_value ?? "0");
-        return `<tr>
-          <td><strong>${p.symbol}</strong></td>
-          <td><span class="${isLong ? "pos-long" : "pos-short"}">${isLong ? "▲ LONG" : "▼ SHORT"}</span></td>
-          <td>${Math.abs(qty)}</td>
-          <td>$${entryPx.toLocaleString(undefined, {maximumFractionDigits: 4})}</td>
-          <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
-          <td>$${mktVal.toFixed(2)}</td>
-          <td class="red">—</td>
-          <td><button class="btn btn-red" onclick="closePos(this, '${p.symbol}', 'alpaca')">Force Exit</button></td>
-        </tr>`;
-      }).join("")
-    : null;
+  const tbody = allRows.length
+    ? allRows.join("")
+    : `<tr><td colspan="9" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No open positions</td></tr>`;
 
   return shell("Positions", `
     ${!PRIVATE_KEY ? '<p style="color:#f87171;margin-bottom:1rem">⚠️ AGENT_PRIVATE_KEY not set — run <code>npm run setup</code></p>' : ""}
-    <p class="section-label">Account</p>
-    ${stats}
-    <p class="section-label">Hyperliquid Positions</p>
     <div class="card">
       <table>
-        <thead><tr><th>Asset</th><th>Side</th><th>Size</th><th>Entry</th><th>Unrealized P&L</th><th>Value</th><th>Liq. Price</th><th></th></tr></thead>
-        <tbody>${posRows}</tbody>
+        <thead><tr><th>Exchange</th><th>Asset</th><th>Side</th><th>Size</th><th>Entry</th><th>Unrealized P&L</th><th>Value</th><th>Liq. Price</th><th></th></tr></thead>
+        <tbody>${tbody}</tbody>
       </table>
     </div>
-    ${alpacaRows !== null ? `
-    <p class="section-label" style="margin-top:1.5rem">Alpaca Positions${process.env.ALPACA_PAPER === "true" ? ' <span style="font-size:0.65rem;color:rgba(255,255,255,0.35);text-transform:none;letter-spacing:0">(paper)</span>' : ""}</p>
-    <div class="card">
-      <table>
-        <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Unrealized P&L</th><th>Market Value</th><th>Liq. Price</th><th></th></tr></thead>
-        <tbody>${alpacaRows || `<tr><td colspan="8" style="color:rgba(255,255,255,0.25);font-style:italic;text-align:center;padding:1.5rem">No open positions</td></tr>`}</tbody>
-      </table>
-    </div>` : ""}
-    ${coinbaseAccounts.length > 0 ? `
-    <p class="section-label" style="margin-top:1.5rem">Coinbase Balances</p>
-    <div class="card">
-      <table>
-        <thead><tr><th>Currency</th><th>Available</th><th>Hold</th></tr></thead>
-        <tbody>${coinbaseAccounts.map(a => {
-          const avail = parseFloat(a.available_balance?.value ?? "0");
-          const hold  = parseFloat(a.hold?.value ?? "0");
-          return `<tr>
-            <td style="font-weight:600">${a.currency}</td>
-            <td>${avail.toFixed(8)}</td>
-            <td style="color:rgba(255,255,255,0.35)">${hold > 0 ? hold.toFixed(8) : "—"}</td>
-          </tr>`;
-        }).join("")}</tbody>
-      </table>
-    </div>` : (process.env.COINBASE_API_KEY ? `<p class="hint" style="margin-top:1rem">Coinbase connected — no non-zero balances found.</p>` : "")}
-    <p class="section-label" style="margin-top:2rem">x402 Signal Spend · <span style="color:rgba(255,255,255,0.35);font-size:0.65rem;text-transform:none;letter-spacing:0">${payNetworkLabel}</span></p>
-    <div class="stat-row">
-      <div class="stat"><div class="label">Today's Fetches</div><div class="value">${fetchesToday.total.toLocaleString()}</div></div>
-      <div class="stat"><div class="label">Today's Spend</div><div class="value cyan">$${fetchesToday.spend.toFixed(3)}</div></div>
-      <div class="stat"><div class="label">All-Time Fetches</div><div class="value" style="font-size:0.95rem">${fetchesTotal.total.toLocaleString()}</div></div>
-      <div class="stat"><div class="label">All-Time Spend</div><div class="value" style="font-size:0.95rem">$${fetchesTotal.spend.toFixed(2)}</div></div>
-      <div class="stat"><div class="label">${payNetworkLabel} USDC</div><div class="value ${networkUsdc !== null && networkUsdc < 0.05 ? "red" : "cyan"}">${networkUsdc !== null ? "$" + networkUsdc.toFixed(4) : "—"}</div></div>
-    </div>
-    ${networkUsdc !== null && networkUsdc < 0.05 ? `<p style="font-size:0.78rem;color:#f87171;margin-bottom:1.5rem">⚠️ Low ${payNetworkLabel} USDC — top up to continue fetching signals.</p>` : ""}
     <p class="hint">Auto-refreshes every 30s · <a href="/positions">Refresh now</a></p>
     <script>
       setTimeout(() => location.reload(), 30000);
@@ -700,9 +920,16 @@ async function positionsPage() {
   `, "positions");
 }
 
-function tvSymbol(symbol) {
+function tvSymbol(symbol, exchange = "hyperliquid") {
   const base = symbol.replace(/-USD$/i, "").replace(/\/USD$/i, "").toUpperCase();
-  const crypto = { BTC:"BINANCE:BTCUSDT",ETH:"BINANCE:ETHUSDT",SOL:"BINANCE:SOLUSDT",BNB:"BINANCE:BNBUSDT",XRP:"BINANCE:XRPUSDT",ADA:"BINANCE:ADAUSDT",AVAX:"BINANCE:AVAXUSDT",DOGE:"BINANCE:DOGEUSDT",LINK:"BINANCE:LINKUSDT",DOT:"BINANCE:DOTUSDT",MATIC:"BINANCE:MATICUSDT",POL:"BINANCE:POLUSDT",UNI:"BINANCE:UNIUSDT",ATOM:"BINANCE:ATOMUSDT",LTC:"BINANCE:LTCUSDT",SHIB:"BINANCE:SHIBUSDT",TRX:"BINANCE:TRXUSDT",SUI:"BINANCE:SUIUSDT",APT:"BINANCE:APTUSDT",INJ:"BINANCE:INJUSDT",NEAR:"BINANCE:NEARUSDT",ARB:"BINANCE:ARBUSDT",OP:"BINANCE:OPUSDT",WIF:"BINANCE:WIFUSDT",PEPE:"BINANCE:PEPEUSDT",BONK:"BINANCE:BONKUSDT" };
+  // Kraken and Coinbase: route directly to their TradingView data feed
+  if (exchange === "kraken") {
+    const krakenBase = base === "BTC" ? "XBT" : base;
+    return `KRAKEN:${krakenBase}USD`;
+  }
+  if (exchange === "coinbase") return `COINBASE:${base}USD`;
+  // Hyperliquid / Alpaca crypto: Binance USDT pairs; Alpaca stocks: exchange-specific
+  const crypto = { BTC:"BINANCE:BTCUSDT",ETH:"BINANCE:ETHUSDT",SOL:"BINANCE:SOLUSDT",BNB:"BINANCE:BNBUSDT",XRP:"BINANCE:XRPUSDT",ADA:"BINANCE:ADAUSDT",AVAX:"BINANCE:AVAXUSDT",DOGE:"BINANCE:DOGEUSDT",LINK:"BINANCE:LINKUSDT",DOT:"BINANCE:DOTUSDT",MATIC:"BINANCE:MATICUSDT",POL:"BINANCE:POLUSDT",UNI:"BINANCE:UNIUSDT",ATOM:"BINANCE:ATOMUSDT",LTC:"BINANCE:LTCUSDT",SHIB:"BINANCE:SHIBUSDT",TRX:"BINANCE:TRXUSDT",SUI:"BINANCE:SUIUSDT",APT:"BINANCE:APTUSDT",INJ:"BINANCE:INJUSDT",NEAR:"BINANCE:NEARUSDT",ARB:"BINANCE:ARBUSDT",OP:"BINANCE:OPUSDT",WIF:"BINANCE:WIFUSDT",PEPE:"BINANCE:PEPEUSDT",BONK:"BINANCE:BONKUSDT",AKT:"BINANCE:AKTUSDT" };
   const stocks = { SPY:"AMEX:SPY",QQQ:"NASDAQ:QQQ",IWM:"AMEX:IWM",GLD:"AMEX:GLD",AAPL:"NASDAQ:AAPL",TSLA:"NASDAQ:TSLA",NVDA:"NASDAQ:NVDA",MSFT:"NASDAQ:MSFT",AMZN:"NASDAQ:AMZN",GOOGL:"NASDAQ:GOOGL" };
   return crypto[base] || stocks[base] || base;
 }
@@ -716,7 +943,7 @@ function strategiesPage() {
         const sig = latest?.signal ?? "—";
         const sigClass = sig === "LONG" ? "badge-long" : sig === "SHORT" ? "badge-short" : "badge-flat";
         const size = s.position_size_usd ? "$" + s.position_size_usd : "$" + (process.env.HL_POSITION_SIZE_USD ?? 10) + " (default)";
-        const tv = tvSymbol(s.symbol);
+        const tv = tvSymbol(s.symbol, s.exchange);
         const sdJson = JSON.stringify(s).replace(/"/g, '&quot;');
         return `
         <div class="acc-item" id="acc-${s.id}">
@@ -730,7 +957,7 @@ function strategiesPage() {
                 ${s.active ? `<span class="badge-active">● AUTO</span>` : `<span class="badge-inactive">○ INACTIVE</span>`}
               </div>
               <div style="margin-top:0.3rem;font-size:0.72rem;color:rgba(255,255,255,0.35);display:flex;gap:1rem;flex-wrap:wrap">
-                <span>${s.leverage}x leverage · ${size} · ${s.exchange === "kraken" ? "Kraken" : s.exchange === "alpaca" ? "Alpaca" : "Hyperliquid"} · every ${s.interval_minutes >= 1440 ? "day" : s.interval_minutes + "min"}${s.tp_pct ? ` · TP ${s.tp_pct}% → trail ${s.trail_pct ?? 0.5}%` : ""}</span>
+                <span>${s.leverage}x leverage · ${size} · ${{ kraken: "Kraken", alpaca: "Alpaca", coinbase: "Coinbase" }[s.exchange] ?? "Hyperliquid"} · every ${s.interval_minutes >= 1440 ? "day" : s.interval_minutes + "min"}${s.tp_pct ? ` · TP ${s.tp_pct}% → trail ${s.trail_pct ?? 0.5}%` : ""}</span>
                 ${latest?.date ? `<span>Signal: ${latest.date}</span>` : ""}
                 <span style="font-family:monospace">${s.id.slice(0,8)}…
                   <button onclick="copyId('${s.id}', this);event.stopPropagation()" style="background:none;border:1px solid rgba(255,255,255,0.1);border-radius:3px;color:rgba(255,255,255,0.3);cursor:pointer;font-size:0.6rem;padding:0.05rem 0.3rem;margin-left:0.2rem;vertical-align:middle">copy</button>
@@ -745,6 +972,7 @@ function strategiesPage() {
               <button class="btn btn-cyan" onclick="runNow(this, '${s.id}', '${s.name.replace(/'/g, "\\'")}')">▶ Run Now</button>
               <button class="btn btn-green" onclick="openPosition(this, '${s.id}', 'buy', '${s.symbol}')">Open Long</button>
               <button class="btn btn-red" onclick="openPosition(this, '${s.id}', 'sell', '${s.symbol}')">Open Short</button>
+
               <button class="btn btn-red" onclick="deleteStrat('${s.id}')">✕</button>
             </div>
           </div>
@@ -760,7 +988,7 @@ function strategiesPage() {
     </div>
     ${cards}
     <script>
-    const TV_SYMBOLS = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, tvSymbol(s.symbol)])))};
+    const TV_SYMBOLS = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, tvSymbol(s.symbol, s.exchange)])))};
 
     const FIELD_TO_STUDY = {
       rsi:        'RSI@tv-basicstudies',
@@ -853,27 +1081,57 @@ function strategiesPage() {
       document.querySelector('#runModal .modal-cancel').textContent = 'Cancel';
       document.getElementById('runModal').classList.add('open');
     }
+    let _omType = 'market';
+    function omSetType(type) {
+      _omType = type;
+      const mBtn = document.getElementById('omtMarket');
+      const lBtn = document.getElementById('omtLimit');
+      const lRow = document.getElementById('omLimitRow');
+      const desc = document.getElementById('omTypeDesc');
+      const isMarket = type === 'market';
+      mBtn.style.background = isMarket ? 'rgba(168,241,247,0.12)' : 'none';
+      mBtn.style.color = isMarket ? '#A8F1F7' : 'rgba(255,255,255,0.4)';
+      mBtn.style.borderColor = isMarket ? 'rgba(168,241,247,0.3)' : 'rgba(255,255,255,0.1)';
+      lBtn.style.background = isMarket ? 'none' : 'rgba(168,241,247,0.12)';
+      lBtn.style.color = isMarket ? 'rgba(255,255,255,0.4)' : '#A8F1F7';
+      lBtn.style.borderColor = isMarket ? 'rgba(255,255,255,0.1)' : 'rgba(168,241,247,0.3)';
+      lRow.style.display = isMarket ? 'none' : 'block';
+      desc.innerHTML = isMarket
+        ? 'Closes any existing position first, then places a <strong>market order immediately</strong>.'
+        : 'Places a <strong>GTC limit order</strong> at your specified price — fills when the market reaches it.';
+    }
     function openPosition(btn, id, side, symbol) {
+      _omType = 'market';
       const label = side === 'buy' ? 'Open Long' : 'Open Short';
       const color = side === 'buy' ? '#4ade80' : '#f87171';
       const confirmCls = side === 'buy' ? 'modal-confirm-green' : 'modal-confirm-red';
+      const btnStyle = 'flex:1;padding:0.4rem;border-radius:6px;border:1px solid;cursor:pointer;font-size:0.78rem;transition:all 0.1s';
       document.getElementById('openModalTitle').textContent = label + ' — ' + symbol;
       document.getElementById('openModalBody').innerHTML =
-        '<p>This places a <strong>market order immediately</strong>, regardless of the current signal.</p>' +
-        '<div class="flow" style="margin-top:0.75rem">' +
-          '<div class="flow-step"><span class="num">1</span><span>Any existing position will be closed first</span></div>' +
-          '<div class="flow-step"><span class="num">2</span><span>A new ' + label.toLowerCase() + ' market order will be placed</span></div>' +
-        '</div>';
+        '<div style="display:flex;gap:0.5rem;margin-bottom:1rem">' +
+          '<button id="omtMarket" onclick="omSetType(\\'market\\')" style="' + btnStyle + ';background:rgba(168,241,247,0.12);color:#A8F1F7;border-color:rgba(168,241,247,0.3)">Market</button>' +
+          '<button id="omtLimit" onclick="omSetType(\\'limit\\')" style="' + btnStyle + ';background:none;color:rgba(255,255,255,0.4);border-color:rgba(255,255,255,0.1)">Limit</button>' +
+        '</div>' +
+        '<div id="omLimitRow" style="display:none;margin-bottom:1rem">' +
+          '<label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.35rem;text-transform:uppercase;letter-spacing:0.05em">Limit Price (USD)</label>' +
+          '<input id="omLimitPrice" type="number" step="any" min="0" placeholder="0.00" style="width:100%;box-sizing:border-box;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:0.5rem 0.75rem;color:#fafafa;font-size:0.9rem;outline:none">' +
+        '</div>' +
+        '<p id="omTypeDesc" style="font-size:0.82rem;color:rgba(255,255,255,0.55);margin:0">Closes any existing position first, then places a <strong>market order immediately</strong>.</p>';
       const confirmBtn = document.getElementById('openModalConfirm');
       confirmBtn.textContent = label;
       confirmBtn.className = confirmCls;
       confirmBtn.onclick = async () => {
-        confirmBtn.textContent = 'Placing order…';
+        const isLimit = _omType === 'limit';
+        const limitPrice = isLimit ? parseFloat(document.getElementById('omLimitPrice').value) : null;
+        if (isLimit && (!limitPrice || limitPrice <= 0)) { alert('Enter a valid limit price.'); return; }
+        confirmBtn.textContent = isLimit ? 'Placing limit order…' : 'Placing order…';
         confirmBtn.disabled = true;
         document.getElementById('openModal').classList.remove('open');
         btn.textContent = 'Executing…'; btn.disabled = true;
         try {
-          const res = await fetch('/api/open', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id, side}) });
+          const payload = { id, side };
+          if (limitPrice) payload.limitPrice = limitPrice;
+          const res = await fetch('/api/open', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
           const d = await res.json();
           if (d.ok) { btn.textContent = '✓'; btn.style.color = color; setTimeout(() => location.reload(), 1500); }
           else { btn.disabled = false; btn.textContent = label; alert('Error: ' + d.error); }
@@ -882,6 +1140,7 @@ function strategiesPage() {
       };
       document.getElementById('openModal').classList.add('open');
     }
+
     async function deleteStrat(id) {
       if (!confirm('Remove this strategy from the trader?\\n\\nThis does not close any open positions.')) return;
       await fetch('/api/strategy/' + id, { method: 'DELETE' });
@@ -1085,6 +1344,20 @@ function settingsPage(saved = false, error = "") {
     </div>`;
   }
 
+  function pemField(label, name, value, hint = "") {
+    // Decode stored \n back to real newlines for display in textarea
+    const display = value.replace(/\\n/g, "\n");
+    const id = `field_${name}`;
+    return `<div>
+      <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">${label}</label>
+      <textarea id="${id}" name="${name}" rows="5" autocomplete="off"
+        placeholder="-----BEGIN EC PRIVATE KEY-----&#10;...&#10;-----END EC PRIVATE KEY-----"
+        style="width:100%;font-family:monospace;font-size:0.72rem;resize:vertical;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#fafafa;padding:0.5rem"
+      >${display.replace(/</g, "&lt;")}</textarea>
+      ${hint ? `<div style="font-size:0.68rem;color:rgba(255,255,255,0.3);margin-top:0.25rem">${hint}</div>` : ""}
+    </div>`;
+  }
+
   function section(title, icon, fields) {
     return `<div class="card" style="margin-bottom:1rem">
       <div style="font-size:0.8rem;font-weight:700;color:#fafafa;margin-bottom:1rem;display:flex;align-items:center;gap:0.5rem">
@@ -1114,28 +1387,6 @@ function settingsPage(saved = false, error = "") {
           <div id="walletInfo" style="font-size:0.72rem;color:rgba(255,255,255,0.3);padding:0.5rem 0.75rem;background:rgba(255,255,255,0.03);border-radius:6px;display:none">
             Wallet: <span id="walletAddr" style="font-family:monospace;color:rgba(168,241,247,0.7)"></span>
           </div>
-        `)}
-
-        ${section("Kraken", "🦀", `
-          ${field("API Key", "KRAKEN_API_KEY", val("KRAKEN_API_KEY"), "text", `kraken.com → Security → API — enable Trade`)}
-          ${field("API Secret", "KRAKEN_API_SECRET", val("KRAKEN_API_SECRET"), "password", "Base64-encoded, shown once at creation")}
-        `)}
-
-        ${section("Alpaca", "🦙", `
-          ${field("API Key", "ALPACA_API_KEY", val("ALPACA_API_KEY"), "text", `alpaca.markets → Your Account → API Keys`)}
-          ${field("API Secret", "ALPACA_API_SECRET", val("ALPACA_API_SECRET"), "password", "Shown once at creation")}
-          <div>
-            <label style="display:flex;align-items:center;gap:0.6rem;cursor:pointer;font-size:0.82rem;color:rgba(255,255,255,0.6)">
-              <input type="checkbox" name="ALPACA_PAPER" value="true" ${val("ALPACA_PAPER") === "true" ? "checked" : ""} style="width:auto;accent-color:#A8F1F7" />
-              Paper trading mode <span style="font-size:0.7rem;color:rgba(255,255,255,0.3)">(paper-api.alpaca.markets)</span>
-            </label>
-          </div>
-        `)}
-
-        ${section("Coinbase", "🔵", `
-          ${field("API Key", "COINBASE_API_KEY", val("COINBASE_API_KEY"), "text", `coinbase.com → Settings → API → New API Key — enable View + Trade`)}
-          ${field("API Secret", "COINBASE_API_SECRET", val("COINBASE_API_SECRET"), "password", "Shown once at creation")}
-          ${field("Passphrase", "COINBASE_API_PASSPHRASE", val("COINBASE_API_PASSPHRASE"), "password", "Set when creating the API key")}
         `)}
 
         ${(function() {
@@ -1235,9 +1486,6 @@ function addStrategyPage(error = "") {
             <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Exchange</label>
             <select name="exchange" style="width:100%">
               <option value="hyperliquid">Hyperliquid (perps)</option>
-              <option value="kraken">Kraken (spot / margin)</option>
-              <option value="alpaca">Alpaca (stocks / crypto)</option>
-              <option value="coinbase">Coinbase (spot crypto)</option>
             </select>
           </div>
           <div>
@@ -1309,7 +1557,8 @@ async function handleClose(body) {
   if (strategy && position) {
     const size = Math.abs(parseFloat(position?.szi ?? "0"));
     const entryPx = parseFloat(position?.entryPx ?? "0");
-    const pnl = size && entryPx ? parseFloat(((midPrice - entryPx) * size * (strategy.leverage ?? 1)).toFixed(2)) : null;
+    const dir = parseFloat(position?.szi ?? "0") >= 0 ? 1 : -1;
+    const pnl = size && entryPx ? parseFloat(((midPrice - entryPx) * size * dir).toFixed(2)) : null;
     const { insertTrade } = await import("./db.mjs");
     insertTrade({ strategy_id: strategy.id, action: `CLOSED ${asset} @ ~$${midPrice.toLocaleString()} [manual]`, asset, size, price: midPrice, leverage: strategy.leverage ?? 1, pnl });
   }
@@ -1378,8 +1627,7 @@ async function handleRun(body) {
   const { x402Client } = await import("@x402/core/client");
   const { decodePaymentRequiredHeader, encodePaymentSignatureHeader } = await import("@x402/core/http");
   const { ExactEvmScheme } = await import("@x402/evm/exact/client");
-  const { toClientEvmSigner } = await import("@x402/evm");
-  const { createPublicClient, http } = await import("viem");
+  const { http } = await import("viem");
   const { privateKeyToAccount } = await import("viem/accounts");
   const allChains = await import("viem/chains");
 
@@ -1394,20 +1642,23 @@ async function handleRun(body) {
     if (probe.ok) {
       signalData = await probe.json();
     } else if (probe.status === 402) {
-      const rawHeader = probe.headers.get("X-PAYMENT-REQUIRED");
-      if (!rawHeader) throw new Error("No X-PAYMENT-REQUIRED header");
+      // x402 v2 uses "payment-required"; v1 used "X-PAYMENT-REQUIRED" — try both
+      const rawHeader = probe.headers.get("payment-required") ?? probe.headers.get("X-PAYMENT-REQUIRED");
+      if (!rawHeader) throw new Error("No payment-required header in 402 response");
       const paymentRequired = decodePaymentRequiredHeader(rawHeader);
 
       // Network comes from the server's 402 response — no local setting needed
       const serverNetwork = paymentRequired.accepts?.[0]?.network ?? paymentRequired.accepts?.network;
-      const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS[getPaymentNetwork()] ?? X402_NETWORKS["eip155:42161"];
+      const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS[getPaymentNetwork()] ?? X402_NETWORKS["eip155:8453"];
       const chain = allChains[networkCfg.viemChain];
-      const publicClient = createPublicClient({ chain, transport: http(networkCfg.rpc) });
-      const signer = toClientEvmSigner(account, publicClient);
+      const walletClient = (await import("viem")).createWalletClient({ account, chain, transport: http(networkCfg.rpc) });
+      const signer = Object.assign(walletClient, { address: account.address });
       client.register(serverNetwork, new ExactEvmScheme(signer));
 
+      console.log(`[run-strategy] 💳 Paying on ${networkCfg.label ?? serverNetwork}`);
       const paymentPayload = await client.createPaymentPayload(paymentRequired);
-      const paid = await fetch(url, { headers: { "X-PAYMENT": encodePaymentSignatureHeader(paymentPayload) } });
+      const paymentHeader = encodePaymentSignatureHeader(paymentPayload);
+      const paid = await fetch(url, { headers: { "payment-signature": paymentHeader } });
       console.log(`[run-strategy] paid status: ${paid.status}`);
       if (paid.ok) {
         signalData = await paid.json();
@@ -1476,13 +1727,13 @@ async function handleRun(body) {
   } else if (signal === "FLAT" && !isFlat) {
     if (entryPrice > 0) {
       const dir = isLong ? 1 : -1;
-      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize) * leverage * dir).toFixed(2));
+      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize) * dir).toFixed(2));
     }
     await exch.closePosition(asset);
     action = `CLOSED ${Math.abs(currentSize)} ${asset} @ ~$${midPrice.toLocaleString()}`;
   } else if (signal === "SHORT" && !isFlat) {
     if (entryPrice > 0 && isLong) {
-      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize) * leverage).toFixed(2));
+      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize)).toFixed(2));
     }
     await exch.closePosition(asset);
     await exch.setLeverage(asset, leverage);
@@ -1496,18 +1747,22 @@ async function handleRun(body) {
 }
 
 async function handleOpen(body) {
-  const { id, side } = JSON.parse(body);
+  const { id, side, limitPrice } = JSON.parse(body);
   if (side !== "buy" && side !== "sell") return { ok: false, error: "side must be buy or sell" };
+  if (limitPrice !== undefined && (typeof limitPrice !== "number" || limitPrice <= 0)) return { ok: false, error: "limitPrice must be a positive number" };
   const strategy = getStrategy(id);
   if (!strategy) return { ok: false, error: "Strategy not found" };
 
   const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
   const { KrakenExchange } = await import("./exchanges/kraken.mjs");
   const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
+  const { CoinbaseExchange } = await import("./exchanges/coinbase.mjs");
   const exch = strategy.exchange === "kraken"
     ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
     : strategy.exchange === "alpaca"
     ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
+    : strategy.exchange === "coinbase"
+    ? new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE)
     : new HyperliquidExchange(PRIVATE_KEY);
 
   const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
@@ -1520,13 +1775,37 @@ async function handleOpen(body) {
 
   if (currentSize !== 0) await exch.closePosition(asset);
   await exch.setLeverage(asset, leverage);
-  await exch.placeMarketOrder(asset, side, positionSize);
-  const action = `${side === "buy" ? "ENTERED LONG" : "SHORTED"} ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x) [manual]`;
+  if (limitPrice) {
+    await exch.placeLimitOrder(asset, side, positionSize, limitPrice);
+  } else {
+    await exch.placeMarketOrder(asset, side, positionSize);
+  }
+  const orderType = limitPrice ? `limit @ $${limitPrice.toLocaleString()}` : `market @ ~$${midPrice.toLocaleString()}`;
+  const action = `${side === "buy" ? "ENTERED LONG" : "SHORTED"} ${positionSize} ${asset} (${orderType}, ${leverage}x) [manual]`;
 
   const { insertTrade } = await import("./db.mjs");
   insertTrade({ strategy_id: id, action, asset, size: positionSize, price: midPrice, leverage });
   return { ok: true, action };
 }
+
+async function handleCancelOrder(body) {
+  const { exchange, orderId, asset } = JSON.parse(body);
+  const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
+  const { KrakenExchange } = await import("./exchanges/kraken.mjs");
+  const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
+  const { CoinbaseExchange } = await import("./exchanges/coinbase.mjs");
+  const exch = exchange === "Kraken"
+    ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
+    : exchange === "Alpaca"
+    ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
+    : exchange === "Coinbase"
+    ? new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE)
+    : new HyperliquidExchange(PRIVATE_KEY);
+  await exch.cancelOrder(orderId, asset);
+  return { ok: true };
+}
+
+
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
@@ -1543,6 +1822,7 @@ const server = createServer(async (req, res) => {
   try {
     if (url === "/" || url === "") return redirect("/positions");
 
+    if (url === "/portfolio") return send(await portfolioPage());
     if (url === "/positions") return send(await positionsPage());
     if (url === "/strategies") return send(strategiesPage());
     if (url === "/signals") return send(signalsPage());
@@ -1557,8 +1837,13 @@ const server = createServer(async (req, res) => {
                           "ALPACA_API_KEY","ALPACA_API_SECRET",
                           "COINBASE_API_KEY","COINBASE_API_SECRET","COINBASE_API_PASSPHRASE",
                           "X402_PAYMENT_NETWORK"]) {
-        const v = params.get(key)?.trim();
-        if (v) updates[key] = v;
+        let v = params.get(key)?.trim();
+        if (!v) continue;
+        // PEM keys contain real newlines from the textarea — encode to \n for single-line .env storage
+        if (key === "COINBASE_API_SECRET" && v.includes("\n")) {
+          v = v.replace(/\r?\n/g, "\\n");
+        }
+        updates[key] = v;
       }
       // Checkbox — present = true, absent = false
       updates["ALPACA_PAPER"] = params.get("ALPACA_PAPER") === "true" ? "true" : "false";
@@ -1611,6 +1896,11 @@ const server = createServer(async (req, res) => {
       const body = await readBody();
       return json(await handleOpen(body).catch(e => ({ ok: false, error: e.message })));
     }
+    if (url === "/api/cancel-order" && method === "POST") {
+      const body = await readBody();
+      return json(await handleCancelOrder(body).catch(e => ({ ok: false, error: e.message })));
+    }
+
     if (url === "/api/pm2-status" && method === "GET") {
       try {
         const { exec } = await import("child_process");

@@ -110,6 +110,35 @@ export class AlpacaExchange {
     });
   }
 
+  async placeLimitOrder(asset, side, size, limitPrice) {
+    const sym = alpacaSymbol(asset);
+    const tif = isCrypto(asset) ? "gtc" : "day";
+    console.log(`[alpaca] Limit ${side.toUpperCase()} ${size} ${sym} @ $${limitPrice} (${tif})`);
+    return this._request("POST", "/v2/orders", {
+      symbol:        sym,
+      qty:           size.toString(),
+      side,
+      type:          "limit",
+      time_in_force: tif,
+      limit_price:   limitPrice.toString(),
+    });
+  }
+
+  async getOpenOrders() {
+    const orders = await this._request("GET", "/v2/orders?status=open&limit=100") ?? [];
+    return orders.map(o => ({
+      id:         o.id,
+      asset:      o.symbol,
+      side:       o.side,
+      size:       parseFloat(o.qty ?? "0"),
+      limitPrice: parseFloat(o.limit_price ?? "0"),
+    }));
+  }
+
+  async cancelOrder(orderId) {
+    return this._request("DELETE", `/v2/orders/${encodeURIComponent(orderId)}`);
+  }
+
   async closePosition(asset) {
     const sym = alpacaSymbol(asset);
     console.log(`[alpaca] Closing position for ${sym}`);

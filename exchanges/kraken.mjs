@@ -113,6 +113,44 @@ export class KrakenExchange {
     }
   }
 
+  async _balance() {
+    return krakenRequest(this.apiKey, this.apiSecret, "/0/private/Balance");
+  }
+
+  async placeLimitOrder(asset, side, size, limitPrice) {
+    const pair = toKrakenPair(asset);
+    const params = {
+      ordertype: "limit",
+      type: side,
+      volume: size.toString(),
+      price: limitPrice.toString(),
+      pair,
+    };
+    if (this._leverage > 1) params.leverage = this._leverage.toString();
+    console.log(`[kraken] Limit ${side.toUpperCase()} ${size} ${asset} @ $${limitPrice}`);
+    return krakenRequest(this.apiKey, this.apiSecret, "/0/private/AddOrder", params);
+  }
+
+  async getOpenOrders() {
+    const result = await krakenRequest(this.apiKey, this.apiSecret, "/0/private/OpenOrders");
+    return Object.entries(result?.open ?? {}).map(([txid, o]) => {
+      // Kraken pair e.g. "XXBTZUSD" → strip known wrapping
+      const raw = o.descr?.pair ?? "";
+      const asset = raw.replace(/^X/, "").replace(/ZUSD$|USD$/, "").replace(/^XBT$/, "BTC") || raw;
+      return {
+        id: txid,
+        asset,
+        side: o.descr?.type ?? "?",
+        size: parseFloat(o.vol ?? "0") - parseFloat(o.vol_exec ?? "0"),
+        limitPrice: parseFloat(o.descr?.price ?? "0"),
+      };
+    });
+  }
+
+  async cancelOrder(orderId) {
+    return krakenRequest(this.apiKey, this.apiSecret, "/0/private/CancelOrder", { txid: orderId });
+  }
+
   async setLeverage(asset, leverage) {
     // Stored and applied at order time (Kraken specifies leverage per-order)
     this._leverage = leverage;
