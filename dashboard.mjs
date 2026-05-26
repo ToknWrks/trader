@@ -1379,7 +1379,7 @@ function settingsPage(saved = false, error = "") {
 
 
         ${section("General", "⚙️", `
-          ${field("Default Position Size (USD)", "HL_POSITION_SIZE_USD", val("HL_POSITION_SIZE_USD") || "10", "text", "Per-trade size used when a strategy has no size override")}
+          ${field("Default Margin to Risk (USD)", "HL_POSITION_SIZE_USD", val("HL_POSITION_SIZE_USD") || "10", "text", "Margin per trade — notional = margin × leverage. Used when a strategy has no size override.")}
         `)}
 
         ${section("Hyperliquid", "⚡", `
@@ -1470,8 +1470,8 @@ function addStrategyPage(error = "") {
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem">
           <div>
-            <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Position Size (USD)</label>
-            <input name="position_size_usd" type="number" placeholder="e.g. 100" style="width:100%" />
+            <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Margin to Risk (USD)</label>
+            <input name="position_size_usd" type="number" placeholder="e.g. 50" style="width:100%" />
           </div>
           <div>
             <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Leverage</label>
@@ -1588,7 +1588,7 @@ async function handleExecute(body) {
   const leverage = strategy.leverage ?? 1;
   const sizeUsd  = strategy.position_size_usd ?? parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
   const midPrice = await getMidPrice(hlAsset);
-  const positionSize = parseFloat((sizeUsd / midPrice).toFixed(5));
+  const positionSize = parseFloat(((sizeUsd * leverage) / midPrice).toFixed(5));
   const position = await getPosition(account.address, hlAsset);
   const currentSize = parseFloat(position?.szi ?? "0");
   const isFlat = currentSize === 0;
@@ -1711,7 +1711,7 @@ async function handleRun(body) {
   const leverage = strategy.leverage ?? 1;
   const sizeUsd  = strategy.position_size_usd ?? parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
   const midPrice = await exch.getMidPrice(asset);
-  const positionSize = parseFloat((sizeUsd / midPrice).toFixed(5));
+  const positionSize = parseFloat(((sizeUsd * leverage) / midPrice).toFixed(5));
   const position = await exch.getPosition(asset);
   const currentSize  = parseFloat(position?.szi ?? "0");
   const entryPrice   = parseFloat(position?.entryPx ?? "0");
@@ -1769,7 +1769,7 @@ async function handleOpen(body) {
   const leverage = strategy.leverage ?? 1;
   const sizeUsd  = strategy.position_size_usd ?? parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
   const midPrice = await exch.getMidPrice(asset);
-  const positionSize = parseFloat((sizeUsd / midPrice).toFixed(5));
+  const positionSize = parseFloat(((sizeUsd * leverage) / midPrice).toFixed(5));
   const position = await exch.getPosition(asset);
   const currentSize = parseFloat(position?.szi ?? "0");
 
