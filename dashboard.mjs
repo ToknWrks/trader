@@ -71,6 +71,7 @@ import {
   getStrategies, getStrategy, upsertStrategy, setStrategyActive,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
   countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents, getYtdPnl,
+  getSnapshots,
 } from "./db.mjs";
 
 // ── x402 network config ───────────────────────────────────────────────────────
@@ -364,7 +365,7 @@ function shell(title, body, active = "") {
 
   <script>
     const SCHEDULES = ${JSON.stringify(SCHEDULES)};
-    const CRYPTO_TICKERS = new Set(["BTC","ETH","SOL","BNB","XRP","ADA","AVAX","DOT","MATIC","POL","LINK","UNI","ATOM","LTC","DOGE","SHIB","TRX","TON","SUI","APT","OP","ARB","INJ","SEI","TIA","JUP","WIF","BONK","PEPE","NEAR","FIL","ICP","HBAR","VET","ALGO","XLM","XMR","ETC","BCH","AAVE","CRV","MKR","SNX","LDO","RETH","STETH","WBTC","VVV","VULT"]);
+    const CRYPTO_TICKERS = new Set(["BTC","ETH","SOL","BNB","XRP","ADA","AVAX","DOT","MATIC","POL","LINK","UNI","ATOM","LTC","DOGE","SHIB","TRX","TON","SUI","APT","OP","ARB","INJ","SEI","TIA","JUP","WIF","BONK","PEPE","NEAR","FIL","ICP","HBAR","VET","ALGO","XLM","XMR","ETC","BCH","AAVE","CRV","MKR","SNX","LDO","RETH","STETH","WBTC","VVV","VULT","ZEC"]);
     function isCrypto(symbol) { return CRYPTO_TICKERS.has(symbol.toUpperCase().replace(/-USD$/, "").replace(/\\/USD$/, "")); }
 
     function closeModal() {
@@ -527,6 +528,72 @@ function writeEnvValues(updates) {
   }
 }
 
+// ── Equity curve (server-side SVG) ────────────────────────────────────────────
+
+function renderEquityCurve(snapshots) {
+  if (snapshots.length < 2) {
+    const val = snapshots[0]?.net_liq;
+    const valStr = val != null ? `$${val.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}` : "—";
+    return `<div class="card" style="margin-bottom:1.5rem">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem">
+        <h2 style="margin:0;font-size:0.9rem">Account Value</h2>
+        <span style="font-size:0.75rem;color:rgba(255,255,255,0.3)">Hyperliquid · daily snapshot</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:1rem;padding:1rem 0">
+        ${val != null ? `<span style="font-size:1.5rem;font-weight:700;color:#fafafa">${valStr}</span><span style="font-size:0.75rem;color:rgba(255,255,255,0.3)">today's baseline captured — chart builds after day 2</span>` : `<span style="font-size:0.78rem;color:rgba(255,255,255,0.3)">No snapshots yet — run the trader to start tracking account value.</span>`}
+      </div>
+    </div>`;
+  }
+  const points = snapshots.map(s => s.net_liq);
+  const dates  = snapshots.map(s => s.date);
+  const minY = Math.min(...points);
+  const maxY = Math.max(...points);
+  const rangeY = maxY - minY || 1;
+  const W = 1000, H = 130;
+  const pL = 62, pR = 10, pT = 10, pB = 22;
+  const cW = W - pL - pR, cH = H - pT - pB;
+
+  const sx = i => (pL + (i / (points.length - 1)) * cW).toFixed(1);
+  const sy = v => (pT + cH - ((v - minY) / rangeY) * cH).toFixed(1);
+
+  const coords = points.map((v, i) => `${sx(i)},${sy(v)}`);
+  const lineD = "M" + coords.join(" L");
+  const fillD = lineD + ` L${sx(points.length - 1)},${pT + cH} L${pL},${pT + cH} Z`;
+
+  const last = points[points.length - 1];
+  const first = points[0];
+  const isUp = last >= first;
+  const color = isUp ? "#4ade80" : "#f87171";
+  const fill  = isUp ? "rgba(74,222,128,0.07)" : "rgba(248,113,113,0.07)";
+  const pct   = ((last - first) / first * 100);
+  const pctStr = (pct >= 0 ? "+" : "") + pct.toFixed(1) + "%";
+
+  const fmt = v => "$" + v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  const mid = Math.floor((dates.length - 1) / 2);
+  const dateFmt = d => d.slice(5); // MM-DD
+
+  return `<div class="card" style="margin-bottom:1.5rem">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem">
+      <h2 style="margin:0;font-size:0.9rem">Account Value</h2>
+      <span style="font-size:0.75rem;color:${color};font-weight:600">${pctStr} <span style="color:rgba(255,255,255,0.3);font-weight:400">· ${snapshots.length}d</span></span>
+    </div>
+    <svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;height:auto">
+      <line x1="${pL}" y1="${pT}"        x2="${W-pR}" y2="${pT}"        stroke="rgba(255,255,255,0.05)" stroke-width="1"/>
+      <line x1="${pL}" y1="${pT+cH/2}"   x2="${W-pR}" y2="${pT+cH/2}"  stroke="rgba(255,255,255,0.05)" stroke-width="1"/>
+      <line x1="${pL}" y1="${pT+cH}"     x2="${W-pR}" y2="${pT+cH}"    stroke="rgba(255,255,255,0.05)" stroke-width="1"/>
+      <text x="${pL-5}" y="${pT+4}"      text-anchor="end" font-size="12" fill="rgba(255,255,255,0.3)">${fmt(maxY)}</text>
+      <text x="${pL-5}" y="${pT+cH/2+4}" text-anchor="end" font-size="12" fill="rgba(255,255,255,0.3)">${fmt((maxY+minY)/2)}</text>
+      <text x="${pL-5}" y="${pT+cH+4}"  text-anchor="end" font-size="12" fill="rgba(255,255,255,0.3)">${fmt(minY)}</text>
+      <path d="${fillD}" fill="${fill}"/>
+      <path d="${lineD}" fill="none" stroke="${color}" stroke-width="1.5"/>
+      <circle cx="${sx(points.length-1)}" cy="${sy(last)}" r="3" fill="${color}"/>
+      <text x="${sx(0)}"   y="${H-4}" text-anchor="start"  font-size="11" fill="rgba(255,255,255,0.3)">${dateFmt(dates[0])}</text>
+      <text x="${sx(mid)}" y="${H-4}" text-anchor="middle" font-size="11" fill="rgba(255,255,255,0.3)">${dateFmt(dates[mid])}</text>
+      <text x="${sx(dates.length-1)}" y="${H-4}" text-anchor="end" font-size="11" fill="rgba(255,255,255,0.3)">${dateFmt(dates[dates.length-1])}</text>
+    </svg>
+  </div>`;
+}
+
 // ── Pages ─────────────────────────────────────────────────────────────────────
 
 async function portfolioPage() {
@@ -658,6 +725,8 @@ async function portfolioPage() {
   const ytdPct = startingValue > 0 ? (ytdPnl / startingValue) * 100 : 0;
   const ytdSign = ytdPnl >= 0 ? "+" : "";
 
+  const equityCurveHtml = renderEquityCurve(getSnapshots(90));
+
   return shell("Portfolio", `
     ${!PRIVATE_KEY ? '<p style="color:#f87171;margin-bottom:1rem">⚠️ AGENT_PRIVATE_KEY not set — run <code>npm run setup</code></p>' : ""}
     <div class="stat-row" style="margin-bottom:2rem">
@@ -674,6 +743,7 @@ async function portfolioPage() {
         <div class="value ${ytdPnl >= 0 ? "green" : "red"}">${ytdSign}$${Math.abs(ytdPnl).toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})} <span style="font-size:0.75em;opacity:0.7">(${ytdSign}${ytdPct.toFixed(1)}%)</span></div>
       </div>
     </div>
+    ${equityCurveHtml}
     ${accountValue > 0 || usdcSpot > 0 ? `
     <details class="accordion" open>
       <summary>Hyperliquid</summary>
@@ -929,7 +999,7 @@ function tvSymbol(symbol, exchange = "hyperliquid") {
   }
   if (exchange === "coinbase") return `COINBASE:${base}USD`;
   // Hyperliquid / Alpaca crypto: Binance USDT pairs; Alpaca stocks: exchange-specific
-  const crypto = { BTC:"BINANCE:BTCUSDT",ETH:"BINANCE:ETHUSDT",SOL:"BINANCE:SOLUSDT",BNB:"BINANCE:BNBUSDT",XRP:"BINANCE:XRPUSDT",ADA:"BINANCE:ADAUSDT",AVAX:"BINANCE:AVAXUSDT",DOGE:"BINANCE:DOGEUSDT",LINK:"BINANCE:LINKUSDT",DOT:"BINANCE:DOTUSDT",MATIC:"BINANCE:MATICUSDT",POL:"BINANCE:POLUSDT",UNI:"BINANCE:UNIUSDT",ATOM:"BINANCE:ATOMUSDT",LTC:"BINANCE:LTCUSDT",SHIB:"BINANCE:SHIBUSDT",TRX:"BINANCE:TRXUSDT",SUI:"BINANCE:SUIUSDT",APT:"BINANCE:APTUSDT",INJ:"BINANCE:INJUSDT",NEAR:"BINANCE:NEARUSDT",ARB:"BINANCE:ARBUSDT",OP:"BINANCE:OPUSDT",WIF:"BINANCE:WIFUSDT",PEPE:"BINANCE:PEPEUSDT",BONK:"BINANCE:BONKUSDT",AKT:"BINANCE:AKTUSDT" };
+  const crypto = { BTC:"BINANCE:BTCUSDT",ETH:"BINANCE:ETHUSDT",SOL:"BINANCE:SOLUSDT",BNB:"BINANCE:BNBUSDT",XRP:"BINANCE:XRPUSDT",ADA:"BINANCE:ADAUSDT",AVAX:"BINANCE:AVAXUSDT",DOGE:"BINANCE:DOGEUSDT",LINK:"BINANCE:LINKUSDT",DOT:"BINANCE:DOTUSDT",MATIC:"BINANCE:MATICUSDT",POL:"BINANCE:POLUSDT",UNI:"BINANCE:UNIUSDT",ATOM:"BINANCE:ATOMUSDT",LTC:"BINANCE:LTCUSDT",SHIB:"BINANCE:SHIBUSDT",TRX:"BINANCE:TRXUSDT",SUI:"BINANCE:SUIUSDT",APT:"BINANCE:APTUSDT",INJ:"BINANCE:INJUSDT",NEAR:"BINANCE:NEARUSDT",ARB:"BINANCE:ARBUSDT",OP:"BINANCE:OPUSDT",WIF:"BINANCE:WIFUSDT",PEPE:"BINANCE:PEPEUSDT",BONK:"BINANCE:BONKUSDT",AKT:"BINANCE:AKTUSDT",ZEC:"BINANCE:ZECUSDT" };
   const stocks = { SPY:"AMEX:SPY",QQQ:"NASDAQ:QQQ",IWM:"AMEX:IWM",GLD:"AMEX:GLD",AAPL:"NASDAQ:AAPL",TSLA:"NASDAQ:TSLA",NVDA:"NASDAQ:NVDA",MSFT:"NASDAQ:MSFT",AMZN:"NASDAQ:AMZN",GOOGL:"NASDAQ:GOOGL" };
   return crypto[base] || stocks[base] || base;
 }
@@ -1520,6 +1590,65 @@ function addStrategyPage(error = "") {
   `, "strategies");
 }
 
+// ── Local price-threshold evaluation (no x402) ───────────────────────────────
+
+async function tryLocalEvalDash(strategy) {
+  try {
+    const res = await fetch(`${getSignalUrl()}/api/strategy/${strategy.id}`);
+    if (!res.ok) return null;
+    const def = await res.json();
+    const entry = typeof def.entry === "string" ? JSON.parse(def.entry) : def.entry;
+    const exit  = typeof def.exit  === "string" ? JSON.parse(def.exit)  : def.exit;
+
+    const allConds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
+    if (!allConds.length) return null;
+    const priceFlds = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
+    if (!allConds.every(c => priceFlds.has((c.field ?? "close").toLowerCase()))) return null;
+
+    const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
+    const { KrakenExchange }      = await import("./exchanges/kraken.mjs");
+    const { AlpacaExchange }      = await import("./exchanges/alpaca.mjs");
+    const exch = strategy.exchange === "kraken"
+      ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
+      : strategy.exchange === "alpaca"
+      ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
+      : new HyperliquidExchange(PRIVATE_KEY);
+
+    const asset = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
+    const [price, position] = await Promise.all([
+      exch.getMidPrice(asset),
+      exch.getPosition(asset).catch(() => null),
+    ]);
+    if (!price) return null;
+
+    const hasPosition = parseFloat(position?.szi ?? "0") !== 0;
+
+    const evalRules = (rules, p) => {
+      if (!rules?.conditions?.length) return false;
+      const results = rules.conditions.map(c => {
+        const v = parseFloat(c.value);
+        switch (c.op) {
+          case "<=": return p <= v;
+          case ">=": return p >= v;
+          case "<":  return p <  v;
+          case ">":  return p >  v;
+          default:   return false;
+        }
+      });
+      return rules.operator === "AND" ? results.every(Boolean) : results.some(Boolean);
+    };
+
+    // Scalper model: derived from actual position + conditions, not signal history
+    const signal = hasPosition
+      ? (evalRules(exit, price) ? "FLAT" : "LONG")
+      : (evalRules(entry, price) ? "LONG" : "FLAT");
+
+    return { signal, price };
+  } catch {
+    return null;
+  }
+}
+
 // ── API handlers ──────────────────────────────────────────────────────────────
 
 async function handleClose(body) {
@@ -1623,57 +1752,59 @@ async function handleRun(body) {
   const strategy = getStrategy(id);
   if (!strategy) return { ok: false, error: "Strategy not found" };
 
-  // Fetch live signal
-  const { x402Client } = await import("@x402/core/client");
-  const { decodePaymentRequiredHeader, encodePaymentSignatureHeader } = await import("@x402/core/http");
-  const { ExactEvmScheme } = await import("@x402/evm/exact/client");
-  const { http } = await import("viem");
-  const { privateKeyToAccount } = await import("viem/accounts");
-  const allChains = await import("viem/chains");
+  // Try local price evaluation first (free, no x402 cost)
+  let signalData = await tryLocalEvalDash(strategy);
 
-  const account = privateKeyToAccount(PRIVATE_KEY);
-  const client = new x402Client();
+  if (!signalData) {
+    // Fall back to x402 fetch
+    const { x402Client } = await import("@x402/core/client");
+    const { decodePaymentRequiredHeader, encodePaymentSignatureHeader } = await import("@x402/core/http");
+    const { ExactEvmScheme } = await import("@x402/evm/exact/client");
+    const { http } = await import("viem");
+    const { privateKeyToAccount } = await import("viem/accounts");
+    const allChains = await import("viem/chains");
 
-  const url = `${getSignalUrl()}/api/strategy/${id}/signal`;
-  let signalData = null;
-  try {
-    const probe = await fetch(url);
-    console.log(`[run-strategy] probe status: ${probe.status}`);
-    if (probe.ok) {
-      signalData = await probe.json();
-    } else if (probe.status === 402) {
-      // x402 v2 uses "payment-required"; v1 used "X-PAYMENT-REQUIRED" — try both
-      const rawHeader = probe.headers.get("payment-required") ?? probe.headers.get("X-PAYMENT-REQUIRED");
-      if (!rawHeader) throw new Error("No payment-required header in 402 response");
-      const paymentRequired = decodePaymentRequiredHeader(rawHeader);
+    const account = privateKeyToAccount(PRIVATE_KEY);
+    const client = new x402Client();
 
-      // Network comes from the server's 402 response — no local setting needed
-      const serverNetwork = paymentRequired.accepts?.[0]?.network ?? paymentRequired.accepts?.network;
-      const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS[getPaymentNetwork()] ?? X402_NETWORKS["eip155:8453"];
-      const chain = allChains[networkCfg.viemChain];
-      const walletClient = (await import("viem")).createWalletClient({ account, chain, transport: http(networkCfg.rpc) });
-      const signer = Object.assign(walletClient, { address: account.address });
-      client.register(serverNetwork, new ExactEvmScheme(signer));
+    const url = `${getSignalUrl()}/api/strategy/${id}/signal`;
+    try {
+      const probe = await fetch(url);
+      console.log(`[run-strategy] probe status: ${probe.status}`);
+      if (probe.ok) {
+        signalData = await probe.json();
+      } else if (probe.status === 402) {
+        const rawHeader = probe.headers.get("payment-required") ?? probe.headers.get("X-PAYMENT-REQUIRED");
+        if (!rawHeader) throw new Error("No payment-required header in 402 response");
+        const paymentRequired = decodePaymentRequiredHeader(rawHeader);
 
-      console.log(`[run-strategy] 💳 Paying on ${networkCfg.label ?? serverNetwork}`);
-      const paymentPayload = await client.createPaymentPayload(paymentRequired);
-      const paymentHeader = encodePaymentSignatureHeader(paymentPayload);
-      const paid = await fetch(url, { headers: { "payment-signature": paymentHeader } });
-      console.log(`[run-strategy] paid status: ${paid.status}`);
-      if (paid.ok) {
-        signalData = await paid.json();
+        const serverNetwork = paymentRequired.accepts?.[0]?.network ?? paymentRequired.accepts?.network;
+        const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS[getPaymentNetwork()] ?? X402_NETWORKS["eip155:8453"];
+        const chain = allChains[networkCfg.viemChain];
+        const walletClient = (await import("viem")).createWalletClient({ account, chain, transport: http(networkCfg.rpc) });
+        const signer = Object.assign(walletClient, { address: account.address });
+        client.register(serverNetwork, new ExactEvmScheme(signer));
+
+        console.log(`[run-strategy] 💳 Paying on ${networkCfg.label ?? serverNetwork}`);
+        const paymentPayload = await client.createPaymentPayload(paymentRequired);
+        const paymentHeader = encodePaymentSignatureHeader(paymentPayload);
+        const paid = await fetch(url, { headers: { "payment-signature": paymentHeader } });
+        console.log(`[run-strategy] paid status: ${paid.status}`);
+        if (paid.ok) {
+          signalData = await paid.json();
+        } else {
+          const errBody = await paid.text().catch(() => "");
+          throw new Error(`Payment rejected (${paid.status}): ${errBody.slice(0, 200)}`);
+        }
       } else {
-        const errBody = await paid.text().catch(() => "");
-        throw new Error(`Payment rejected (${paid.status}): ${errBody.slice(0, 200)}`);
+        throw new Error(`Unexpected probe status: ${probe.status}`);
       }
-    } else {
-      throw new Error(`Unexpected probe status: ${probe.status}`);
+    } catch (err) {
+      console.error(`[run-strategy] signal fetch error:`, err.message);
+      return { ok: false, error: `Could not fetch signal: ${err.message}` };
     }
-  } catch (err) {
-    console.error(`[run-strategy] signal fetch error:`, err.message);
-    return { ok: false, error: `Could not fetch signal: ${err.message}` };
+    if (!signalData) return { ok: false, error: "Could not fetch signal from AgentSignal" };
   }
-  if (!signalData) return { ok: false, error: "Could not fetch signal from AgentSignal" };
 
   const signal = signalData.signal;
   const price  = signalData.price ?? null;

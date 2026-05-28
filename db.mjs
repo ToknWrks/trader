@@ -70,10 +70,10 @@ export function getStrategy(id) {
   return db.prepare("SELECT * FROM strategies WHERE id = ?").get(id);
 }
 
-export function upsertStrategy({ id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct }) {
+export function upsertStrategy({ id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct, max_size_usd, cooldown_minutes }) {
   db.prepare(`
-    INSERT INTO strategies (id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO strategies (id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct, max_size_usd, cooldown_minutes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       symbol = excluded.symbol,
@@ -82,8 +82,10 @@ export function upsertStrategy({ id, name, symbol, leverage, position_size_usd, 
       exchange = excluded.exchange,
       interval_minutes = excluded.interval_minutes,
       tp_pct = excluded.tp_pct,
-      trail_pct = excluded.trail_pct
-  `).run(id, name, symbol, leverage ?? 1, position_size_usd ?? null, exchange ?? "hyperliquid", interval_minutes ?? 60, tp_pct ?? null, trail_pct ?? null);
+      trail_pct = excluded.trail_pct,
+      max_size_usd = excluded.max_size_usd,
+      cooldown_minutes = excluded.cooldown_minutes
+  `).run(id, name, symbol, leverage ?? 1, position_size_usd ?? null, exchange ?? "hyperliquid", interval_minutes ?? 60, tp_pct ?? null, trail_pct ?? null, max_size_usd ?? null, cooldown_minutes ?? null);
 }
 
 export function touchStrategyRun(id) {
@@ -104,6 +106,8 @@ try { db.exec("ALTER TABLE strategies ADD COLUMN interval_minutes INTEGER NOT NU
 try { db.exec("ALTER TABLE strategies ADD COLUMN last_run_at TEXT"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN tp_pct REAL"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN trail_pct REAL"); } catch {}
+try { db.exec("ALTER TABLE strategies ADD COLUMN max_size_usd REAL"); } catch {}
+try { db.exec("ALTER TABLE strategies ADD COLUMN cooldown_minutes INTEGER"); } catch {}
 
 // ── TP / Trail state (one row per open position) ──────────────────────────────
 
@@ -333,4 +337,45 @@ export function getAllRecentTrades(limit = 50) {
     LEFT JOIN strategies s ON s.id = t.strategy_id
     ORDER BY t.created_at DESC LIMIT ?
   `).all(limit);
+}
+
+export function getLastTradeTime(strategy_id) {
+  const row = db.prepare(
+    "SELECT MAX(created_at) as last_at FROM trades WHERE strategy_id = ?"
+  ).get(strategy_id);
+  return row?.last_at ?? null;
+}
+
+// ── Account snapshots (equity curve) ─────────────────────────────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT NOT NULL DEFAULT (datetime('now')),
+    net_liq         REAL NOT NULL,
+    unrealized_pnl  REAL NOT NULL DEFAULT 0,
+    realized_pnl    REAL NOT NULL DEFAULT 0,
+    total_value     REAL NOT NULL
+  )
+`);
+
+export function insertSnapshot({ net_liq, unrealized_pnl = 0, realized_pnl = 0, total_value }) {
+  db.prepare(`
+    INSERT INTO snapshots (net_liq, unrealized_pnl, realized_pnl, total_value)
+    VALUES (?, ?, ?, ?)
+  `).run(net_liq, unrealized_pnl, realized_pnl, total_value ?? net_liq);
+}
+
+export function getSnapshots(days = 90) {
+  return db.prepare(`
+    SELECT date(timestamp) as date,
+           AVG(net_liq)        as net_liq,
+           AVG(unrealized_pnl) as unrealized_pnl,
+           AVG(realized_pnl)   as realized_pnl,
+           AVG(total_value)    as total_value
+    FROM snapshots
+    WHERE timestamp >= datetime('now', '-${days} days')
+    GROUP BY date(timestamp)
+    ORDER BY date ASC
+  `).all();
 }

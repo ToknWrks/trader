@@ -4,6 +4,7 @@
  * Env: AGENT_PRIVATE_KEY — 0x-prefixed private key
  */
 
+import Decimal from "decimal.js";
 import { privateKeyToAccount } from "viem/accounts";
 import { createWalletClient, http } from "viem";
 import { mainnet } from "viem/chains";
@@ -49,7 +50,7 @@ function getSzDecimals(asset) {
 
 function fmtSize(size, asset) {
   const dec = getSzDecimals(asset);
-  return size.toFixed(dec);
+  return new Decimal(String(size)).toDecimalPlaces(dec).toFixed(dec);
 }
 
 async function getAssetIndex(asset) {

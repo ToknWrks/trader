@@ -13,6 +13,7 @@ import { readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { argv } from "process";
+import Decimal from "decimal.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -67,7 +68,7 @@ const CRYPTO_TICKERS = new Set([
   "BTC","ETH","SOL","BNB","XRP","ADA","AVAX","DOT","MATIC","POL","LINK","UNI",
   "ATOM","LTC","DOGE","SHIB","TRX","TON","SUI","APT","OP","ARB","INJ","SEI",
   "TIA","JUP","WIF","BONK","PEPE","NEAR","FIL","ICP","HBAR","VET","ALGO","XLM",
-  "XMR","ETC","BCH","AAVE","CRV","MKR","SNX","LDO","RETH","STETH","WBTC","VVV","VULT",
+  "XMR","ETC","BCH","AAVE","CRV","MKR","SNX","LDO","RETH","STETH","WBTC","VVV","VULT","ZEC",
 ]);
 
 function isCrypto(symbol) {
@@ -87,7 +88,8 @@ import {
   getActiveStrategies, upsertSignal, getLatestSignal,
   getPriorSignal, insertTrade, isStrategyDue, touchStrategyRun,
   insertSignalEvent, setTpState, getTpState, updateTpTrailMode,
-  updateTpHighWater, clearTpState, logFetch,
+  updateTpHighWater, clearTpState, logFetch, getLastTradeTime,
+  insertSnapshot, getYtdPnl,
 } from "./db.mjs";
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
@@ -111,6 +113,94 @@ function getExchange(strategy) {
   }
   if (!PRIVATE_KEY) throw new Error("AGENT_PRIVATE_KEY is required for Hyperliquid strategies");
   return new HyperliquidExchange(PRIVATE_KEY);
+}
+
+// ── Retry / guard helpers ─────────────────────────────────────────────────────
+
+async function withRetry(fn, maxAttempts = 3, baseDelayMs = 500) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isTransient =
+        err.cause?.code === "ECONNRESET" || err.cause?.code === "ETIMEDOUT" ||
+        err.cause?.code === "ENOTFOUND"  || err.cause?.code === "ECONNREFUSED" ||
+        err.message?.includes("fetch failed") || err.message?.includes("timeout");
+      if (!isTransient || attempt === maxAttempts) throw err;
+      const delay = baseDelayMs * 2 ** (attempt - 1);
+      console.warn(`[trader] Network error, retry ${attempt}/${maxAttempts - 1} in ${delay}ms: ${err.message}`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
+function runGuards(strategy, sizeUsd) {
+  if (strategy.max_size_usd && sizeUsd > strategy.max_size_usd) {
+    return `position size $${sizeUsd} exceeds max $${strategy.max_size_usd}`;
+  }
+  if (strategy.cooldown_minutes) {
+    const lastTrade = getLastTradeTime(strategy.id);
+    if (lastTrade) {
+      const minutesAgo = (Date.now() - new Date(lastTrade + "Z").getTime()) / 60000;
+      if (minutesAgo < strategy.cooldown_minutes) {
+        return `cooldown active — last trade ${Math.round(minutesAgo)}min ago (cooldown: ${strategy.cooldown_minutes}min)`;
+      }
+    }
+  }
+  return null;
+}
+
+// ── Local price-threshold evaluation (no x402) ───────────────────────────────
+
+async function tryLocalEval(strategy) {
+  try {
+    const res = await fetch(`${AGENT_SIGNAL_URL}/api/strategy/${strategy.id}`);
+    if (!res.ok) return null;
+    const def = await res.json();
+    const entry = typeof def.entry === "string" ? JSON.parse(def.entry) : def.entry;
+    const exit  = typeof def.exit  === "string" ? JSON.parse(def.exit)  : def.exit;
+
+    const allConds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
+    if (!allConds.length) return null;
+    const priceFlds = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
+    if (!allConds.every(c => priceFlds.has((c.field ?? "close").toLowerCase()))) return null;
+
+    const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
+    const exchange = getExchange(strategy);
+    const [price, position] = await Promise.all([
+      withRetry(() => exchange.getMidPrice(asset)),
+      withRetry(() => exchange.getPosition(asset)),
+    ]);
+    if (!price) return null;
+
+    const hasPosition = parseFloat(position?.szi ?? "0") !== 0;
+
+    const evalRules = (rules, p) => {
+      if (!rules?.conditions?.length) return false;
+      const results = rules.conditions.map(c => {
+        const v = parseFloat(c.value);
+        switch (c.op) {
+          case "<=": return p <= v;
+          case ">=": return p >= v;
+          case "<":  return p <  v;
+          case ">":  return p >  v;
+          default:   return false;
+        }
+      });
+      return rules.operator === "AND" ? results.every(Boolean) : results.some(Boolean);
+    };
+
+    // Scalper model: signal derived from actual position + conditions, not signal history
+    const signal = hasPosition
+      ? (evalRules(exit, price) ? "FLAT" : "LONG")   // in position: stay unless exit fires
+      : (evalRules(entry, price) ? "LONG" : "FLAT");  // flat: enter only if entry fires
+
+    console.log(`[trader] 📊 Local eval: ${asset} @ $${price.toLocaleString()} | pos: ${hasPosition ? "open" : "flat"} → ${signal}`);
+    return { signal, price };
+  } catch (err) {
+    console.warn(`[trader] Local eval failed: ${err.message}`);
+    return null;
+  }
 }
 
 // ── Fetch signal from agentsignal.app ─────────────────────────────────────────
@@ -193,7 +283,7 @@ async function checkTpTrail(strategy) {
   const exchange = getExchange(strategy);
 
   // Check actual position on exchange — not signal state
-  const position    = await exchange.getPosition(asset);
+  const position    = await withRetry(() => exchange.getPosition(asset));
   const positionSzi = parseFloat(position?.szi ?? "0");
 
   // No open position — clear stale TP state and bail
@@ -224,7 +314,7 @@ async function checkTpTrail(strategy) {
 
   if (!state) return false;
 
-  const price = await exchange.getMidPrice(asset);
+  const price = await withRetry(() => exchange.getMidPrice(asset));
   if (!price) return false;
 
   if (!state.trail_mode) {
@@ -280,11 +370,18 @@ async function executeTrade(strategy, signal, priorSignal) {
 
   const exchange = getExchange(strategy);
 
-  const midPrice = await exchange.getMidPrice(asset);
+  const midPrice = await withRetry(() => exchange.getMidPrice(asset));
   if (!midPrice) throw new Error(`Could not get price for ${asset}`);
 
-  const positionSize = parseFloat(((sizeUsd * leverage) / midPrice).toFixed(5));
-  const position     = await exchange.getPosition(asset);
+  const positionSize = new Decimal(sizeUsd).times(leverage).div(midPrice).toDecimalPlaces(5).toNumber();
+
+  const guardBlock = runGuards(strategy, sizeUsd);
+  if (guardBlock) {
+    console.warn(`[trader] 🛡 Guard blocked: ${guardBlock}`);
+    return;
+  }
+
+  const position     = await withRetry(() => exchange.getPosition(asset));
   const currentSize  = parseFloat(position?.szi ?? "0");
   const entryPrice   = parseFloat(position?.entryPx ?? "0");
   const isFlat = currentSize === 0;
@@ -299,12 +396,11 @@ async function executeTrade(strategy, signal, priorSignal) {
   if (signal === "LONG" && isFlat) {
     action = `ENTERED LONG ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
     if (!isDryRun) {
-      await exchange.setLeverage(asset, leverage);
-      result = await exchange.placeMarketOrder(asset, "buy", positionSize);
+      await withRetry(() => exchange.setLeverage(asset, leverage));
+      result = await withRetry(() => exchange.placeMarketOrder(asset, "buy", positionSize));
     }
-    // Set TP state if strategy has TP configured
     if (strategy.tp_pct && strategy.trail_pct) {
-      const tpPrice = midPrice * (1 + strategy.tp_pct / 100);
+      const tpPrice = new Decimal(midPrice).times(1 + strategy.tp_pct / 100).toDecimalPlaces(2).toNumber();
       setTpState({ strategy_id: strategy.id, entry_price: midPrice, tp_price: tpPrice, trail_pct: strategy.trail_pct });
       console.log(`[trader] 🎯 TP set: +${strategy.tp_pct}% = $${tpPrice.toLocaleString()} | trail ${strategy.trail_pct}%`);
     }
@@ -312,23 +408,23 @@ async function executeTrade(strategy, signal, priorSignal) {
     action = `CLOSED ${Math.abs(currentSize)} ${asset} @ ~$${midPrice.toLocaleString()}`;
     if (entryPrice > 0) {
       const dir = isLong ? 1 : -1;
-      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize) * dir).toFixed(2));
+      pnl = new Decimal(midPrice).minus(entryPrice).times(Math.abs(currentSize)).times(dir).toDecimalPlaces(2).toNumber();
       console.log(`[trader] P&L: ${pnl >= 0 ? "+" : ""}$${pnl}`);
     }
     if (!isDryRun) {
-      result = await exchange.closePosition(asset);
+      result = await withRetry(() => exchange.closePosition(asset));
     }
     clearTpState(strategy.id);
   } else if (signal === "SHORT" && !isFlat) {
     action = `SHORTED ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
     if (entryPrice > 0 && isLong) {
-      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize)).toFixed(2));
+      pnl = new Decimal(midPrice).minus(entryPrice).times(Math.abs(currentSize)).toDecimalPlaces(2).toNumber();
       console.log(`[trader] Closed long P&L: ${pnl >= 0 ? "+" : ""}$${pnl}`);
     }
     if (!isDryRun) {
-      await exchange.closePosition(asset);
-      await exchange.setLeverage(asset, leverage);
-      result = await exchange.placeMarketOrder(asset, "sell", positionSize);
+      await withRetry(() => exchange.closePosition(asset));
+      await withRetry(() => exchange.setLeverage(asset, leverage));
+      result = await withRetry(() => exchange.placeMarketOrder(asset, "sell", positionSize));
     }
   } else {
     console.log(`[trader] ⚪ HOLD — no action needed`);
@@ -380,8 +476,8 @@ for (const strategy of strategies) {
     continue;
   }
 
-  // Fetch signal
-  const signalData = await fetchSignal(strategy.id);
+  // Try local price eval first, fall back to x402 fetch
+  const signalData = await tryLocalEval(strategy) ?? await fetchSignal(strategy.id);
   if (!signalData) {
     console.warn(`[trader] Skipping ${strategy.name} — could not fetch signal`);
     continue;
@@ -447,3 +543,22 @@ for (const strategy of strategies) {
 }
 
 console.log(`\n[trader] Done.`);
+
+// ── Account snapshot ──────────────────────────────────────────────────────────
+if (PRIVATE_KEY && !isDryRun) {
+  try {
+    const { getAccountState } = await import("./hyperliquid.mjs");
+    const { privateKeyToAccount } = await import("viem/accounts");
+    const account = privateKeyToAccount(PRIVATE_KEY);
+    const state = await withRetry(() => getAccountState(account.address));
+    const netLiq = parseFloat(state?.marginSummary?.accountValue ?? "0");
+    const unrealizedPnl = (state?.assetPositions ?? [])
+      .reduce((s, p) => s + parseFloat(p.position?.unrealizedPnl ?? "0"), 0);
+    if (netLiq > 0) {
+      insertSnapshot({ net_liq: netLiq, unrealized_pnl: unrealizedPnl, realized_pnl: getYtdPnl(), total_value: netLiq });
+      console.log(`[trader] 📸 Snapshot: $${netLiq.toFixed(2)}`);
+    }
+  } catch (err) {
+    console.warn(`[trader] Snapshot failed: ${err.message}`);
+  }
+}
