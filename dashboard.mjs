@@ -789,10 +789,10 @@ async function portfolioPage() {
   const ytdSign = ytdPnl >= 0 ? "+" : "";
 
   const hlTotalValue = accountValue + usdcSpot;
-  if (hlTotalValue > 0) {
+  if (usdcSpot > 0) {
     const unrealizedPnl = (hlData?.assetPositions ?? [])
       .reduce((s, p) => s + parseFloat(p.position?.unrealizedPnl ?? "0"), 0);
-    insertSnapshot({ net_liq: hlTotalValue, unrealized_pnl: unrealizedPnl, realized_pnl: ytdPnl, total_value: hlTotalValue });
+    insertSnapshot({ net_liq: usdcSpot, unrealized_pnl: unrealizedPnl, realized_pnl: ytdPnl, total_value: usdcSpot });
   }
 
   const hlPositionValue = (hlData?.assetPositions ?? [])
