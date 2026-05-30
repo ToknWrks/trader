@@ -71,7 +71,7 @@ import {
   getStrategies, getStrategy, upsertStrategy, setStrategyActive,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
   countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents, getYtdPnl,
-  getSnapshots,
+  getSnapshots, insertSnapshot,
 } from "./db.mjs";
 
 // ── x402 network config ───────────────────────────────────────────────────────
@@ -394,7 +394,15 @@ function shell(title, body, active = "") {
     });
 
     let _pendingToggle = null;
-    function showToggleModal(btn, id, active, symbol) {
+
+    function subPrice(intervalMinutes, period) {
+      const days = { day: 1, week: 7, month: 30, year: 365 }[period];
+      const calls = Math.round((60 / intervalMinutes) * 24 * days);
+      return (Math.round(calls * 0.01 * 100) / 100).toFixed(2);
+    }
+
+    function showToggleModal(btn, id, active, symbol, intervalMinutes) {
+      const iv = intervalMinutes || 60;
       const sched = isCrypto(symbol) ? SCHEDULES.crypto : SCHEDULES.stocks;
       const title = active ? 'Activate Strategy' : 'Deactivate Strategy';
       const confirmClass = active ? 'modal-confirm-green' : 'modal-confirm-red';
@@ -409,21 +417,66 @@ function shell(title, body, active = "") {
           <div class="flow-step"><span class="num">4</span><span>If the signal hasn't changed, it holds — no order is placed.</span></div>
         </div>
         <div class="modal-schedule">⏱ Runs: \${sched.label}<br><span style="opacity:0.6;font-size:0.7rem">\${sched.detail}</span></div>
+        <div style="margin-top:1rem;padding:0.85rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px">
+          <div style="font-size:0.78rem;font-weight:600;color:#fafafa;margin-bottom:0.6rem">Signal subscription <span style="font-weight:400;color:rgba(255,255,255,0.4)">(optional — prepay for unmetered fetches)</span></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.35rem">
+            \${['day','week','month','year'].map(p => \`
+              <label style="display:flex;align-items:center;gap:0.4rem;padding:0.4rem 0.5rem;border:1px solid rgba(255,255,255,0.08);border-radius:6px;cursor:pointer;font-size:0.75rem;color:rgba(255,255,255,0.7)">
+                <input type="radio" name="subPeriod" value="\${p}" style="accent-color:#A8F1F7">
+                \${p.charAt(0).toUpperCase()+p.slice(1)} — <strong style="color:#A8F1F7">$\${subPrice(iv, p)}</strong>
+              </label>\`).join('')}
+          </div>
+          <label style="margin-top:0.5rem;display:flex;align-items:center;gap:0.4rem;font-size:0.72rem;color:rgba(255,255,255,0.4);cursor:pointer">
+            <input type="radio" name="subPeriod" value="" checked style="accent-color:#A8F1F7"> Pay per signal ($0.01/fetch)
+          </label>
+        </div>
       \` : \`
         <p>The trader will <strong>stop executing trades</strong> for this strategy. Any open positions on Hyperliquid will remain open until you close them manually.</p>
       \`;
       const confirmBtn = document.getElementById('modalConfirm');
       confirmBtn.className = confirmClass;
       confirmBtn.textContent = confirmLabel;
-      _pendingToggle = { btn, id, active };
+      _pendingToggle = { btn, id, active, intervalMinutes: iv };
+
+      // Update button text when period selection changes
+      if (active) {
+        setTimeout(() => {
+          document.querySelectorAll('input[name="subPeriod"]').forEach(r => {
+            r.addEventListener('change', () => {
+              confirmBtn.textContent = r.value ? 'Subscribe & Activate' : 'Activate';
+            });
+          });
+        }, 0);
+      }
+
       document.getElementById('toggleModal').classList.add('open');
     }
 
     document.getElementById('modalConfirm').addEventListener('click', async () => {
       if (!_pendingToggle) return;
-      const { btn, id, active } = _pendingToggle;
+      const { btn, id, active, intervalMinutes } = _pendingToggle;
+      const selectedPeriod = active
+        ? (document.querySelector('input[name="subPeriod"]:checked')?.value ?? '')
+        : '';
       closeModal();
-      btn.disabled = true; btn.textContent = 'Saving...';
+      btn.disabled = true;
+      btn.textContent = selectedPeriod ? 'Subscribing...' : 'Saving...';
+
+      if (active && selectedPeriod) {
+        const subRes = await fetch('/api/subscribe-strategy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ strategy_id: id, interval_minutes: intervalMinutes, period: selectedPeriod }),
+        });
+        const subData = await subRes.json();
+        if (!subData.ok) {
+          btn.disabled = false; btn.textContent = 'Activate';
+          alert('Subscription failed: ' + (subData.error ?? 'Unknown error'));
+          return;
+        }
+        console.log('[subscribe] ✅ Subscribed until', subData.expires_at);
+      }
+
       const res = await fetch('/api/toggle', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id, active}) });
       const d = await res.json();
       if (d.ok) setTimeout(() => location.reload(), 300);
@@ -530,17 +583,27 @@ function writeEnvValues(updates) {
 
 // ── Equity curve (server-side SVG) ────────────────────────────────────────────
 
-function renderEquityCurve(snapshots) {
+function renderEquityCurve(snapshots, positionValue, marginValue, spotUsdc = 0) {
+  const fmt2 = v => v > 0 ? `$${v.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}` : "—";
+  const statBlock = (label, val) => `
+    <div>
+      <div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4);margin-bottom:0.25rem">${label}</div>
+      <div style="font-size:1rem;font-weight:600;color:rgba(255,255,255,0.55);letter-spacing:-0.02em;line-height:1">${val}</div>
+    </div>`;
+  const divider = `<div style="width:1px;background:rgba(255,255,255,0.08);align-self:stretch;margin-top:2px"></div>`;
+  const header = `<div style="display:flex;gap:2rem;align-items:flex-start">
+    ${statBlock("Position Value", fmt2(positionValue))}
+    ${divider}
+    ${statBlock("Margin", fmt2(marginValue))}
+    ${divider}
+    ${statBlock("Spot USDC", fmt2(spotUsdc))}
+  </div>`;
+
   if (snapshots.length < 2) {
-    const val = snapshots[0]?.net_liq;
-    const valStr = val != null ? `$${val.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}` : "—";
     return `<div class="card" style="margin-bottom:1.5rem">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem">
-        <h2 style="margin:0;font-size:0.9rem">Account Value</h2>
-        <span style="font-size:0.75rem;color:rgba(255,255,255,0.3)">Hyperliquid · daily snapshot</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:1rem;padding:1rem 0">
-        ${val != null ? `<span style="font-size:1.5rem;font-weight:700;color:#fafafa">${valStr}</span><span style="font-size:0.75rem;color:rgba(255,255,255,0.3)">today's baseline captured — chart builds after day 2</span>` : `<span style="font-size:0.78rem;color:rgba(255,255,255,0.3)">No snapshots yet — run the trader to start tracking account value.</span>`}
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        ${header}
+        <span style="font-size:0.7rem;color:rgba(255,255,255,0.25)">chart builds after day 2</span>
       </div>
     </div>`;
   }
@@ -574,7 +637,7 @@ function renderEquityCurve(snapshots) {
 
   return `<div class="card" style="margin-bottom:1.5rem">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem">
-      <h2 style="margin:0;font-size:0.9rem">Account Value</h2>
+      ${header}
       <span style="font-size:0.75rem;color:${color};font-weight:600">${pctStr} <span style="color:rgba(255,255,255,0.3);font-weight:400">· ${snapshots.length}d</span></span>
     </div>
     <svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;height:auto">
@@ -725,7 +788,18 @@ async function portfolioPage() {
   const ytdPct = startingValue > 0 ? (ytdPnl / startingValue) * 100 : 0;
   const ytdSign = ytdPnl >= 0 ? "+" : "";
 
-  const equityCurveHtml = renderEquityCurve(getSnapshots(90));
+  const hlTotalValue = accountValue + usdcSpot;
+  if (hlTotalValue > 0) {
+    const unrealizedPnl = (hlData?.assetPositions ?? [])
+      .reduce((s, p) => s + parseFloat(p.position?.unrealizedPnl ?? "0"), 0);
+    insertSnapshot({ net_liq: hlTotalValue, unrealized_pnl: unrealizedPnl, realized_pnl: ytdPnl, total_value: hlTotalValue });
+  }
+
+  const hlPositionValue = (hlData?.assetPositions ?? [])
+    .filter(p => parseFloat(p.position?.szi ?? "0") !== 0)
+    .reduce((s, p) => s + parseFloat(p.position?.positionValue ?? "0"), 0);
+
+  const equityCurveHtml = renderEquityCurve(getSnapshots(90), hlPositionValue, accountValue, usdcSpot);
 
   return shell("Portfolio", `
     ${!PRIVATE_KEY ? '<p style="color:#f87171;margin-bottom:1rem">⚠️ AGENT_PRIVATE_KEY not set — run <code>npm run setup</code></p>' : ""}
@@ -743,76 +817,88 @@ async function portfolioPage() {
         <div class="value ${ytdPnl >= 0 ? "green" : "red"}">${ytdSign}$${Math.abs(ytdPnl).toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})} <span style="font-size:0.75em;opacity:0.7">(${ytdSign}${ytdPct.toFixed(1)}%)</span></div>
       </div>
     </div>
-    ${equityCurveHtml}
-    ${accountValue > 0 || usdcSpot > 0 ? `
-    <details class="accordion" open>
-      <summary>Hyperliquid</summary>
-      <div class="card">
-        <table>
-          <thead><tr><th>Asset</th><th>Value (USD)</th></tr></thead>
-          <tbody>
-            ${accountValue > 0.01 ? `<tr><td style="font-weight:600">Perp Account</td><td>$${accountValue.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>` : ""}
-            ${usdcSpot > 0.001 ? `<tr><td style="font-weight:600">Spot USDC</td><td>$${usdcSpot.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>` : ""}
-          </tbody>
-        </table>
+    <div style="display:flex;gap:0.25rem;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:0.2rem;margin-bottom:1.25rem">
+      <button id="ptab-hl"     onclick="switchPTab('hl')"     style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:#A8F1F7;color:#000">Hyperliquid</button>
+      ${process.env.COINBASE_API_KEY ? `<button id="ptab-cb" onclick="switchPTab('cb')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Coinbase</button>` : ""}
+      ${process.env.KRAKEN_API_KEY   ? `<button id="ptab-kr" onclick="switchPTab('kr')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Kraken</button>` : ""}
+      <button id="ptab-orders" onclick="switchPTab('orders')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Orders${openOrders.length > 0 ? ` (${openOrders.length})` : ""}</button>
+    </div>
+
+    <div id="ppane-hl">
+      ${equityCurveHtml}
+      ${accountValue > 0.01 || usdcSpot > 0.001 ? `<div class="card"><table>
+        <thead><tr><th>Asset</th><th>Value (USD)</th></tr></thead>
+        <tbody>
+          ${accountValue > 0.01 ? `<tr><td style="font-weight:600">Perp Account</td><td>$${accountValue.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>` : ""}
+          ${usdcSpot > 0.001   ? `<tr><td style="font-weight:600">Spot USDC</td><td>$${usdcSpot.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>` : ""}
+        </tbody>
+      </table></div>` : `<p class="hint">No Hyperliquid balance.</p>`}
+    </div>
+
+    <div id="ppane-cb" style="display:none">
+      <div class="card" style="margin-bottom:1.5rem">
+        <div style="display:flex;gap:2rem;align-items:flex-start">
+          <div><div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4);margin-bottom:0.25rem">Total Value</div>
+          <div style="font-size:1rem;font-weight:600;color:rgba(255,255,255,0.55);line-height:1">$${cbTotalUsd.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</div></div>
+        </div>
       </div>
-    </details>` : ""}
-    ${coinbaseAccounts.length > 0 ? `
-    <details class="accordion" open>
-      <summary>Coinbase</summary>
-      <div class="card">
-        <table>
-          <thead><tr><th>Currency</th><th>Available</th><th>Hold</th><th>Value (USD)</th></tr></thead>
-          <tbody>${coinbaseAccounts.map(a => {
-            const avail = parseFloat(a.available_balance?.value ?? "0");
-            const hold  = parseFloat(a.hold?.value ?? "0");
-            const isUsd = a.currency === "USD" || a.currency === "USDC" || a.currency === "USDT";
-            const usdVal = isUsd ? coinbaseUsdValues[a.currency] : coinbaseUsdValues[a.uuid];
-            return `<tr>
-              <td style="font-weight:600">${a.currency}</td>
-              <td>${avail.toFixed(3)}</td>
-              <td style="color:rgba(255,255,255,0.35)">${hold > 0 ? hold.toFixed(3) : "—"}</td>
-              <td>${usdVal != null ? "$" + usdVal.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) : "—"}</td>
-            </tr>`;
-          }).join("")}</tbody>
-        </table>
+      ${coinbaseAccounts.length > 0 ? `<div class="card"><table>
+        <thead><tr><th>Currency</th><th>Available</th><th>Hold</th><th>Value (USD)</th><th></th></tr></thead>
+        <tbody>${coinbaseAccounts.map(a => {
+          const avail = parseFloat(a.available_balance?.value ?? "0");
+          const hold  = parseFloat(a.hold?.value ?? "0");
+          const isUsd = a.currency === "USD" || a.currency === "USDC" || a.currency === "USDT";
+          const usdVal = isUsd ? coinbaseUsdValues[a.currency] : coinbaseUsdValues[a.uuid];
+          const sellBtn = !isUsd && avail > 0 ? `<button class="btn btn-cyan" onclick="sellForUsdc('coinbase','${a.currency}',${avail},this)">→ USDC</button>` : "";
+          return `<tr>
+            <td style="font-weight:600">${a.currency}</td>
+            <td>${avail.toFixed(3)}</td>
+            <td style="color:rgba(255,255,255,0.35)">${hold > 0 ? hold.toFixed(3) : "—"}</td>
+            <td>${usdVal != null ? "$" + usdVal.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) : "—"}</td>
+            <td>${sellBtn}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table></div>` : `<p class="hint">No Coinbase balances found.</p>`}
+    </div>
+
+    <div id="ppane-kr" style="display:none">
+      <div class="card" style="margin-bottom:1.5rem">
+        <div style="display:flex;gap:2rem;align-items:flex-start">
+          <div><div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4);margin-bottom:0.25rem">Total Value</div>
+          <div style="font-size:1rem;font-weight:600;color:rgba(255,255,255,0.55);line-height:1">$${krTotalUsd.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</div></div>
+        </div>
       </div>
-    </details>` : (process.env.COINBASE_API_KEY ? `<p class="hint">Coinbase connected — no non-zero balances found.</p>` : "")}
-    ${Object.keys(krakenBalances).length > 0 ? `
-    <details class="accordion" open>
-      <summary>Kraken</summary>
-      <div class="card">
-        <table>
-          <thead><tr><th>Asset</th><th>Balance</th><th>Value (USD)</th></tr></thead>
-          <tbody>${Object.entries(krakenBalances).map(([key, val]) => {
-            const display = key === "XXBT" ? "BTC" : key === "XETH" ? "ETH" : key === "ZUSD" ? "USD" : key.replace(/^[XZ]/, "");
-            const usdVal = krakenUsdValues[key];
-            return `<tr>
-              <td style="font-weight:600">${display}</td>
-              <td>${parseFloat(val).toFixed(3)}</td>
-              <td>${usdVal != null ? "$" + usdVal.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) : "—"}</td>
-            </tr>`;
-          }).join("")}</tbody>
-        </table>
-      </div>
-    </details>` : (process.env.KRAKEN_API_KEY ? `<p class="hint">Kraken connected — no non-zero balances found.</p>` : "")}
-    <details class="accordion"${openOrders.length > 0 ? " open" : ""} style="margin-top:1.5rem">
-      <summary>Open Orders${openOrders.length > 0 ? ` <span style="font-size:0.65rem;font-weight:400;text-transform:none;letter-spacing:0;color:rgba(168,241,247,0.7);margin-left:0.4rem">${openOrders.length}</span>` : ""}</summary>
-      ${openOrders.length > 0 ? `
-      <div class="card">
-        <table>
-          <thead><tr><th>Exchange</th><th>Asset</th><th>Side</th><th>Size</th><th>Limit Price</th><th></th></tr></thead>
-          <tbody>${openOrders.map(o => `<tr>
-            <td style="color:rgba(255,255,255,0.4);font-size:0.78rem">${o.exchange}</td>
-            <td style="font-weight:600">${o.asset}</td>
-            <td><span class="${o.side === "buy" ? "pos-long" : "pos-short"}">${o.side === "buy" ? "▲ BUY" : "▼ SELL"}</span></td>
-            <td>${o.size.toFixed(4)}</td>
-            <td>$${o.limitPrice.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-            <td><button class="btn btn-red" onclick="cancelOrder('${o.exchange}','${o.id}','${o.asset}',this)">Cancel</button></td>
-          </tr>`).join("")}</tbody>
-        </table>
-      </div>` : `<p class="hint">No open limit orders across connected exchanges.</p>`}
-    </details>
+      ${Object.keys(krakenBalances).length > 0 ? `<div class="card"><table>
+        <thead><tr><th>Asset</th><th>Balance</th><th>Value (USD)</th><th></th></tr></thead>
+        <tbody>${Object.entries(krakenBalances).map(([key, val]) => {
+          const display = key === "XXBT" ? "BTC" : key === "XETH" ? "ETH" : key === "ZUSD" ? "USD" : key.replace(/^[XZ]/, "");
+          const isUsd = ["ZUSD","USDC","USDT"].includes(key);
+          const usdVal = krakenUsdValues[key];
+          const amount = parseFloat(val);
+          const sellBtn = !isUsd && amount > 0 ? `<button class="btn btn-cyan" onclick="sellForUsdc('kraken','${display}',${amount},this)">→ USDC</button>` : "";
+          return `<tr>
+            <td style="font-weight:600">${display}</td>
+            <td>${amount.toFixed(3)}</td>
+            <td>${usdVal != null ? "$" + usdVal.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) : "—"}</td>
+            <td>${sellBtn}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table></div>` : `<p class="hint">No Kraken balances found.</p>`}
+    </div>
+
+    <div id="ppane-orders" style="display:none">
+      ${openOrders.length > 0 ? `<div class="card"><table>
+        <thead><tr><th>Exchange</th><th>Asset</th><th>Side</th><th>Size</th><th>Limit Price</th><th></th></tr></thead>
+        <tbody>${openOrders.map(o => `<tr>
+          <td style="color:rgba(255,255,255,0.4);font-size:0.78rem">${o.exchange}</td>
+          <td style="font-weight:600">${o.asset}</td>
+          <td><span class="${o.side === "buy" ? "pos-long" : "pos-short"}">${o.side === "buy" ? "▲ BUY" : "▼ SELL"}</span></td>
+          <td>${o.size.toFixed(4)}</td>
+          <td>$${o.limitPrice.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+          <td><button class="btn btn-red" onclick="cancelOrder('${o.exchange}','${o.id}','${o.asset}',this)">Cancel</button></td>
+        </tr>`).join("")}</tbody>
+      </table></div>` : `<p class="hint">No open limit orders.</p>`}
+    </div>
     <p class="section-label" style="margin-top:2rem">x402 Signal Spend · <span style="color:rgba(255,255,255,0.35);font-size:0.65rem;text-transform:none;letter-spacing:0">${payNetworkLabel}</span></p>
     <div class="stat-row">
       <div class="stat"><div class="label">Today's Fetches</div><div class="value">${fetchesToday.total.toLocaleString()}</div></div>
@@ -825,6 +911,45 @@ async function portfolioPage() {
     <p class="hint">Auto-refreshes every 30s · <a href="/portfolio">Refresh now</a></p>
     <script>
       setTimeout(() => location.reload(), 30000);
+      function switchPTab(tab) {
+        ['hl','cb','kr','orders'].forEach(t => {
+          const pane = document.getElementById('ppane-' + t);
+          const btn  = document.getElementById('ptab-' + t);
+          if (pane) pane.style.display = t === tab ? '' : 'none';
+          if (btn)  { btn.style.background = t === tab ? '#A8F1F7' : 'transparent'; btn.style.color = t === tab ? '#000' : 'rgba(255,255,255,0.5)'; }
+        });
+      }
+      function sellForUsdc(exchange, asset, maxAmount, btn) {
+        const exchLabel = exchange === 'kraken' ? 'Kraken' : 'Coinbase';
+        document.getElementById('openModalTitle').textContent = 'Sell ' + asset + ' → USDC';
+        document.getElementById('openModalBody').innerHTML =
+          '<div style="margin-bottom:1rem">' +
+            '<label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.35rem;text-transform:uppercase;letter-spacing:0.05em">Amount (' + asset + ')</label>' +
+            '<div style="display:flex;gap:0.5rem;align-items:center">' +
+              '<input id="sellAmount" type="number" step="any" min="0" max="' + maxAmount + '" value="' + maxAmount.toFixed(6) + '" style="flex:1;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:0.5rem 0.75rem;color:#fafafa;font-size:0.9rem;outline:none" />' +
+              '<button type="button" onclick="this.previousElementSibling.value=this.dataset.max" data-max="' + maxAmount.toFixed(6) + '" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:rgba(255,255,255,0.45);font-size:0.72rem;padding:0.4rem 0.65rem;cursor:pointer;white-space:nowrap">Max</button>' +
+            '</div>' +
+            '<div style="font-size:0.68rem;color:rgba(255,255,255,0.3);margin-top:0.3rem">Available: ' + maxAmount.toFixed(6) + ' ' + asset + ' on ' + exchLabel + '</div>' +
+          '</div>' +
+          '<p style="font-size:0.78rem;color:rgba(255,255,255,0.4)">Market order — fills at current bid price.</p>';
+        const confirmBtn = document.getElementById('openModalConfirm');
+        confirmBtn.textContent = 'Sell ' + asset;
+        confirmBtn.className = 'modal-confirm-red';
+        confirmBtn.onclick = async () => {
+          const sellAmt = parseFloat(document.getElementById('sellAmount')?.value);
+          if (!sellAmt || sellAmt <= 0) { alert('Enter a valid amount.'); return; }
+          if (sellAmt > maxAmount) { alert('Amount exceeds available balance.'); return; }
+          confirmBtn.textContent = 'Selling…'; confirmBtn.disabled = true;
+          document.getElementById('openModal').classList.remove('open');
+          btn.textContent = 'Selling…'; btn.disabled = true;
+          const res = await fetch('/api/sell-for-usdc', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ exchange, asset, amount: sellAmt }) });
+          const d = await res.json();
+          if (d.ok) { btn.textContent = '✓'; btn.style.color = '#4ade80'; setTimeout(() => location.reload(), 1500); }
+          else { btn.disabled = false; btn.textContent = '→ USDC'; alert('Error: ' + d.error); }
+          confirmBtn.disabled = false;
+        };
+        document.getElementById('openModal').classList.add('open');
+      }
       async function cancelOrder(exchange, orderId, asset, btn) {
         if (!confirm('Cancel this ' + asset + ' limit order on ' + exchange + '?')) return;
         btn.textContent = 'Cancelling…'; btn.disabled = true;
@@ -1037,12 +1162,13 @@ function strategiesPage() {
             </div>
             <div style="display:flex;gap:0.4rem;align-items:center;flex-shrink:0" onclick="event.stopPropagation()">
               ${s.active
-                ? `<button class="btn btn-red" onclick="showToggleModal(this, '${s.id}', false, '${s.symbol}')">Deactivate</button>`
-                : `<button class="btn btn-green" onclick="showToggleModal(this, '${s.id}', true, '${s.symbol}')">Activate</button>`}
+                ? `<button class="btn btn-red" onclick="showToggleModal(this, '${s.id}', false, '${s.symbol}', ${s.interval_minutes ?? 60})">Deactivate</button>`
+                : `<button class="btn btn-green" onclick="showToggleModal(this, '${s.id}', true, '${s.symbol}', ${s.interval_minutes ?? 60})">Activate</button>`}
               <button class="btn btn-cyan" onclick="runNow(this, '${s.id}', '${s.name.replace(/'/g, "\\'")}')">▶ Run Now</button>
               <button class="btn btn-green" onclick="openPosition(this, '${s.id}', 'buy', '${s.symbol}')">Open Long</button>
               <button class="btn btn-red" onclick="openPosition(this, '${s.id}', 'sell', '${s.symbol}')">Open Short</button>
 
+              <button class="btn btn-cyan" onclick="openEditModal(${JSON.stringify(s).replace(/"/g, '&quot;')})">Edit</button>
               <button class="btn btn-red" onclick="deleteStrat('${s.id}')">✕</button>
             </div>
           </div>
@@ -1216,7 +1342,119 @@ function strategiesPage() {
       await fetch('/api/strategy/' + id, { method: 'DELETE' });
       location.reload();
     }
+
+    function openEditModal(s) {
+      const f = (id, val) => { const el = document.getElementById(id); if (el) el.value = val ?? ''; };
+      const sel = (id, val) => { const el = document.getElementById(id); if (el) el.value = val ?? ''; };
+      document.getElementById('editModalTitle').textContent = 'Edit — ' + s.name;
+      document.getElementById('em_id').value = s.id;
+      f('em_name', s.name);
+      f('em_symbol', s.symbol);
+      f('em_position_size_usd', s.position_size_usd);
+      sel('em_leverage', s.leverage ?? 1);
+      sel('em_exchange', s.exchange ?? 'hyperliquid');
+      sel('em_interval_minutes', s.interval_minutes ?? 60);
+      f('em_tp_pct', s.tp_pct);
+      f('em_trail_pct', s.trail_pct);
+      f('em_max_size_usd', s.max_size_usd);
+      f('em_cooldown_minutes', s.cooldown_minutes);
+      document.getElementById('editModal').classList.add('open');
+    }
+
+    document.getElementById('editModal').addEventListener('click', e => { if (e.target === e.currentTarget) e.currentTarget.classList.remove('open'); });
+
+    document.getElementById('editModalSave').addEventListener('click', async () => {
+      const btn = document.getElementById('editModalSave');
+      btn.textContent = 'Saving…'; btn.disabled = true;
+      const get = id => document.getElementById(id)?.value ?? '';
+      const payload = {
+        id: get('em_id'),
+        name: get('em_name'),
+        symbol: get('em_symbol'),
+        leverage: parseInt(get('em_leverage')) || 1,
+        position_size_usd: get('em_position_size_usd') ? parseFloat(get('em_position_size_usd')) : null,
+        exchange: get('em_exchange') || 'hyperliquid',
+        interval_minutes: parseInt(get('em_interval_minutes')) || 60,
+        tp_pct: get('em_tp_pct') ? parseFloat(get('em_tp_pct')) : null,
+        trail_pct: get('em_trail_pct') ? parseFloat(get('em_trail_pct')) : null,
+        max_size_usd: get('em_max_size_usd') ? parseFloat(get('em_max_size_usd')) : null,
+        cooldown_minutes: get('em_cooldown_minutes') ? parseInt(get('em_cooldown_minutes')) : null,
+      };
+      const res = await fetch('/api/upsert-strategy', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      const d = await res.json();
+      if (d.ok) { location.reload(); }
+      else { btn.textContent = 'Save'; btn.disabled = false; alert(d.error); }
+    });
     </script>
+
+  <!-- Edit strategy modal -->
+  <div class="modal-overlay" id="editModal">
+    <div class="modal" style="max-width:500px;max-height:90vh;overflow-y:auto">
+      <div class="modal-title" id="editModalTitle">Edit Strategy</div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:0.75rem;margin-top:1rem">
+        <input type="hidden" id="em_id" />
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.65rem">
+          <div style="grid-column:1/-1">
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Name</label>
+            <input id="em_name" style="width:100%" />
+          </div>
+          <div style="grid-column:1/-1">
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Symbol</label>
+            <input id="em_symbol" style="width:100%" />
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Margin (USD)</label>
+            <input id="em_position_size_usd" type="number" placeholder="default" style="width:100%" />
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Leverage</label>
+            <select id="em_leverage" style="width:100%">
+              <option value="1">1x</option><option value="2">2x</option><option value="3">3x</option>
+              <option value="5">5x</option><option value="10">10x</option><option value="20">20x</option><option value="50">50x</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Exchange</label>
+            <select id="em_exchange" style="width:100%">
+              <option value="hyperliquid">Hyperliquid</option>
+              <option value="kraken">Kraken</option>
+              <option value="alpaca">Alpaca</option>
+              <option value="coinbase">Coinbase</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Check Every</label>
+            <select id="em_interval_minutes" style="width:100%">
+              <option value="5">5 min</option><option value="15">15 min</option><option value="30">30 min</option>
+              <option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option><option value="1440">Daily</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Take Profit %</label>
+            <input id="em_tp_pct" type="number" step="0.5" placeholder="optional" style="width:100%" />
+            <div style="font-size:0.67rem;color:rgba(255,255,255,0.25);margin-top:0.2rem">Asset price move, not P&L. 5% @ 5x = 25% profit.</div>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Trail Stop %</label>
+            <input id="em_trail_pct" type="number" step="0.1" placeholder="optional" style="width:100%" />
+            <div style="font-size:0.67rem;color:rgba(255,255,255,0.25);margin-top:0.2rem">% drop from peak before closing.</div>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Max Size (USD)</label>
+            <input id="em_max_size_usd" type="number" placeholder="optional" style="width:100%" />
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Cooldown (min)</label>
+            <input id="em_cooldown_minutes" type="number" placeholder="optional" style="width:100%" />
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-cancel" onclick="document.getElementById('editModal').classList.remove('open')">Cancel</button>
+        <button id="editModalSave" class="modal-confirm-green">Save</button>
+      </div>
+    </div>
+  </div>
   `, "strategies");
 }
 
@@ -1459,6 +1697,26 @@ function settingsPage(saved = false, error = "") {
           </div>
         `)}
 
+        ${section("Kraken", "🦑", `
+          ${field("API Key", "KRAKEN_API_KEY", val("KRAKEN_API_KEY"), "password")}
+          ${field("API Secret", "KRAKEN_API_SECRET", val("KRAKEN_API_SECRET"), "password")}
+        `)}
+
+        ${section("Alpaca", "🦙", `
+          ${field("API Key", "ALPACA_API_KEY", val("ALPACA_API_KEY"), "password")}
+          ${field("API Secret", "ALPACA_API_SECRET", val("ALPACA_API_SECRET"), "password")}
+          <div style="display:flex;align-items:center;gap:0.6rem">
+            <input type="checkbox" name="ALPACA_PAPER" value="true" id="alpacaPaper" ${val("ALPACA_PAPER") === "true" ? "checked" : ""} style="width:auto;accent-color:#A8F1F7" />
+            <label for="alpacaPaper" style="font-size:0.78rem;color:rgba(255,255,255,0.5);cursor:pointer">Paper trading mode</label>
+          </div>
+        `)}
+
+        ${section("Coinbase", "🔵", `
+          ${field("API Key", "COINBASE_API_KEY", val("COINBASE_API_KEY"), "password")}
+          ${field("API Passphrase", "COINBASE_API_PASSPHRASE", val("COINBASE_API_PASSPHRASE"), "password")}
+          ${pemField("API Secret (PEM)", "COINBASE_API_SECRET", val("COINBASE_API_SECRET"), "EC private key from Coinbase Advanced Trade — paste the full PEM block")}
+        `)}
+
         ${(function() {
           const current = getPaymentNetwork();
           const currentLabel = X402_NETWORKS[current]?.label ?? current;
@@ -1556,11 +1814,15 @@ function addStrategyPage(error = "") {
             <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Exchange</label>
             <select name="exchange" style="width:100%">
               <option value="hyperliquid">Hyperliquid (perps)</option>
+              <option value="kraken">Kraken</option>
+              <option value="alpaca">Alpaca</option>
+              <option value="coinbase">Coinbase</option>
             </select>
           </div>
           <div>
             <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Check Every</label>
             <select name="interval_minutes" style="width:100%">
+              <option value="5">5 minutes</option>
               <option value="15">15 minutes</option>
               <option value="30">30 minutes</option>
               <option value="60" selected>1 hour</option>
@@ -1698,6 +1960,56 @@ async function handleToggle(body) {
   const { id, active } = JSON.parse(body);
   setStrategyActive(id, active);
   return { ok: true };
+}
+
+async function handleSubscribeStrategy(body) {
+  if (!PRIVATE_KEY) return { ok: false, error: "AGENT_PRIVATE_KEY not set" };
+  const { strategy_id, interval_minutes, period } = JSON.parse(body);
+  if (!strategy_id || !interval_minutes || !period) return { ok: false, error: "strategy_id, interval_minutes, period required" };
+
+  const PERIOD_DAYS = { day: 1, week: 7, month: 30, year: 365 };
+  const days = PERIOD_DAYS[period];
+  if (!days) return { ok: false, error: "Invalid period" };
+
+  const url = `${getSignalUrl()}/api/strategy/${strategy_id}/subscribe?interval_minutes=${interval_minutes}&period=${period}`;
+
+  const { x402Client } = await import("@x402/core/client");
+  const { decodePaymentRequiredHeader, encodePaymentSignatureHeader } = await import("@x402/core/http");
+  const { ExactEvmScheme } = await import("@x402/evm/exact/client");
+  const { http, createWalletClient } = await import("viem");
+  const { privateKeyToAccount } = await import("viem/accounts");
+  const allChains = await import("viem/chains");
+
+  const account = privateKeyToAccount(PRIVATE_KEY);
+  const client = new x402Client();
+
+  const probe = await fetch(url, { method: "POST", headers: { "X-Wallet-Address": account.address } });
+  if (probe.ok) return await probe.json();
+  if (probe.status !== 402) throw new Error(`Subscribe API ${probe.status}`);
+
+  const rawHeader = probe.headers.get("payment-required") ?? probe.headers.get("X-PAYMENT-REQUIRED");
+  if (!rawHeader) throw new Error("No payment-required header in 402 response");
+  const paymentRequired = decodePaymentRequiredHeader(rawHeader);
+
+  const serverNetwork = paymentRequired.accepts?.[0]?.network ?? paymentRequired.accepts?.network;
+  const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS[getPaymentNetwork()] ?? X402_NETWORKS["eip155:8453"];
+  const chain = allChains[networkCfg.viemChain];
+  const walletClient = createWalletClient({ account, chain, transport: http(networkCfg.rpc) });
+  const signer = Object.assign(walletClient, { address: account.address });
+  client.register(serverNetwork, new ExactEvmScheme(signer));
+
+  const calls = Math.round((60 / interval_minutes) * 24 * days);
+  const priceUsd = (Math.round(calls * 0.01 * 100) / 100).toFixed(2);
+  console.log(`[subscribe] 💳 Paying $${priceUsd} USDC on ${networkCfg.label ?? serverNetwork}`);
+
+  const paymentPayload = await client.createPaymentPayload(paymentRequired);
+  const paymentHeader = encodePaymentSignatureHeader(paymentPayload);
+  const paid = await fetch(url, { method: "POST", headers: { "payment-signature": paymentHeader, "X-Wallet-Address": account.address } });
+  if (!paid.ok) {
+    const errBody = await paid.text().catch(() => "");
+    throw new Error(`Payment rejected (${paid.status}): ${errBody.slice(0, 200)}`);
+  }
+  return await paid.json();
 }
 
 async function handleExecute(body) {
@@ -2015,6 +2327,10 @@ const server = createServer(async (req, res) => {
       const body = await readBody();
       return json(await handleToggle(body).catch(e => ({ ok: false, error: e.message })));
     }
+    if (url === "/api/subscribe-strategy" && method === "POST") {
+      const body = await readBody();
+      return json(await handleSubscribeStrategy(body).catch(e => ({ ok: false, error: e.message })));
+    }
     if (url === "/api/execute" && method === "POST") {
       const body = await readBody();
       return json(await handleExecute(body).catch(e => ({ ok: false, error: e.message })));
@@ -2027,6 +2343,31 @@ const server = createServer(async (req, res) => {
       const body = await readBody();
       return json(await handleOpen(body).catch(e => ({ ok: false, error: e.message })));
     }
+    if (url === "/api/sell-for-usdc" && method === "POST") {
+      const body = await readBody();
+      try {
+        const { exchange, asset, amount } = JSON.parse(body);
+        if (!exchange || !asset || !amount) return json({ ok: false, error: "exchange, asset, amount required" });
+        const { KrakenExchange }   = await import("./exchanges/kraken.mjs");
+        const { CoinbaseExchange } = await import("./exchanges/coinbase.mjs");
+        const exch = exchange === "kraken"
+          ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
+          : new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE);
+        const result = await exch.placeMarketOrder(asset, "sell", amount);
+        return json({ ok: true, result });
+      } catch (e) { return json({ ok: false, error: e.message }); }
+    }
+
+    if (url === "/api/upsert-strategy" && method === "POST") {
+      const body = await readBody();
+      try {
+        const s = JSON.parse(body);
+        if (!s.id) return json({ ok: false, error: "id required" });
+        upsertStrategy(s);
+        return json({ ok: true });
+      } catch (e) { return json({ ok: false, error: e.message }); }
+    }
+
     if (url === "/api/cancel-order" && method === "POST") {
       const body = await readBody();
       return json(await handleCancelOrder(body).catch(e => ({ ok: false, error: e.message })));

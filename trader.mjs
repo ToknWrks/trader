@@ -89,7 +89,6 @@ import {
   getPriorSignal, insertTrade, isStrategyDue, touchStrategyRun,
   insertSignalEvent, setTpState, getTpState, updateTpTrailMode,
   updateTpHighWater, clearTpState, logFetch, getLastTradeTime,
-  insertSnapshot, getYtdPnl,
 } from "./db.mjs";
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
@@ -218,8 +217,8 @@ async function fetchSignal(strategyId) {
     const account = privateKeyToAccount(PRIVATE_KEY);
     const client = new x402Client();
 
-    // Step 1: probe — expect 402
-    const probe = await fetch(url);
+    // Step 1: probe — expect 402 (send wallet address so server can skip x402 if subscribed)
+    const probe = await fetch(url, { headers: { "X-Wallet-Address": account.address } });
     if (probe.ok) {
       // No payment required (e.g. local dev bypass)
       const data = await probe.json();
@@ -255,7 +254,7 @@ async function fetchSignal(strategyId) {
 
     // Step 5: retry with payment
     // x402 v2 server reads "payment-signature" (core server extractPayment)
-    const res = await fetch(url, { headers: { "payment-signature": paymentHeader } });
+    const res = await fetch(url, { headers: { "payment-signature": paymentHeader, "X-Wallet-Address": account.address } });
     if (!res.ok) {
       const errHeader = res.headers.get("payment-required") ?? res.headers.get("X-PAYMENT-REQUIRED") ?? "";
       try {
@@ -544,21 +543,3 @@ for (const strategy of strategies) {
 
 console.log(`\n[trader] Done.`);
 
-// ── Account snapshot ──────────────────────────────────────────────────────────
-if (PRIVATE_KEY && !isDryRun) {
-  try {
-    const { getAccountState } = await import("./hyperliquid.mjs");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(PRIVATE_KEY);
-    const state = await withRetry(() => getAccountState(account.address));
-    const netLiq = parseFloat(state?.marginSummary?.accountValue ?? "0");
-    const unrealizedPnl = (state?.assetPositions ?? [])
-      .reduce((s, p) => s + parseFloat(p.position?.unrealizedPnl ?? "0"), 0);
-    if (netLiq > 0) {
-      insertSnapshot({ net_liq: netLiq, unrealized_pnl: unrealizedPnl, realized_pnl: getYtdPnl(), total_value: netLiq });
-      console.log(`[trader] 📸 Snapshot: $${netLiq.toFixed(2)}`);
-    }
-  } catch (err) {
-    console.warn(`[trader] Snapshot failed: ${err.message}`);
-  }
-}

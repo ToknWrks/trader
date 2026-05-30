@@ -360,6 +360,11 @@ db.exec(`
 `);
 
 export function insertSnapshot({ net_liq, unrealized_pnl = 0, realized_pnl = 0, total_value }) {
+  const last = db.prepare("SELECT MAX(timestamp) as t FROM snapshots").get()?.t;
+  if (last) {
+    const minutesSince = (Date.now() - new Date(last + "Z").getTime()) / 60000;
+    if (minutesSince < 60) return;
+  }
   db.prepare(`
     INSERT INTO snapshots (net_liq, unrealized_pnl, realized_pnl, total_value)
     VALUES (?, ?, ?, ?)
