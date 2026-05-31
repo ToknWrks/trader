@@ -202,9 +202,54 @@ async function tryLocalEval(strategy) {
   }
 }
 
+// ── Subscribe strategy (lump-sum x402) ───────────────────────────────────────
+
+async function subscribeStrategy(strategyId, intervalMinutes, period) {
+  const PERIOD_DAYS = { day: 1, week: 7, month: 30, year: 365 };
+  const days = PERIOD_DAYS[period];
+  if (!days) throw new Error(`Invalid subscription period: ${period}`);
+
+  const url = `${AGENT_SIGNAL_URL}/api/strategy/${strategyId}/subscribe?interval_minutes=${intervalMinutes}&period=${period}`;
+  const { x402Client } = await import("@x402/core/client");
+  const { decodePaymentRequiredHeader, encodePaymentSignatureHeader } = await import("@x402/core/http");
+  const { ExactEvmScheme } = await import("@x402/evm/exact/client");
+  const { createWalletClient, http } = await import("viem");
+  const { privateKeyToAccount } = await import("viem/accounts");
+  const allChains = await import("viem/chains");
+
+  const account = privateKeyToAccount(PRIVATE_KEY);
+  const client = new x402Client();
+
+  const probe = await fetch(url, { method: "POST", headers: { "X-Wallet-Address": account.address } });
+  if (probe.ok) return await probe.json();
+  if (probe.status !== 402) throw new Error(`Subscribe API ${probe.status}`);
+
+  const rawHeader = probe.headers.get("payment-required") ?? probe.headers.get("X-PAYMENT-REQUIRED");
+  if (!rawHeader) throw new Error("No payment-required header");
+  const paymentRequired = decodePaymentRequiredHeader(rawHeader);
+
+  const serverNetwork = paymentRequired.accepts?.[0]?.network ?? paymentRequired.accepts?.network;
+  const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS["eip155:8453"];
+  const chain = allChains[networkCfg.viemChain];
+  const walletClient = createWalletClient({ account, chain, transport: http(networkCfg.rpc) });
+  const signer = Object.assign(walletClient, { address: account.address });
+  client.register(serverNetwork, new ExactEvmScheme(signer));
+
+  const calls = Math.round((60 / intervalMinutes) * 24 * days);
+  const priceUsd = (Math.round(calls * 0.01 * 100) / 100).toFixed(2);
+  console.log(`[trader] 🔄 Auto-renewing ${period} subscription for strategy ${strategyId} — $${priceUsd}`);
+
+  const paymentPayload = await client.createPaymentPayload(paymentRequired);
+  const paymentHeader = encodePaymentSignatureHeader(paymentPayload);
+  const paid = await fetch(url, { method: "POST", headers: { "payment-signature": paymentHeader, "X-Wallet-Address": account.address } });
+  if (!paid.ok) throw new Error(`Subscription payment rejected (${paid.status})`);
+  return await paid.json();
+}
+
 // ── Fetch signal from agentsignal.app ─────────────────────────────────────────
 
-async function fetchSignal(strategyId) {
+async function fetchSignal(strategy) {
+  const strategyId = typeof strategy === "string" ? strategy : strategy.id;
   const url = `${AGENT_SIGNAL_URL}/api/strategy/${strategyId}/signal`;
   try {
     const { x402Client } = await import("@x402/core/client");
@@ -227,6 +272,25 @@ async function fetchSignal(strategyId) {
       return data;
     }
     if (probe.status !== 402) throw new Error(`Signal API ${probe.status}`);
+
+    // Auto-renew subscription if strategy has a preferred period
+    const subPeriod = typeof strategy === "object" ? strategy.subscription_period : null;
+    if (subPeriod) {
+      try {
+        const iv = typeof strategy === "object" ? (strategy.interval_minutes ?? 60) : 60;
+        await subscribeStrategy(strategyId, iv, subPeriod);
+        // Retry — subscription now active
+        const retried = await fetch(url, { headers: { "X-Wallet-Address": account.address } });
+        if (retried.ok) {
+          const data = await retried.json();
+          console.log(`[trader] ✅ Signal fetched for ${strategyId} (auto-renewed ${subPeriod}): ${data.signal}`);
+          logFetch({ strategy_id: strategyId, network: "subscription", cost_usd: 0 });
+          return data;
+        }
+      } catch (e) {
+        console.warn(`[trader] Auto-renew failed: ${e.message} — falling back to per-call`);
+      }
+    }
 
     // Step 2: decode payment requirement — network comes FROM the server's 402 response
     // x402 v2 uses "payment-required"; v1 used "X-PAYMENT-REQUIRED" — try both
@@ -476,7 +540,7 @@ for (const strategy of strategies) {
   }
 
   // Try local price eval first, fall back to x402 fetch
-  const signalData = await tryLocalEval(strategy) ?? await fetchSignal(strategy.id);
+  const signalData = await tryLocalEval(strategy) ?? await fetchSignal(strategy);
   if (!signalData) {
     console.warn(`[trader] Skipping ${strategy.name} — could not fetch signal`);
     continue;

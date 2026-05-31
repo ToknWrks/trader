@@ -68,7 +68,7 @@ function parseSchedules() {
 const SCHEDULES = parseSchedules();
 
 import {
-  getStrategies, getStrategy, upsertStrategy, setStrategyActive,
+  getStrategies, getStrategy, upsertStrategy, setStrategyActive, setSubscriptionPeriod,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
   countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents, getYtdPnl,
   getSnapshots, insertSnapshot,
@@ -341,6 +341,75 @@ function shell(title, body, active = "") {
     </div>
   </div>
 
+  <!-- Edit strategy modal -->
+  <div class="modal-overlay" id="editModal">
+    <div class="modal" style="max-width:500px;max-height:90vh;overflow-y:auto">
+      <div class="modal-title" id="editModalTitle">Edit Strategy</div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:0.75rem;margin-top:1rem">
+        <input type="hidden" id="em_id" />
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.65rem">
+          <div style="grid-column:1/-1">
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Name</label>
+            <input id="em_name" style="width:100%" />
+          </div>
+          <div style="grid-column:1/-1">
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Symbol</label>
+            <input id="em_symbol" style="width:100%" />
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Margin (USD)</label>
+            <input id="em_position_size_usd" type="number" placeholder="default" style="width:100%" />
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Leverage</label>
+            <select id="em_leverage" style="width:100%">
+              <option value="1">1x</option><option value="2">2x</option><option value="3">3x</option>
+              <option value="5">5x</option><option value="10">10x</option><option value="20">20x</option><option value="50">50x</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Exchange</label>
+            <select id="em_exchange" style="width:100%">
+              <option value="hyperliquid">Hyperliquid</option>
+              <option value="kraken">Kraken</option>
+              <option value="alpaca">Alpaca</option>
+              <option value="coinbase">Coinbase</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Check Every</label>
+            <select id="em_interval_minutes" style="width:100%">
+              <option value="5">5 min</option><option value="15">15 min</option><option value="30">30 min</option>
+              <option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option><option value="1440">Daily</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Take Profit %</label>
+            <input id="em_tp_pct" type="number" step="0.5" placeholder="optional" style="width:100%" />
+            <div style="font-size:0.67rem;color:rgba(255,255,255,0.25);margin-top:0.2rem">Asset price move, not P&L. 5% @ 5x = 25% profit.</div>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Trail Stop %</label>
+            <input id="em_trail_pct" type="number" step="0.1" placeholder="optional" style="width:100%" />
+            <div style="font-size:0.67rem;color:rgba(255,255,255,0.25);margin-top:0.2rem">% drop from peak before closing.</div>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Max Size (USD)</label>
+            <input id="em_max_size_usd" type="number" placeholder="optional" style="width:100%" />
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Cooldown (min)</label>
+            <input id="em_cooldown_minutes" type="number" placeholder="optional" style="width:100%" />
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-cancel" onclick="document.getElementById('editModal').classList.remove('open')">Cancel</button>
+        <button id="editModalSave" class="modal-confirm-green">Save</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Network picker modal -->
   <div class="modal-overlay" id="networkModal" onclick="if(event.target===this)document.getElementById('networkModal').classList.remove('open')">
     <div class="modal" style="max-width:380px">
@@ -418,36 +487,22 @@ function shell(title, body, active = "") {
         </div>
         <div class="modal-schedule">⏱ Runs: \${sched.label}<br><span style="opacity:0.6;font-size:0.7rem">\${sched.detail}</span></div>
         <div style="margin-top:1rem;padding:0.85rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px">
-          <div style="font-size:0.78rem;font-weight:600;color:#fafafa;margin-bottom:0.6rem">Signal subscription <span style="font-weight:400;color:rgba(255,255,255,0.4)">(optional — prepay for unmetered fetches)</span></div>
+          <div style="font-size:0.78rem;font-weight:600;color:#fafafa;margin-bottom:0.6rem">Signal subscription</div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.35rem">
-            \${['day','week','month','year'].map(p => \`
+            \${['day','week','month','year'].map((p, i) => \`
               <label style="display:flex;align-items:center;gap:0.4rem;padding:0.4rem 0.5rem;border:1px solid rgba(255,255,255,0.08);border-radius:6px;cursor:pointer;font-size:0.75rem;color:rgba(255,255,255,0.7)">
-                <input type="radio" name="subPeriod" value="\${p}" style="accent-color:#A8F1F7">
-                \${p.charAt(0).toUpperCase()+p.slice(1)} — <strong style="color:#A8F1F7">$\${subPrice(iv, p)}</strong>
+                <input type="radio" name="subPeriod" value="\${p}" \${i === 2 ? 'checked' : ''} style="accent-color:#A8F1F7">
+                1 \${p.charAt(0).toUpperCase()+p.slice(1)} — <strong style="color:#A8F1F7">$\${subPrice(iv, p)}</strong>
               </label>\`).join('')}
           </div>
-          <label style="margin-top:0.5rem;display:flex;align-items:center;gap:0.4rem;font-size:0.72rem;color:rgba(255,255,255,0.4);cursor:pointer">
-            <input type="radio" name="subPeriod" value="" checked style="accent-color:#A8F1F7"> Pay per signal ($0.01/fetch)
-          </label>
         </div>
       \` : \`
         <p>The trader will <strong>stop executing trades</strong> for this strategy. Any open positions on Hyperliquid will remain open until you close them manually.</p>
       \`;
       const confirmBtn = document.getElementById('modalConfirm');
       confirmBtn.className = confirmClass;
-      confirmBtn.textContent = confirmLabel;
+      confirmBtn.textContent = active ? 'Subscribe & Activate' : 'Deactivate';
       _pendingToggle = { btn, id, active, intervalMinutes: iv };
-
-      // Update button text when period selection changes
-      if (active) {
-        setTimeout(() => {
-          document.querySelectorAll('input[name="subPeriod"]').forEach(r => {
-            r.addEventListener('change', () => {
-              confirmBtn.textContent = r.value ? 'Subscribe & Activate' : 'Activate';
-            });
-          });
-        }, 0);
-      }
 
       document.getElementById('toggleModal').classList.add('open');
     }
@@ -456,13 +511,13 @@ function shell(title, body, active = "") {
       if (!_pendingToggle) return;
       const { btn, id, active, intervalMinutes } = _pendingToggle;
       const selectedPeriod = active
-        ? (document.querySelector('input[name="subPeriod"]:checked')?.value ?? '')
+        ? (document.querySelector('input[name="subPeriod"]:checked')?.value ?? 'month')
         : '';
       closeModal();
       btn.disabled = true;
-      btn.textContent = selectedPeriod ? 'Subscribing...' : 'Saving...';
+      btn.textContent = active ? 'Subscribing...' : 'Saving...';
 
-      if (active && selectedPeriod) {
+      if (active) {
         const subRes = await fetch('/api/subscribe-strategy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -475,6 +530,12 @@ function shell(title, body, active = "") {
           return;
         }
         console.log('[subscribe] ✅ Subscribed until', subData.expires_at);
+        // Save period to strategy for auto-renew
+        await fetch('/api/set-subscription-period', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ strategy_id: id, period: selectedPeriod }),
+        });
       }
 
       const res = await fetch('/api/toggle', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id, active}) });
@@ -799,7 +860,7 @@ async function portfolioPage() {
     .filter(p => parseFloat(p.position?.szi ?? "0") !== 0)
     .reduce((s, p) => s + parseFloat(p.position?.positionValue ?? "0"), 0);
 
-  const equityCurveHtml = renderEquityCurve(getSnapshots(90), hlPositionValue, accountValue, usdcSpot);
+  const equityCurveHtml = renderEquityCurve(getSnapshots(90), hlPositionValue, accountValue - usdcSpot, usdcSpot);
 
   return shell("Portfolio", `
     ${!PRIVATE_KEY ? '<p style="color:#f87171;margin-bottom:1rem">⚠️ AGENT_PRIVATE_KEY not set — run <code>npm run setup</code></p>' : ""}
@@ -1361,9 +1422,10 @@ function strategiesPage() {
       document.getElementById('editModal').classList.add('open');
     }
 
-    document.getElementById('editModal').addEventListener('click', e => { if (e.target === e.currentTarget) e.currentTarget.classList.remove('open'); });
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('editModal').addEventListener('click', e => { if (e.target === e.currentTarget) e.currentTarget.classList.remove('open'); });
 
-    document.getElementById('editModalSave').addEventListener('click', async () => {
+      document.getElementById('editModalSave').addEventListener('click', async () => {
       const btn = document.getElementById('editModalSave');
       btn.textContent = 'Saving…'; btn.disabled = true;
       const get = id => document.getElementById(id)?.value ?? '';
@@ -1385,76 +1447,9 @@ function strategiesPage() {
       if (d.ok) { location.reload(); }
       else { btn.textContent = 'Save'; btn.disabled = false; alert(d.error); }
     });
+    }); // DOMContentLoaded
     </script>
 
-  <!-- Edit strategy modal -->
-  <div class="modal-overlay" id="editModal">
-    <div class="modal" style="max-width:500px;max-height:90vh;overflow-y:auto">
-      <div class="modal-title" id="editModalTitle">Edit Strategy</div>
-      <div class="modal-body" style="display:flex;flex-direction:column;gap:0.75rem;margin-top:1rem">
-        <input type="hidden" id="em_id" />
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.65rem">
-          <div style="grid-column:1/-1">
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Name</label>
-            <input id="em_name" style="width:100%" />
-          </div>
-          <div style="grid-column:1/-1">
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Symbol</label>
-            <input id="em_symbol" style="width:100%" />
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Margin (USD)</label>
-            <input id="em_position_size_usd" type="number" placeholder="default" style="width:100%" />
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Leverage</label>
-            <select id="em_leverage" style="width:100%">
-              <option value="1">1x</option><option value="2">2x</option><option value="3">3x</option>
-              <option value="5">5x</option><option value="10">10x</option><option value="20">20x</option><option value="50">50x</option>
-            </select>
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Exchange</label>
-            <select id="em_exchange" style="width:100%">
-              <option value="hyperliquid">Hyperliquid</option>
-              <option value="kraken">Kraken</option>
-              <option value="alpaca">Alpaca</option>
-              <option value="coinbase">Coinbase</option>
-            </select>
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Check Every</label>
-            <select id="em_interval_minutes" style="width:100%">
-              <option value="5">5 min</option><option value="15">15 min</option><option value="30">30 min</option>
-              <option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option><option value="1440">Daily</option>
-            </select>
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Take Profit %</label>
-            <input id="em_tp_pct" type="number" step="0.5" placeholder="optional" style="width:100%" />
-            <div style="font-size:0.67rem;color:rgba(255,255,255,0.25);margin-top:0.2rem">Asset price move, not P&L. 5% @ 5x = 25% profit.</div>
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Trail Stop %</label>
-            <input id="em_trail_pct" type="number" step="0.1" placeholder="optional" style="width:100%" />
-            <div style="font-size:0.67rem;color:rgba(255,255,255,0.25);margin-top:0.2rem">% drop from peak before closing.</div>
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Max Size (USD)</label>
-            <input id="em_max_size_usd" type="number" placeholder="optional" style="width:100%" />
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Cooldown (min)</label>
-            <input id="em_cooldown_minutes" type="number" placeholder="optional" style="width:100%" />
-          </div>
-        </div>
-      </div>
-      <div class="modal-actions">
-        <button class="modal-cancel" onclick="document.getElementById('editModal').classList.remove('open')">Cancel</button>
-        <button id="editModalSave" class="modal-confirm-green">Save</button>
-      </div>
-    </div>
-  </div>
   `, "strategies");
 }
 
@@ -2355,6 +2350,16 @@ const server = createServer(async (req, res) => {
           : new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE);
         const result = await exch.placeMarketOrder(asset, "sell", amount);
         return json({ ok: true, result });
+      } catch (e) { return json({ ok: false, error: e.message }); }
+    }
+
+    if (url === "/api/set-subscription-period" && method === "POST") {
+      const body = await readBody();
+      try {
+        const { strategy_id, period } = JSON.parse(body);
+        if (!strategy_id) return json({ ok: false, error: "strategy_id required" });
+        setSubscriptionPeriod(strategy_id, period ?? null);
+        return json({ ok: true });
       } catch (e) { return json({ ok: false, error: e.message }); }
     }
 
