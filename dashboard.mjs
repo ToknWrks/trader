@@ -71,7 +71,7 @@ import {
   getStrategies, getStrategy, upsertStrategy, setStrategyActive, setSubscriptionPeriod,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
   countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents, getYtdPnl,
-  getSnapshots, insertSnapshot,
+  getSnapshots, insertSnapshot, hasSnapshots, backfillSnapshotsFromTrades,
 } from "./db.mjs";
 
 // ── x402 network config ───────────────────────────────────────────────────────
@@ -652,7 +652,7 @@ function writeEnvValues(updates) {
 
 // ── Equity curve (server-side SVG) ────────────────────────────────────────────
 
-function renderEquityCurve(snapshots, positionValue, marginValue, spotUsdc = 0) {
+function renderEquityCurve(snapshots, positionValue, spotUsdc = 0) {
   const fmt2 = v => v > 0 ? `$${v.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}` : "—";
   const statBlock = (label, val) => `
     <div>
@@ -662,8 +662,6 @@ function renderEquityCurve(snapshots, positionValue, marginValue, spotUsdc = 0) 
   const divider = `<div style="width:1px;background:rgba(255,255,255,0.08);align-self:stretch;margin-top:2px"></div>`;
   const header = `<div style="display:flex;gap:2rem;align-items:flex-start">
     ${statBlock("Position Value", fmt2(positionValue))}
-    ${divider}
-    ${statBlock("Margin", fmt2(marginValue))}
     ${divider}
     ${statBlock("Spot USDC", fmt2(spotUsdc))}
   </div>`;
@@ -859,6 +857,7 @@ async function portfolioPage() {
 
   const hlTotalValue = accountValue + usdcSpot;
   if (usdcSpot > 0) {
+    if (!hasSnapshots()) backfillSnapshotsFromTrades(usdcSpot);
     const unrealizedPnl = (hlData?.assetPositions ?? [])
       .reduce((s, p) => s + parseFloat(p.position?.unrealizedPnl ?? "0"), 0);
     insertSnapshot({ net_liq: usdcSpot, unrealized_pnl: unrealizedPnl, realized_pnl: ytdPnl, total_value: usdcSpot });
@@ -868,7 +867,7 @@ async function portfolioPage() {
     .filter(p => parseFloat(p.position?.szi ?? "0") !== 0)
     .reduce((s, p) => s + parseFloat(p.position?.positionValue ?? "0"), 0);
 
-  const equityCurveHtml = renderEquityCurve(getSnapshots(90), hlPositionValue, accountValue - usdcSpot, usdcSpot);
+  const equityCurveHtml = renderEquityCurve(getSnapshots(90), hlPositionValue, usdcSpot);
 
   return shell("Portfolio", `
     ${!PRIVATE_KEY ? '<p style="color:#f87171;margin-bottom:1rem">⚠️ AGENT_PRIVATE_KEY not set — run <code>npm run setup</code></p>' : ""}

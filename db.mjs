@@ -403,3 +403,31 @@ export function getSnapshots(days = 90) {
     ORDER BY date ASC
   `).all();
 }
+
+export function hasSnapshots() {
+  return (db.prepare("SELECT COUNT(*) as c FROM snapshots").get()?.c ?? 0) > 0;
+}
+
+export function backfillSnapshotsFromTrades(currentAccountValue) {
+  const totalPnl = db.prepare(
+    "SELECT COALESCE(SUM(pnl), 0) as total FROM trades WHERE pnl IS NOT NULL"
+  ).get()?.total ?? 0;
+  const startingValue = currentAccountValue - totalPnl;
+
+  const days = db.prepare(`
+    SELECT date, SUM(pnl) as daily_pnl
+    FROM trades
+    WHERE pnl IS NOT NULL
+    GROUP BY date
+    ORDER BY date ASC
+  `).all();
+
+  let running = startingValue;
+  for (const day of days) {
+    running += day.daily_pnl;
+    db.prepare(`
+      INSERT INTO snapshots (timestamp, net_liq, unrealized_pnl, realized_pnl, total_value)
+      VALUES (datetime(?, '12:00:00'), ?, 0, ?, ?)
+    `).run(day.date, running, running - startingValue, running);
+  }
+}
