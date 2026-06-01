@@ -382,6 +382,7 @@ function shell(title, body, active = "") {
               <option value="5">5 min</option><option value="15">15 min</option><option value="30">30 min</option>
               <option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option><option value="1440">Daily</option>
             </select>
+            <div id="em_candle_hint" style="font-size:0.67rem;color:rgba(255,255,255,0.3);margin-top:0.25rem;display:none"></div>
           </div>
           <div>
             <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Take Profit %</label>
@@ -577,8 +578,10 @@ function shell(title, body, active = "") {
         const res = await fetch('/api/strategy-details/' + s.id);
         if (res.ok) {
           const full = await res.json();
-          entry = typeof full.entry === 'string' ? JSON.parse(full.entry) : full.entry;
-          exit  = typeof full.exit  === 'string' ? JSON.parse(full.exit)  : full.exit;
+          const parse = v => typeof v === 'string' ? JSON.parse(v) : v;
+          const hasConditions = r => r?.conditions?.length > 0;
+          entry = hasConditions(parse(full.long_entry)) ? parse(full.long_entry) : parse(full.entry);
+          exit  = hasConditions(parse(full.long_exit))  ? parse(full.long_exit)  : parse(full.exit);
         }
       } catch {}
 
@@ -1084,7 +1087,7 @@ async function positionsPage() {
       const isDust = parseFloat(b.entryNtl ?? "0") < 1.0;
       const closeBtn = isDust
         ? `<span style="color:rgba(255,255,255,0.25);font-size:0.75rem">dust</span>`
-        : `<button class="btn btn-red" onclick="closePos(this, '${b.coin}', 'hyperliquid')">Force Exit</button>`;
+        : `<div style="display:flex;gap:0.4rem"><button class="btn btn-green" onclick="addToPos(this, '${b.coin}', 'hyperliquid', 'buy')" title="Add to position">+</button><button class="btn btn-red" onclick="closePos(this, '${b.coin}', 'hyperliquid')">Force Exit</button></div>`;
       return `<tr>
         <td style="color:rgba(255,255,255,0.4);font-size:0.78rem">${label}</td>
         <td><strong>${b.coin}</strong></td>
@@ -1112,7 +1115,7 @@ async function positionsPage() {
         <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
         <td>$${parseFloat(pos.positionValue ?? "0").toFixed(2)}</td>
         <td class="red">${liqPx > 0 ? "$" + liqPx.toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
-        <td><button class="btn btn-red" onclick="closePos(this, '${pos.coin}', 'hyperliquid')">Force Exit</button></td>
+        <td><div style="display:flex;gap:0.4rem"><button class="btn btn-${isLong ? "green" : "red"}" onclick="addToPos(this, '${pos.coin}', 'hyperliquid', '${isLong ? "buy" : "sell"}')" title="Add to position">+</button><button class="btn btn-red" onclick="closePos(this, '${pos.coin}', 'hyperliquid')">Force Exit</button></div></td>
       </tr>`;
     }),
     ...alpacaPositions.map(p => {
@@ -1131,7 +1134,7 @@ async function positionsPage() {
         <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
         <td>$${mktVal.toFixed(2)}</td>
         <td class="red">—</td>
-        <td><button class="btn btn-red" onclick="closePos(this, '${p.symbol}', 'alpaca')">Force Exit</button></td>
+        <td><div style="display:flex;gap:0.4rem"><button class="btn btn-${isLong ? "green" : "red"}" onclick="addToPos(this, '${p.symbol}', 'alpaca', '${isLong ? "buy" : "sell"}')" title="Add to position">+</button><button class="btn btn-red" onclick="closePos(this, '${p.symbol}', 'alpaca')">Force Exit</button></div></td>
       </tr>`;
     }),
   ];
@@ -1151,6 +1154,33 @@ async function positionsPage() {
     <p class="hint">Auto-refreshes every 30s · <a href="/positions">Refresh now</a></p>
     <script>
       setTimeout(() => location.reload(), 30000);
+      function addToPos(btn, asset, exchange, side) {
+        const dirLabel = side === 'buy' ? 'Long' : 'Short';
+        document.getElementById('openModalTitle').textContent = 'Add to ' + dirLabel + ' — ' + asset;
+        document.getElementById('openModalBody').innerHTML =
+          '<p style="font-size:0.82rem;color:rgba(255,255,255,0.55);margin:0 0 1rem">Place an additional <strong>' + dirLabel + '</strong> market order on <strong>' + asset + '</strong>.</p>' +
+          '<label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.35rem;text-transform:uppercase;letter-spacing:0.05em">Amount (USD)</label>' +
+          '<input id="addPosUsd" type="number" step="any" min="1" placeholder="e.g. 50" style="width:100%;box-sizing:border-box;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:0.5rem 0.75rem;color:#fafafa;font-size:0.9rem;outline:none">';
+        const confirmBtn = document.getElementById('openModalConfirm');
+        confirmBtn.textContent = 'Add ' + dirLabel;
+        confirmBtn.className = side === 'buy' ? 'modal-confirm-green' : 'modal-confirm-red';
+        confirmBtn.onclick = async () => {
+          const sizeUsd = parseFloat(document.getElementById('addPosUsd').value);
+          if (!sizeUsd || sizeUsd <= 0) { alert('Enter a valid USD amount.'); return; }
+          confirmBtn.textContent = 'Placing…'; confirmBtn.disabled = true;
+          document.getElementById('openModal').classList.remove('open');
+          btn.textContent = '…'; btn.disabled = true;
+          try {
+            const res = await fetch('/api/add-to-position', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ asset, exchange, side, sizeUsd }) });
+            const d = await res.json();
+            if (d.ok) { btn.textContent = '✓'; setTimeout(() => location.reload(), 1500); }
+            else { btn.disabled = false; btn.textContent = '+'; alert('Error: ' + d.error); }
+          } catch { btn.disabled = false; btn.textContent = '+'; }
+          confirmBtn.disabled = false;
+        };
+        document.getElementById('openModal').classList.add('open');
+        setTimeout(() => document.getElementById('addPosUsd')?.focus(), 100);
+      }
       function closePos(btn, asset, exchange) {
         const exchLabel = exchange === 'alpaca' ? 'Alpaca' : exchange === 'kraken' ? 'Kraken' : exchange === 'coinbase' ? 'Coinbase' : 'Hyperliquid';
         document.getElementById('openModalTitle').textContent = 'Force Exit — ' + asset;
@@ -1276,8 +1306,10 @@ function strategiesPage() {
           const res = await fetch('/api/strategy-details/' + id);
           if (res.ok) {
             const full = await res.json();
-            const entry = typeof full.entry === 'string' ? JSON.parse(full.entry) : full.entry;
-            const exit  = typeof full.exit  === 'string' ? JSON.parse(full.exit)  : full.exit;
+            const parse = v => typeof v === 'string' ? JSON.parse(v) : v;
+            const hasConditions = r => r?.conditions?.length > 0;
+            const entry = hasConditions(parse(full.long_entry)) ? parse(full.long_entry) : parse(full.entry);
+            const exit  = hasConditions(parse(full.long_exit))  ? parse(full.long_exit)  : parse(full.exit);
             const allConds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
             const seen = new Set();
             for (const c of allConds) {
@@ -1404,7 +1436,9 @@ function strategiesPage() {
       location.reload();
     }
 
-    function openEditModal(s) {
+    const CANDLE_TO_MIN = { "1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60,"2h":120,"4h":240,"8h":480,"12h":720,"1d":1440 };
+
+    async function openEditModal(s) {
       const f = (id, val) => { const el = document.getElementById(id); if (el) el.value = val ?? ''; };
       const sel = (id, val) => { const el = document.getElementById(id); if (el) el.value = val ?? ''; };
       document.getElementById('editModalTitle').textContent = 'Edit — ' + s.name;
@@ -1420,6 +1454,46 @@ function strategiesPage() {
       f('em_max_size_usd', s.max_size_usd);
       f('em_cooldown_minutes', s.cooldown_minutes);
       document.getElementById('editModal').classList.add('open');
+
+      // Fetch candle interval from AgentSignal and show hint
+      const hint = document.getElementById('em_candle_hint');
+      hint.style.display = 'none';
+      try {
+        const r = await fetch('/api/strategy-details/' + s.id);
+        if (r.ok) {
+          const def = await r.json();
+          const conds = def.long_entry?.conditions ?? def.entry?.conditions ?? [];
+          const candleInterval = conds.find(c => c.interval)?.interval;
+          if (candleInterval) {
+            const candleMin = CANDLE_TO_MIN[candleInterval];
+            const mismatch = candleMin && candleMin !== (s.interval_minutes ?? 60);
+            hint.style.display = 'block';
+            hint.style.color = mismatch ? 'rgba(251,191,36,0.7)' : 'rgba(255,255,255,0.3)';
+            hint.innerHTML = '';
+            const strong = document.createElement('strong');
+            strong.textContent = candleInterval;
+            hint.appendChild(document.createTextNode('Candle interval: '));
+            hint.appendChild(strong);
+            if (mismatch) {
+              const link = document.createElement('a');
+              link.href = '#';
+              link.textContent = 'match';
+              link.style.color = 'rgba(168,241,247,0.8)';
+              link.style.marginLeft = '0.25rem';
+              link.addEventListener('click', function(e) {
+                e.preventDefault();
+                document.getElementById('em_interval_minutes').value = candleMin;
+                hint.style.color = 'rgba(255,255,255,0.3)';
+                hint.textContent = 'Candle interval: ' + candleInterval + ' — matched';
+              });
+              hint.appendChild(document.createTextNode(' — '));
+              hint.appendChild(link);
+            } else {
+              hint.appendChild(document.createTextNode(' — matched'));
+            }
+          }
+        }
+      } catch {}
     }
 
     document.addEventListener('DOMContentLoaded', () => {
@@ -2226,6 +2300,31 @@ async function handleOpen(body) {
   return { ok: true, action };
 }
 
+async function handleAddToPosition(body) {
+  const { asset, exchange, side, sizeUsd } = JSON.parse(body);
+  if (!asset || !side || !sizeUsd || sizeUsd <= 0) return { ok: false, error: "asset, side, sizeUsd required" };
+
+  const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
+  const { KrakenExchange }      = await import("./exchanges/kraken.mjs");
+  const { AlpacaExchange }      = await import("./exchanges/alpaca.mjs");
+  const { CoinbaseExchange }    = await import("./exchanges/coinbase.mjs");
+  const exch = exchange === "kraken"
+    ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
+    : exchange === "alpaca"
+    ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
+    : exchange === "coinbase"
+    ? new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE)
+    : new HyperliquidExchange(PRIVATE_KEY);
+
+  const midPrice = await exch.getMidPrice(asset);
+  const size = parseFloat((sizeUsd / midPrice).toFixed(5));
+  await exch.placeMarketOrder(asset, side, size);
+  const action = `ADD ${side === "buy" ? "LONG" : "SHORT"} +${size} ${asset} @ ~$${midPrice.toLocaleString()} ($${sizeUsd})`;
+  const { insertTrade } = await import("./db.mjs");
+  insertTrade({ strategy_id: null, action, asset, size, price: midPrice, leverage: 1 });
+  return { ok: true, action };
+}
+
 async function handleCancelOrder(body) {
   const { exchange, orderId, asset } = JSON.parse(body);
   const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
@@ -2334,6 +2433,11 @@ const server = createServer(async (req, res) => {
       const body = await readBody();
       return json(await handleRun(body).catch(e => ({ ok: false, error: e.message })));
     }
+    if (url === "/api/add-to-position" && method === "POST") {
+      const body = await readBody();
+      return json(await handleAddToPosition(body).catch(e => ({ ok: false, error: e.message })));
+    }
+
     if (url === "/api/open" && method === "POST") {
       const body = await readBody();
       return json(await handleOpen(body).catch(e => ({ ok: false, error: e.message })));
@@ -2368,7 +2472,30 @@ const server = createServer(async (req, res) => {
       try {
         const s = JSON.parse(body);
         if (!s.id) return json({ ok: false, error: "id required" });
+        const old = getStrategy(s.id);
         upsertStrategy(s);
+        // If interval changed, adjust subscription expiry on AgentSignal
+        if (old && s.interval_minutes && old.interval_minutes !== s.interval_minutes && PRIVATE_KEY) {
+          try {
+            const { privateKeyToAccount } = await import("viem/accounts");
+            const account = privateKeyToAccount(PRIVATE_KEY);
+            const adjustUrl = getSignalUrl() + '/api/strategy/' + s.id + '/subscription/adjust';
+            const r = await fetch(adjustUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-Wallet-Address': account.address },
+              body: JSON.stringify({ new_interval_minutes: s.interval_minutes }),
+            });
+            const adj = await r.json();
+            if (r.status === 402 && adj.upcharge_required) {
+              console.warn('[adjust-sub] upcharge required: $' + adj.upcharge_usd + ' — ' + adj.message);
+              return json({ ok: false, error: 'Faster interval requires upcharge of $' + adj.upcharge_usd.toFixed(2) + '. Purchase a new subscription at ' + s.interval_minutes + '-min interval to upgrade.' });
+            }
+            if (r.ok) {
+              console.log('[adjust-sub] interval', old.interval_minutes, '→', s.interval_minutes,
+                '| expiry', adj.old_expires_at, '→', adj.new_expires_at);
+            }
+          } catch (e) { console.warn('[adjust-sub] skipped:', e.message); }
+        }
         return json({ ok: true });
       } catch (e) { return json({ ok: false, error: e.message }); }
     }

@@ -156,8 +156,10 @@ async function tryLocalEval(strategy) {
     const res = await fetch(`${AGENT_SIGNAL_URL}/api/strategy/${strategy.id}`);
     if (!res.ok) return null;
     const def = await res.json();
-    const entry = typeof def.entry === "string" ? JSON.parse(def.entry) : def.entry;
-    const exit  = typeof def.exit  === "string" ? JSON.parse(def.exit)  : def.exit;
+    const parse = v => typeof v === "string" ? JSON.parse(v) : v;
+    const hasConditions = r => r?.conditions?.length > 0;
+    const entry = hasConditions(parse(def.long_entry)) ? parse(def.long_entry) : parse(def.entry);
+    const exit  = hasConditions(parse(def.long_exit))  ? parse(def.long_exit)  : parse(def.exit);
 
     const allConds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
     if (!allConds.length) return null;
