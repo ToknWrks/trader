@@ -12,6 +12,7 @@ import {
   setLeverage as hlSetLeverage,
   getOpenOrders as hlGetOpenOrders,
   cancelOrder as hlCancelOrder,
+  getCandleSnapshots as hlGetCandles,
 } from "../hyperliquid.mjs";
 
 export class HyperliquidExchange {
@@ -53,5 +54,9 @@ export class HyperliquidExchange {
 
   async closePosition(asset) {
     return hlClose(this.privateKey, asset);
+  }
+
+  async getCandles(asset, interval, count) {
+    return hlGetCandles(asset, interval, count);
   }
 }

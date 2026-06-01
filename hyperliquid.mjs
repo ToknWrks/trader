@@ -216,6 +216,40 @@ export async function cancelOrder(privateKey, asset, oid) {
 }
 
 /**
+ * Fetch OHLCV candle snapshots from Hyperliquid.
+ * interval: "1m" | "3m" | "5m" | "15m" | "30m" | "1h" | "2h" | "4h" | "8h" | "12h" | "1d"
+ * Returns last `count` closed candles, each: { t, T, s, i, o, c, h, l, v, n }
+ */
+export async function getFundingRate(asset) {
+  await _loadCaches();
+  const info = new InfoClient({ transport });
+  const [meta, ctxs] = await info.metaAndAssetCtxs();
+  const idx = meta.universe.findIndex(a => a.name.toUpperCase() === asset.toUpperCase());
+  if (idx === -1) return null;
+  const ctx = ctxs[idx];
+  return {
+    funding:       parseFloat(ctx.funding),
+    openInterest:  parseFloat(ctx.openInterest),
+    markPx:        parseFloat(ctx.markPx),
+    dayNtlVlm:     parseFloat(ctx.dayNtlVlm),
+  };
+}
+
+export async function getCandleSnapshots(asset, interval, count = 100) {
+  const INTERVAL_MS = {
+    "1m": 60000, "3m": 180000, "5m": 300000, "15m": 900000, "30m": 1800000,
+    "1h": 3600000, "2h": 7200000, "4h": 14400000, "8h": 28800000, "12h": 43200000,
+    "1d": 86400000, "3d": 259200000, "1w": 604800000,
+  };
+  const intervalMs = INTERVAL_MS[interval] ?? 60000;
+  const endTime = Date.now();
+  const startTime = endTime - intervalMs * (count + 50);
+  const info = new InfoClient({ transport });
+  const candles = await info.candleSnapshot({ coin: asset.toUpperCase(), interval, startTime, endTime });
+  return Array.isArray(candles) ? candles.slice(-count) : [];
+}
+
+/**
  * Close all positions for an asset (reduce-only IOC).
  */
 export async function closePosition(privateKey, asset) {

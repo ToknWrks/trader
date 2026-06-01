@@ -1276,6 +1276,7 @@ function strategiesPage() {
     ${cards}
     <script>
     const TV_SYMBOLS = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, tvSymbol(s.symbol, s.exchange)])))};
+    const STRAT_INFO  = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, { exchange: s.exchange ?? "hyperliquid", symbol: s.symbol.replace(/-USD$|\/USD$/i, "") }])))};
 
     const FIELD_TO_STUDY = {
       rsi:        'RSI@tv-basicstudies',
@@ -1300,17 +1301,26 @@ function strategiesPage() {
       if (!isOpen && !body.querySelector('iframe')) {
         const tv = TV_SYMBOLS[id] || 'BINANCE:BTCUSDT';
 
-        // Derive up to 2 indicator studies from strategy conditions
+        // Fetch strategy conditions + funding rate in parallel
         let studies = [];
+        let tvInterval = '60';
+        let fundingHtml = '';
+        const info = STRAT_INFO[id] ?? {};
+        const isHL = !info.exchange || info.exchange === 'hyperliquid';
+        const [detailsRes, fundingRes] = await Promise.all([
+          fetch('/api/strategy-details/' + id),
+          isHL && info.symbol ? fetch('/api/funding-rate/' + encodeURIComponent(info.symbol)) : Promise.resolve(null),
+        ]);
         try {
-          const res = await fetch('/api/strategy-details/' + id);
-          if (res.ok) {
-            const full = await res.json();
+          if (detailsRes.ok) {
+            const full = await detailsRes.json();
             const parse = v => typeof v === 'string' ? JSON.parse(v) : v;
             const hasConditions = r => r?.conditions?.length > 0;
             const entry = hasConditions(parse(full.long_entry)) ? parse(full.long_entry) : parse(full.entry);
             const exit  = hasConditions(parse(full.long_exit))  ? parse(full.long_exit)  : parse(full.exit);
             const allConds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
+            const CANDLE_TO_TV = { "1m":"1","3m":"3","5m":"5","15m":"15","30m":"30","1h":"60","2h":"120","4h":"240","8h":"480","12h":"720","1d":"D" };
+            tvInterval = CANDLE_TO_TV[allConds.find(c => c.interval)?.interval] ?? '60';
             const seen = new Set();
             for (const c of allConds) {
               const study = FIELD_TO_STUDY[c.field];
@@ -1319,9 +1329,24 @@ function strategiesPage() {
             }
           }
         } catch {}
-
+        try {
+          if (fundingRes?.ok) {
+            const f = await fundingRes.json();
+            const rate = f.funding;
+            const ratePct = (rate * 100).toFixed(4);
+            const color = rate < 0 ? '#4ade80' : rate > 0 ? '#f87171' : 'rgba(255,255,255,0.4)';
+            const dir   = rate < 0 ? '▼ shorts pay' : rate > 0 ? '▲ longs pay' : '—';
+            const fmtNum = n => n >= 1e9 ? (n/1e9).toFixed(2)+'B' : n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n.toFixed(0);
+            fundingHtml = '<div style="display:flex;gap:1.5rem;align-items:center;padding:0.5rem 0.75rem;background:rgba(0,0,0,0.25);font-size:0.75rem;border-bottom:1px solid rgba(255,255,255,0.07)">'
+              + '<span style="color:rgba(255,255,255,0.4)">Funding/hr</span>'
+              + '<span style="color:' + color + ';font-weight:600">' + (rate >= 0 ? '+' : '') + ratePct + '% &nbsp;<span style="font-weight:400;opacity:0.7">' + dir + '</span></span>'
+              + '<span style="color:rgba(255,255,255,0.4)">OI</span><span style="color:rgba(255,255,255,0.75)">$' + fmtNum(f.openInterest * f.markPx) + '</span>'
+              + '<span style="color:rgba(255,255,255,0.4)">24h Vol</span><span style="color:rgba(255,255,255,0.75)">$' + fmtNum(f.dayNtlVlm) + '</span>'
+              + '</div>';
+          }
+        } catch {}
         const studyParams = studies.map(s => '&studies=' + encodeURIComponent(s)).join('');
-        body.innerHTML = '<iframe src="https://www.tradingview.com/widgetembed/?symbol=' + encodeURIComponent(tv) + '&interval=15&theme=dark&style=1&hide_side_toolbar=0&allow_symbol_change=1&save_image=0&locale=en&hide_legend=0&hide_volume=0' + studyParams + '" width="100%" height="480" frameborder="0" allowtransparency="true" scrolling="no" style="display:block"></iframe>';
+        body.innerHTML = fundingHtml + '<iframe src="https://www.tradingview.com/widgetembed/?symbol=' + encodeURIComponent(tv) + '&interval=' + tvInterval + '&theme=dark&style=1&hide_side_toolbar=0&allow_symbol_change=1&save_image=0&locale=en&hide_legend=0&hide_volume=0' + studyParams + '" width="100%" height="480" frameborder="0" allowtransparency="true" scrolling="no" style="display:block"></iframe>';
       }
     }
     function runNow(btn, id, name) {
@@ -1462,7 +1487,10 @@ function strategiesPage() {
         const r = await fetch('/api/strategy-details/' + s.id);
         if (r.ok) {
           const def = await r.json();
-          const conds = def.long_entry?.conditions ?? def.entry?.conditions ?? [];
+          const parseJ = v => { try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return v; } };
+          const defEntry = parseJ(def.long_entry) ?? parseJ(def.entry);
+          const defExit  = parseJ(def.long_exit)  ?? parseJ(def.exit);
+          const conds = [...(defEntry?.conditions ?? []), ...(defExit?.conditions ?? [])];
           const candleInterval = conds.find(c => c.interval)?.interval;
           if (candleInterval) {
             const candleMin = CANDLE_TO_MIN[candleInterval];
@@ -2546,6 +2574,16 @@ const server = createServer(async (req, res) => {
       const id = url.replace("/api/strategy/", "");
       deleteStrategy(id);
       return json({ ok: true });
+    }
+
+    if (url.startsWith("/api/funding-rate/") && method === "GET") {
+      const asset = decodeURIComponent(url.replace("/api/funding-rate/", "")).toUpperCase();
+      try {
+        const { getFundingRate } = await import("./hyperliquid.mjs");
+        const data = await getFundingRate(asset);
+        if (!data) return json({ error: "Asset not found" }, 404);
+        return json(data);
+      } catch (e) { return json({ error: e.message }, 500); }
     }
 
     if (url.startsWith("/api/strategy-details/") && method === "GET") {
