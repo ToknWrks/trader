@@ -64,6 +64,10 @@ for (const col of [
   "ALTER TABLE strategies ADD COLUMN max_size_usd REAL",
   "ALTER TABLE strategies ADD COLUMN cooldown_minutes INTEGER",
   "ALTER TABLE strategies ADD COLUMN subscription_period TEXT",
+  "ALTER TABLE strategies ADD COLUMN option_mode TEXT",
+  "ALTER TABLE strategies ADD COLUMN dte_target INTEGER",
+  "ALTER TABLE strategies ADD COLUMN delta_target REAL",
+  "ALTER TABLE strategies ADD COLUMN contracts INTEGER",
 ]) {
   try { db.exec(col); } catch {}
 }

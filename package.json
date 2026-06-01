@@ -10,7 +10,9 @@
     "stop": "pm2 stop all",
     "dashboard": "node dashboard.mjs",
     "trade": "node trader.mjs",
-    "logs": "pm2 logs trader"
+    "logs": "pm2 logs trader",
+    "restart": "pm2 restart trader-dashboard",
+    "schwab-auth": "node schwab-auth.mjs"
   },
   "dependencies": {
     "@nktkas/hyperliquid": "^0.32.2",

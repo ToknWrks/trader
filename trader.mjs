@@ -41,6 +41,9 @@ const ALPACA_PAPER           = process.env.ALPACA_PAPER === "true";
 const COINBASE_API_KEY        = process.env.COINBASE_API_KEY?.trim();
 const COINBASE_API_SECRET     = process.env.COINBASE_API_SECRET?.trim();
 const COINBASE_API_PASSPHRASE = process.env.COINBASE_API_PASSPHRASE?.trim();
+const SCHWAB_API_KEY          = process.env.SCHWAB_API_KEY?.trim();
+const SCHWAB_APP_SECRET       = process.env.SCHWAB_APP_SECRET?.trim();
+const AGENT_API_KEY           = process.env.AGENT_API_KEY?.trim();
 const AGENT_SIGNAL_URL  = process.env.AGENT_SIGNAL_URL ?? "https://agentsignal.app";
 
 // ── x402 network config ───────────────────────────────────────────────────────
@@ -95,6 +98,7 @@ import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
 import { KrakenExchange } from "./exchanges/kraken.mjs";
 import { AlpacaExchange } from "./exchanges/alpaca.mjs";
 import { CoinbaseExchange } from "./exchanges/coinbase.mjs";
+import { SchwabExchange } from "./exchanges/schwab.mjs";
 
 function getExchange(strategy) {
   const exch = strategy.exchange ?? "hyperliquid";
@@ -109,6 +113,15 @@ function getExchange(strategy) {
   if (exch === "coinbase") {
     if (!COINBASE_API_KEY || !COINBASE_API_SECRET || !COINBASE_API_PASSPHRASE) throw new Error("COINBASE_API_KEY, COINBASE_API_SECRET, and COINBASE_API_PASSPHRASE are required for Coinbase strategies");
     return new CoinbaseExchange(COINBASE_API_KEY, COINBASE_API_SECRET, COINBASE_API_PASSPHRASE);
+  }
+  if (exch === "schwab") {
+    if (!SCHWAB_API_KEY || !SCHWAB_APP_SECRET) throw new Error("SCHWAB_API_KEY and SCHWAB_APP_SECRET are required for Schwab strategies");
+    return new SchwabExchange(SCHWAB_API_KEY, SCHWAB_APP_SECRET, {
+      optionMode:  strategy.option_mode  ?? null,
+      dteTarget:   strategy.dte_target   ?? 30,
+      deltaTarget: strategy.delta_target ?? 0.30,
+      contracts:   strategy.contracts    ?? 1,
+    });
   }
   if (!PRIVATE_KEY) throw new Error("AGENT_PRIVATE_KEY is required for Hyperliquid strategies");
   return new HyperliquidExchange(PRIVATE_KEY);
@@ -360,13 +373,15 @@ async function fetchSignal(strategy) {
     const account = privateKeyToAccount(PRIVATE_KEY);
     const client = new x402Client();
 
-    // Step 1: probe — expect 402 (send wallet address so server can skip x402 if subscribed)
-    const probe = await fetch(url, { headers: { "X-Wallet-Address": account.address } });
+    // Step 1: probe — send API key header so AgentSignal can bypass x402 for paid subscribers
+    const probeHeaders = { "X-Wallet-Address": account.address };
+    if (AGENT_API_KEY) probeHeaders["Authorization"] = "Bearer " + AGENT_API_KEY;
+    const probe = await fetch(url, { headers: probeHeaders });
     if (probe.ok) {
-      // No payment required (e.g. local dev bypass)
       const data = await probe.json();
-      console.log(`[trader] ✅ Signal fetched for ${strategyId}: ${data.signal}`);
-      logFetch({ strategy_id: strategyId, network: "bypass", cost_usd: 0 });
+      const network = AGENT_API_KEY ? "api_key" : "bypass";
+      console.log(`[trader] ✅ Signal fetched for ${strategyId} (${network}): ${data.signal}`);
+      logFetch({ strategy_id: strategyId, network, cost_usd: 0 });
       return data;
     }
     if (probe.status !== 402) throw new Error(`Signal API ${probe.status}`);

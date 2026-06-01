@@ -27,6 +27,25 @@ loadEnv();
 const PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY;
 function getSignalUrl() { return process.env.AGENT_SIGNAL_URL ?? "https://agentsignal.app"; }
 
+async function getAgentSignalUser() {
+  const key = process.env.AGENT_API_KEY?.trim();
+  if (!key) return null;
+  try {
+    const res = await fetch(`${getSignalUrl()}/api/auth/me`, {
+      headers: { "Authorization": "Bearer " + key },
+    });
+    if (!res.ok) return null;
+    return await res.json(); // { valid, email, tier }
+  } catch { return null; }
+}
+
+function getSchwabClient() {
+  const key = process.env.SCHWAB_API_KEY?.trim();
+  const sec = process.env.SCHWAB_APP_SECRET?.trim();
+  if (!key || !sec) return null;
+  return new SchwabClient(key, sec);
+}
+
 // ── Schedule ──────────────────────────────────────────────────────────────────
 
 function parseCron(cron) {
@@ -71,8 +90,11 @@ import {
   getStrategies, getStrategy, upsertStrategy, setStrategyActive, setSubscriptionPeriod,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
   countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents, getYtdPnl,
-  getSnapshots, insertSnapshot, hasSnapshots, backfillSnapshotsFromTrades,
+  getSnapshots, insertSnapshot, hasSnapshots, backfillSnapshotsFromTrades, insertTrade,
 } from "./db.mjs";
+
+import { getV3Positions, getV4Positions, getPnl, collectAndSwap } from "./uniswap-api.mjs";
+import { SchwabClient } from "./exchanges/schwab.mjs";
 
 // ── x402 network config ───────────────────────────────────────────────────────
 
@@ -248,6 +270,8 @@ function shell(title, body, active = "") {
       <a class="nav-link ${active === "strategies" ? "active" : ""}" href="/strategies">Strategies</a>
       <a class="nav-link ${active === "signals" ? "active" : ""}" href="/signals">Signals</a>
       <a class="nav-link ${active === "history" ? "active" : ""}" href="/history">History</a>
+      ${process.env.AGENT_API_KEY ? `<a class="nav-link ${active === "premium-fade" ? "active" : ""}" href="/premium-fade">Premium Fade</a>` : ""}
+      <a class="nav-link ${active === "uniswap" ? "active" : ""}" href="/uniswap">Uniswap</a>
       <a class="nav-link ${active === "settings" ? "active" : ""}" href="/settings">Settings</a>
       <a class="nav-link" href="${getSignalUrl()}/navigator" target="_blank">Navigator ↗</a>
       <span id="traderStatus" style="font-size:0.75rem;padding:0.25rem 0.75rem;border-radius:999px;border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.4);margin-left:0.5rem">checking…</span>
@@ -374,6 +398,7 @@ function shell(title, body, active = "") {
               <option value="kraken">Kraken</option>
               <option value="alpaca">Alpaca</option>
               <option value="coinbase">Coinbase</option>
+              <option value="schwab">Schwab</option>
             </select>
           </div>
           <div>
@@ -835,10 +860,30 @@ async function portfolioPage() {
   const payNetwork = getPaymentNetwork();
   const payNetworkLabel = X402_NETWORKS[payNetwork]?.label ?? payNetwork;
 
+  // ── Schwab account data ─────────────────────────────────────────────────────
+  const schwab = getSchwabClient();
+  let schwabAccounts = [], schwabTotalUsd = 0;
+  if (schwab?.isAuthorized()) {
+    try {
+      const raw = await schwab.getAccounts(true);
+      schwabAccounts = Array.isArray(raw) ? raw : [];
+      schwabTotalUsd = schwabAccounts.reduce((s, a) => {
+        const eq = parseFloat(a.securitiesAccount?.currentBalances?.liquidationValue ?? a.securitiesAccount?.currentBalances?.totalCash ?? 0);
+        return s + eq;
+      }, 0);
+    } catch {}
+  }
+
+  // ── Uniswap positions ───────────────────────────────────────────────────────
+  const uniData = wallet ? (await getV3Positions(wallet.address).catch(() => ({ positions: [] }))) : { positions: [] };
+  const uniOpen = uniData.positions.filter(p => p.hasLiquidity);
+  const uniswapLiqUsd  = uniOpen.reduce((s, p) => s + (p.totalLiquidityUsd ?? 0), 0);
+  const uniswapFeesUsd = uniOpen.reduce((s, p) => s + (p.totalFeesUsd ?? 0), 0);
+
   // ── Summary calculations ────────────────────────────────────────────────────
   const cbTotalUsd = Object.values(coinbaseUsdValues).reduce((s, v) => s + (v ?? 0), 0);
   const krTotalUsd = Object.values(krakenUsdValues).reduce((s, v) => s + (v ?? 0), 0);
-  const totalValue = accountValue + usdcSpot + cbTotalUsd + krTotalUsd;
+  const totalValue = accountValue + usdcSpot + cbTotalUsd + krTotalUsd + uniswapLiqUsd + schwabTotalUsd;
 
   // Liquid USDC/USD across all exchanges
   const cbUsdcTotal = coinbaseAccounts
@@ -884,11 +929,22 @@ async function portfolioPage() {
         <div class="label">YTD P&amp;L</div>
         <div class="value ${ytdPnl >= 0 ? "green" : "red"}">${ytdSign}$${Math.abs(ytdPnl).toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})} <span style="font-size:0.75em;opacity:0.7">(${ytdSign}${ytdPct.toFixed(1)}%)</span></div>
       </div>
+      ${uniswapLiqUsd > 0.01 ? `<div class="stat">
+        <div class="label">Uniswap LP</div>
+        <div class="value" style="color:#a78bfa">$${uniswapLiqUsd.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</div>
+        ${uniswapFeesUsd > 0.001 ? `<div style="font-size:0.7rem;color:rgba(167,139,250,0.6);margin-top:0.15rem">+$${uniswapFeesUsd.toFixed(2)} fees</div>` : ""}
+      </div>` : ""}
+      ${schwabTotalUsd > 0.01 ? `<div class="stat">
+        <div class="label">Schwab</div>
+        <div class="value" style="color:#fbbf24">$${schwabTotalUsd.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</div>
+      </div>` : ""}
     </div>
     <div style="display:flex;gap:0.25rem;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:0.2rem;margin-bottom:1.25rem">
       <button id="ptab-hl"     onclick="switchPTab('hl')"     style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:#A8F1F7;color:#000">Hyperliquid</button>
       ${process.env.COINBASE_API_KEY ? `<button id="ptab-cb" onclick="switchPTab('cb')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Coinbase</button>` : ""}
       ${process.env.KRAKEN_API_KEY   ? `<button id="ptab-kr" onclick="switchPTab('kr')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Kraken</button>` : ""}
+      ${schwab ? `<button id="ptab-schwab" onclick="switchPTab('schwab')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Schwab</button>` : ""}
+      ${uniOpen.length > 0 ? `<button id="ptab-uni" onclick="switchPTab('uni')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Uniswap (${uniOpen.length})</button>` : ""}
       <button id="ptab-orders" onclick="switchPTab('orders')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Orders${openOrders.length > 0 ? ` (${openOrders.length})` : ""}</button>
     </div>
 
@@ -954,6 +1010,204 @@ async function portfolioPage() {
       </table></div>` : `<p class="hint">No Kraken balances found.</p>`}
     </div>
 
+    <div id="ppane-schwab" style="display:none">
+      ${schwab && !schwab.isAuthorized() ? `
+        <div class="card" style="text-align:center;padding:2.5rem">
+          <p style="color:rgba(255,255,255,0.5);margin-bottom:1rem">Schwab not yet authorized.</p>
+          <a href="/settings" style="color:#A8F1F7;font-size:0.82rem">Go to Settings to connect →</a>
+        </div>` :
+      schwabAccounts.length > 0 ? schwabAccounts.map(a => {
+        const sa = a.securitiesAccount;
+        const bal = sa?.currentBalances;
+        const positions = sa?.positions ?? [];
+        const liqValue  = parseFloat(bal?.liquidationValue ?? bal?.totalCash ?? 0);
+        const cashBal   = parseFloat(bal?.cashBalance ?? 0);
+        const posRows   = positions.map(p => {
+          const sym    = p.instrument?.symbol ?? "—";
+          const under  = p.instrument?.underlyingSymbol ?? sym;
+          const qty    = p.longQuantity || p.shortQuantity || 0;
+          const side   = p.shortQuantity > 0 ? "SHORT" : "LONG";
+          const mv     = parseFloat(p.marketValue ?? 0);
+          const avgPx  = parseFloat(p.averagePrice ?? 0);
+          const dayPnl = parseFloat(p.currentDayProfitLoss ?? 0);
+          const type   = p.instrument?.assetType ?? "";
+          const isEquity = (type === "EQUITY" || type === "COLLECTIVE_INVESTMENT") && p.longQuantity > 0;
+          const maxC   = isEquity ? Math.floor(p.longQuantity / 100) : 0;
+          const writeBtn = isEquity && maxC > 0
+            ? "<button data-sym='" + sym + "' data-maxc='" + maxC + "' onclick='openSchwabWriteModal(this)' style='font-size:0.68rem;padding:0.2rem 0.55rem;border-radius:5px;border:1px solid rgba(251,191,36,0.35);background:rgba(251,191,36,0.07);color:#fbbf24;cursor:pointer;white-space:nowrap'>Write</button>"
+            : "";
+          return "<tr>" +
+            "<td style='font-weight:600'>" + sym + (type === "OPTION" ? " <span style='font-size:0.65rem;color:rgba(255,255,255,0.4)'>OPT</span>" : "") + "</td>" +
+            "<td><span class='" + (side === "LONG" ? "pos-long" : "pos-short") + "'>" + side + "</span></td>" +
+            "<td>" + qty + "</td>" +
+            "<td>$" + avgPx.toFixed(2) + "</td>" +
+            "<td>$" + mv.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) + "</td>" +
+            "<td style='color:" + (dayPnl >= 0 ? "#4ade80" : "#f87171") + "'>" + (dayPnl >= 0 ? "+" : "") + "$" + Math.abs(dayPnl).toFixed(2) + "</td>" +
+            "<td>" + writeBtn + "</td>" +
+            "</tr>";
+        }).join("") || "<tr><td colspan='7' style='color:rgba(255,255,255,0.25);text-align:center;padding:1rem'>No open positions</td></tr>";
+        return "<div class='card'><table>" +
+          "<thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Price</th><th>Mkt Value</th><th>Day P&L</th><th></th></tr></thead>" +
+          "<tbody>" + posRows + "</tbody></table>" +
+          "<div style='display:flex;gap:1.5rem;margin-top:0.75rem;font-size:0.78rem;color:rgba(255,255,255,0.45)'>" +
+          "<span>Account: <strong style='color:#fafafa'>" + (sa?.accountNumber ?? "—") + "</strong></span>" +
+          "<span>Cash: <strong style='color:#fafafa'>$" + cashBal.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) + "</strong></span>" +
+          "<span>Total: <strong style='color:#fbbf24'>$" + liqValue.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) + "</strong></span>" +
+          "</div></div>";
+      }).join("") : `<p class="hint">No Schwab accounts found or credentials not configured.</p>`}
+    </div>
+
+    <!-- Schwab option write modal -->
+    <div class="modal-overlay" id="schwabWriteModal" onclick="if(event.target===this)closeSchwabWrite()">
+      <div class="modal" style="max-width:460px">
+        <div class="modal-title" id="swTitle">Write Option</div>
+        <div class="modal-body" style="display:flex;flex-direction:column;gap:0.75rem;margin-top:0.85rem">
+          <div style="display:flex;gap:0.4rem">
+            <button id="swBtnCall" onclick="swSetType('CALL')" style="flex:1;padding:0.35rem;border-radius:6px;border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.12);color:#fbbf24;font-size:0.78rem;font-weight:600;cursor:pointer">Call</button>
+            <button id="swBtnPut"  onclick="swSetType('PUT')"  style="flex:1;padding:0.35rem;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:transparent;color:rgba(255,255,255,0.4);font-size:0.78rem;cursor:pointer">Put</button>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Expiration</label>
+            <select id="swExpiry" onchange="swLoadStrikes()" style="width:100%"><option>Loading…</option></select>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Strike</label>
+            <select id="swStrike" onchange="swUpdatePreview()" style="width:100%"><option>Select expiry first</option></select>
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Contracts</label>
+            <input id="swContracts" type="number" min="1" value="1" oninput="swUpdatePreview()" style="width:100%" />
+          </div>
+          <div id="swPreview" style="padding:0.65rem 0.85rem;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:0.8rem;color:rgba(255,255,255,0.6);min-height:2.5rem"></div>
+          <div id="swError" style="color:#f87171;font-size:0.75rem;display:none"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="modal-cancel" onclick="closeSchwabWrite()">Cancel</button>
+          <button id="swSubmit" onclick="submitSchwabWrite()" style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.35);color:#fbbf24;border-radius:7px;padding:0.45rem 1rem;font-size:0.82rem;font-weight:600;cursor:pointer">Sell to Open</button>
+        </div>
+      </div>
+    </div>
+    <script>
+    var _swSym = '', _swType = 'CALL', _swMaxC = 1, _swChain = null;
+
+    function openSchwabWriteModal(btn) {
+      _swSym  = btn.dataset.sym;
+      _swMaxC = parseInt(btn.dataset.maxc) || 1;
+      _swType = 'CALL';
+      document.getElementById('swTitle').textContent = 'Write Option — ' + _swSym;
+      document.getElementById('swContracts').value = _swMaxC;
+      document.getElementById('swContracts').max = _swMaxC;
+      document.getElementById('swExpiry').innerHTML = '<option>Loading…</option>';
+      document.getElementById('swStrike').innerHTML = '<option>Select expiry first</option>';
+      document.getElementById('swPreview').textContent = '';
+      document.getElementById('swError').style.display = 'none';
+      swSetType('CALL');
+      document.getElementById('schwabWriteModal').classList.add('open');
+      swFetchChain();
+    }
+
+    function closeSchwabWrite() {
+      document.getElementById('schwabWriteModal').classList.remove('open');
+    }
+
+    function swSetType(t) {
+      _swType = t;
+      var callBtn = document.getElementById('swBtnCall');
+      var putBtn  = document.getElementById('swBtnPut');
+      var activeStyle  = 'flex:1;padding:0.35rem;border-radius:6px;border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.12);color:#fbbf24;font-size:0.78rem;font-weight:600;cursor:pointer';
+      var inactiveStyle = 'flex:1;padding:0.35rem;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:transparent;color:rgba(255,255,255,0.4);font-size:0.78rem;cursor:pointer';
+      callBtn.style.cssText = t === 'CALL' ? activeStyle : inactiveStyle;
+      putBtn.style.cssText  = t === 'PUT'  ? activeStyle : inactiveStyle;
+      swFetchChain();
+    }
+
+    async function swFetchChain() {
+      _swChain = null;
+      document.getElementById('swExpiry').innerHTML = '<option>Loading…</option>';
+      document.getElementById('swStrike').innerHTML = '<option>Select expiry first</option>';
+      document.getElementById('swPreview').textContent = 'Fetching chain…';
+      try {
+        var r = await fetch('/schwab/chains?symbol=' + encodeURIComponent(_swSym) + '&type=' + _swType);
+        var d = await r.json();
+        if (d.error) throw new Error(d.error);
+        _swChain = d;
+        var exp = document.getElementById('swExpiry');
+        exp.innerHTML = d.expirations.map(function(e) { return '<option value="' + e + '">' + e + '</option>'; }).join('');
+        swLoadStrikes();
+      } catch(e) {
+        document.getElementById('swPreview').textContent = 'Chain error: ' + e.message;
+      }
+    }
+
+    function swLoadStrikes() {
+      if (!_swChain) return;
+      var expiry = document.getElementById('swExpiry').value;
+      var contracts = _swChain.byExpiry[expiry] || [];
+      var sel = document.getElementById('swStrike');
+      sel.innerHTML = contracts.map(function(c) {
+        var label = '$' + c.strike.toFixed(2) + '  mid $' + c.mid.toFixed(2) + (c.delta ? '  Δ' + c.delta.toFixed(2) : '');
+        return '<option value="' + c.symbol + '" data-mid="' + c.mid + '" data-bid="' + c.bid + '" data-ask="' + c.ask + '">' + label + '</option>';
+      }).join('');
+      swUpdatePreview();
+    }
+
+    function swUpdatePreview() {
+      var sel = document.getElementById('swStrike');
+      var opt = sel.options[sel.selectedIndex];
+      if (!opt || !opt.dataset.mid) { document.getElementById('swPreview').textContent = ''; return; }
+      var mid = parseFloat(opt.dataset.mid);
+      var bid = parseFloat(opt.dataset.bid);
+      var ask = parseFloat(opt.dataset.ask);
+      var qty = parseInt(document.getElementById('swContracts').value) || 1;
+      var credit = (mid * qty * 100).toFixed(2);
+      document.getElementById('swPreview').innerHTML =
+        '<strong style="color:#fbbf24">Limit: $' + mid.toFixed(2) + ' mid</strong>' +
+        ' &nbsp;(bid $' + bid.toFixed(2) + ' / ask $' + ask.toFixed(2) + ')' +
+        '<br>Credit: <strong style="color:#4ade80">$' + credit + '</strong> for ' + qty + ' contract' + (qty > 1 ? 's' : '');
+    }
+
+    async function submitSchwabWrite() {
+      var sel  = document.getElementById('swStrike');
+      var optsym = sel.value;
+      if (!optsym) { alert('Select a strike first'); return; }
+      var mid  = parseFloat(sel.options[sel.selectedIndex].dataset.mid);
+      var qty  = parseInt(document.getElementById('swContracts').value) || 1;
+      var btn  = document.getElementById('swSubmit');
+      btn.disabled = true; btn.textContent = 'Placing…';
+      document.getElementById('swError').style.display = 'none';
+      try {
+        var r = await fetch('/schwab/write', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ optionSymbol: optsym, contracts: qty, limitPrice: mid }) });
+        var d = await r.json();
+        if (d.error) throw new Error(d.error);
+        btn.textContent = '✓ Order placed';
+        btn.style.color = '#4ade80';
+        setTimeout(closeSchwabWrite, 1500);
+      } catch(e) {
+        document.getElementById('swError').textContent = e.message;
+        document.getElementById('swError').style.display = 'block';
+        btn.disabled = false; btn.textContent = 'Sell to Open';
+      }
+    }
+    </script>
+
+    <div id="ppane-uni" style="display:none">
+      ${uniOpen.length > 0 ? `<div class="card"><table>
+        <thead><tr><th>Pair</th><th>Status</th><th>Liquidity</th><th>Uncollected Fees</th></tr></thead>
+        <tbody>${uniOpen.map(p => {
+          const inRangeBadge = p.inRange === null ? '<span class="badge-flat">Unknown</span>' :
+            p.inRange ? '<span class="badge-active">In Range</span>' : '<span class="badge-inactive">Out of Range</span>';
+          const liq = p.totalLiquidityUsd !== null ? "$" + p.totalLiquidityUsd.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) : "—";
+          const fees = p.totalFeesUsd !== null && p.totalFeesUsd > 0.0001
+            ? "<span style='color:#A8F1F7'>$" + p.totalFeesUsd.toFixed(3) + "</span>" : "—";
+          const ver = p.version === "v4" ? " <span style='font-size:0.65rem;color:#a78bfa;font-weight:700'>V4</span>" : "";
+          return "<tr><td style='font-weight:600'>" + p.token0.symbol + "/" + p.token1.symbol + ver + "<div style='font-size:0.68rem;color:rgba(255,255,255,0.35)'>" + p.feeDisplay + " · #" + p.tokenId + "</div></td><td>" + inRangeBadge + "</td><td>" + liq + "</td><td>" + fees + "</td></tr>";
+        }).join("")}</tbody>
+      </table></div>
+      <p style="margin-top:0.75rem"><a href="/uniswap" style="font-size:0.78rem;color:#A8F1F7">View full positions + P&L →</a></p>`
+      : `<p class="hint">No open Uniswap V3 positions on Base.</p><p style="margin-top:0.5rem"><a href="/uniswap" style="font-size:0.78rem;color:#A8F1F7">Go to Uniswap →</a></p>`}
+    </div>
+
     <div id="ppane-orders" style="display:none">
       ${openOrders.length > 0 ? `<div class="card"><table>
         <thead><tr><th>Exchange</th><th>Asset</th><th>Side</th><th>Size</th><th>Limit Price</th><th></th></tr></thead>
@@ -976,11 +1230,10 @@ async function portfolioPage() {
       <div class="stat"><div class="label">${payNetworkLabel} USDC</div><div class="value ${networkUsdc !== null && networkUsdc < 0.05 ? "red" : "cyan"}">${networkUsdc !== null ? "$" + networkUsdc.toFixed(4) : "—"}</div></div>
     </div>
     ${networkUsdc !== null && networkUsdc < 0.05 ? `<p style="font-size:0.78rem;color:#f87171;margin-bottom:1.5rem">⚠️ Low ${payNetworkLabel} USDC — top up to continue fetching signals.</p>` : ""}
-    <p class="hint">Auto-refreshes every 30s · <a href="/portfolio">Refresh now</a></p>
+    <p class="hint"><a href="/portfolio">Refresh</a></p>
     <script>
-      setTimeout(() => location.reload(), 30000);
       function switchPTab(tab) {
-        ['hl','cb','kr','orders'].forEach(t => {
+        ['hl','cb','kr','schwab','uni','orders'].forEach(t => {
           const pane = document.getElementById('ppane-' + t);
           const btn  = document.getElementById('ptab-' + t);
           if (pane) pane.style.display = t === tab ? '' : 'none';
@@ -1718,14 +1971,17 @@ function historyPage() {
     const rows = tList.length
       ? tList.map(t => {
           const isEntry = t.action.startsWith("ENTERED") || t.action.startsWith("SHORTED");
+          const isCollect = t.action === 'COLLECT FEES';
           const pnl = t.pnl != null ? parseFloat(t.pnl) : null;
           const pnlStr = pnl != null
             ? `<span style="color:${pnl >= 0 ? "#4ade80" : "#f87171"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</span>`
             : "—";
-          return `<tr>
+          const actionColor = isCollect ? "#A8F1F7" : isEntry ? "#4ade80" : "#f87171";
+          const strategyLabel = isCollect ? "Uniswap" : (t.strategy_name ?? (t.strategy_id === 'manual' ? 'Manual' : t.strategy_id ? t.strategy_id.slice(0,8) : '—'));
+          return `<tr${isCollect ? ' style="background:rgba(168,241,247,0.03)"' : ''}>
             <td>${t.created_at.slice(0, 16)}</td>
-            <td>${t.strategy_name ?? (t.strategy_id === 'manual' ? 'Manual' : t.strategy_id ? t.strategy_id.slice(0,8) : '—')}</td>
-            <td style="color:${isEntry ? "#4ade80" : "#f87171"}">${t.action}</td>
+            <td>${strategyLabel}</td>
+            <td style="color:${actionColor}">${t.action}${isCollect ? ` <span style="color:rgba(255,255,255,0.35);font-size:0.72rem">(${t.asset})</span>` : ''}</td>
             <td>${t.price ? "$" + parseFloat(t.price).toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
             <td>${pnlStr}</td>
           </tr>`;
@@ -1802,7 +2058,7 @@ function historyPage() {
   `, "history");
 }
 
-function settingsPage(saved = false, error = "") {
+function settingsPage(saved = false, error = "", schwabAuthorized = false) {
   const val = (key) => getEnvValue(key);
 
   function field(label, name, value, type = "text", hint = "") {
@@ -1849,6 +2105,7 @@ function settingsPage(saved = false, error = "") {
       <p class="section-label" style="margin:0">Settings</p>
     </div>
     ${saved ? `<div style="color:#4ade80;font-size:0.82rem;margin-bottom:1rem;padding:0.6rem 0.85rem;background:rgba(74,222,128,0.08);border:1px solid rgba(74,222,128,0.2);border-radius:8px">✓ Settings saved. Restart the trader processes for key changes to take effect.</div>` : ""}
+    ${schwabAuthorized ? `<div style="color:#fbbf24;font-size:0.82rem;margin-bottom:1rem;padding:0.6rem 0.85rem;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);border-radius:8px">✓ Schwab authorized successfully. Tokens stored and ready.</div>` : ""}
     ${error ? `<div style="color:#f87171;font-size:0.82rem;margin-bottom:1rem">${error}</div>` : ""}
     <form method="POST" action="/settings">
 
@@ -1886,6 +2143,16 @@ function settingsPage(saved = false, error = "") {
           ${pemField("API Secret (PEM)", "COINBASE_API_SECRET", val("COINBASE_API_SECRET"), "EC private key from Coinbase Advanced Trade — paste the full PEM block")}
         `)}
 
+        ${section("AgentSignal Account", "🔑", `
+          ${field("API Key", "AGENT_API_KEY", val("AGENT_API_KEY"), "password",
+            "From agentsignal.app/account — verifies your subscription tier. Alpha &amp; Trader subscribers skip x402 on signal fetches and unlock Premium Fade signals.")}
+          ${(function() {
+            const keySet = !!val("AGENT_API_KEY");
+            if (!keySet) return '<div style="font-size:0.72rem;color:rgba(255,255,255,0.3);margin-top:0.15rem">No key set — signal fetches use x402 ($0.01 each)</div>';
+            return '<div style="font-size:0.72rem;color:rgba(74,222,128,0.7);margin-top:0.15rem">Key configured — tier verified on next dashboard load</div>';
+          })()}
+        `)}
+
         ${(function() {
           const current = getPaymentNetwork();
           const currentLabel = X402_NETWORKS[current]?.label ?? current;
@@ -1902,6 +2169,51 @@ function settingsPage(saved = false, error = "") {
             </div>
           `);
         })()}
+
+        ${(function() {
+          const sc = getSchwabClient();
+          const status = sc ? sc.tokenStatus() : null;
+          const authUrl = sc ? sc.getAuthUrl() : null;
+          const statusHtml = !sc
+            ? `<div style="font-size:0.72rem;color:rgba(255,255,255,0.3);margin-top:0.25rem">Enter API Key + App Secret above and save first.</div>`
+            : status?.authorized
+              ? `<div style="font-size:0.72rem;padding:0.5rem 0.75rem;background:rgba(74,222,128,0.06);border:1px solid rgba(74,222,128,0.2);border-radius:6px;color:#4ade80;margin-top:0.25rem">
+                  ✓ Authorized · refresh token expires in ${status.refreshDaysLeft} days
+                  ${parseFloat(status.refreshDaysLeft) < 2 ? ' · <strong style="color:#f87171">Re-authorize soon</strong>' : ''}
+                </div>`
+              : `<div style="font-size:0.72rem;color:rgba(255,255,255,0.35);margin-top:0.25rem">Not yet authorized — click Authorize below.</div>`;
+          return section("Schwab", "📈", `
+            ${field("API Key (Client ID)", "SCHWAB_API_KEY", val("SCHWAB_API_KEY"), "password")}
+            ${field("App Secret", "SCHWAB_APP_SECRET", val("SCHWAB_APP_SECRET"), "password")}
+            ${field("Redirect URI", "SCHWAB_REDIRECT_URI", val("SCHWAB_REDIRECT_URI") || "https://127.0.0.1:4101/schwab/callback", "text",
+              "Register this exact URL in your Schwab Developer app settings. Must match exactly.")}
+            ${statusHtml}
+            <div style="margin-top:0.6rem;padding:0.75rem;background:rgba(251,191,36,0.04);border:1px solid rgba(251,191,36,0.15);border-radius:8px;font-size:0.75rem;color:rgba(255,255,255,0.5);line-height:1.6">
+              <strong style="color:rgba(255,255,255,0.7)">To authorize:</strong><br>
+              1. Register <code style="color:#fbbf24">https://127.0.0.1:4101/schwab/callback</code> as your Redirect URI in the Schwab developer portal<br>
+              2. Save your API Key + App Secret above<br>
+              3. In your terminal run: <code style="color:#fbbf24">node schwab-auth.mjs</code><br>
+              4. Approve in the browser that opens — tokens auto-saved
+            </div>
+          `);
+        })()}
+
+        ${section("Alchemy (Optional)", "🔮", `
+          ${field("API Key", "ALCHEMY_API_KEY", val("ALCHEMY_API_KEY"), "password", "Required for Uniswap V4 positions and P&L history on the Uniswap tab.")}
+          <div style="font-size:0.75rem;color:rgba(255,255,255,0.4);line-height:1.6;padding:0.75rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:8px">
+            <strong style="color:rgba(255,255,255,0.7);display:block;margin-bottom:0.35rem">What this unlocks</strong>
+            <div style="display:flex;flex-direction:column;gap:0.3rem">
+              <span>✓ <strong style="color:rgba(255,255,255,0.6)">V3 positions</strong> — works without a key (uses public Base RPC)</span>
+              <span style="color:rgba(255,255,255,0.55)">↳ <strong style="color:#A8F1F7">V4 positions</strong> — requires Alchemy (NFT enumeration API)</span>
+              <span style="color:rgba(255,255,255,0.55)">↳ <strong style="color:#A8F1F7">P&L history</strong> — requires Alchemy (Transfer history API)</span>
+            </div>
+            <div style="margin-top:0.6rem;padding-top:0.6rem;border-top:1px solid rgba(255,255,255,0.06)">
+              Free tier is sufficient — get a key at
+              <a href="https://www.alchemy.com" target="_blank" rel="noopener noreferrer" style="color:#A8F1F7;text-decoration:none">alchemy.com</a>,
+              create a Base app, and paste the API key above.
+            </div>
+          </div>
+        `)}
 
       </div>
 
@@ -2554,6 +2866,511 @@ async function handleCancelOrder(body) {
 
 
 
+// ── Premium Fade Page ────────────────────────────────────────────────────────
+
+async function premiumFadePage() {
+  const user = await getAgentSignalUser();
+
+  if (!process.env.AGENT_API_KEY) {
+    return shell("Premium Fade", `
+      <div class="card" style="text-align:center;padding:3rem">
+        <div style="font-size:2rem;margin-bottom:1rem">🔑</div>
+        <p style="color:rgba(255,255,255,0.5);margin-bottom:1rem">Add your AgentSignal API key in Settings to access Premium Fade signals.</p>
+        <a href="/settings" style="color:#A8F1F7;font-size:0.82rem">Go to Settings →</a>
+      </div>`, "premium-fade");
+  }
+
+  if (!user?.valid || user.tier !== "alpha") {
+    const tierLabel = user?.tier ?? "unknown";
+    return shell("Premium Fade", `
+      <div class="card" style="text-align:center;padding:3rem">
+        <div style="font-size:2rem;margin-bottom:1rem">🚫</div>
+        <p style="color:rgba(255,255,255,0.5);margin-bottom:0.5rem">Premium Fade signals require an <strong style="color:#fbbf24">Alpha</strong> subscription.</p>
+        <p style="color:rgba(255,255,255,0.3);font-size:0.78rem;margin-bottom:1rem">Your current tier: <strong>${tierLabel}</strong></p>
+        <a href="https://agentsignal.app/account" target="_blank" rel="noopener noreferrer" style="color:#A8F1F7;font-size:0.82rem">Upgrade at agentsignal.app →</a>
+      </div>`, "premium-fade");
+  }
+
+  let signals = { recent: [], open: [] };
+  let fetchError = null;
+  try {
+    const res = await fetch(`${getSignalUrl()}/api/premium-fade`, {
+      headers: { "Authorization": "Bearer " + process.env.AGENT_API_KEY },
+    });
+    if (res.ok) signals = await res.json();
+    else fetchError = "API returned " + res.status;
+  } catch (e) { fetchError = e.message; }
+
+  const statusColor = { open: "#A8F1F7", target_hit: "#4ade80", stopped_out: "#f87171", expired: "rgba(255,255,255,0.25)", closed: "rgba(255,255,255,0.4)" };
+  const statusLabel = { open: "Open", target_hit: "Target Hit", stopped_out: "Stopped Out", expired: "Expired", closed: "Closed" };
+
+  function signalRow(s) {
+    const color = statusColor[s.status] ?? "rgba(255,255,255,0.5)";
+    const label = statusLabel[s.status] ?? s.status;
+    const isOpen = s.status === "open";
+    const typeColor = s.option_type === "call" ? "#4ade80" : "#f87171";
+    const vel = s.velocity_pct != null ? (s.velocity_pct > 0 ? "+" : "") + s.velocity_pct.toFixed(1) + "%" : "—";
+    const iv  = s.curr_iv != null ? (s.curr_iv * 100).toFixed(1) + "%" : "—";
+    const pnl = s.pnl != null ? (s.pnl >= 0 ? "+" : "") + "$" + Math.abs(s.pnl).toFixed(2) : "";
+    return `<tr style="${isOpen ? "" : "opacity:0.65"}">
+      <td style="font-weight:600">${s.ticker}</td>
+      <td style="color:${typeColor};font-weight:600">${(s.option_type ?? "").toUpperCase()}</td>
+      <td>$${parseFloat(s.strike ?? 0).toFixed(0)}</td>
+      <td style="font-size:0.75rem;color:rgba(255,255,255,0.55)">${s.expiration ?? "—"}</td>
+      <td style="text-align:right">${s.dte ?? "—"}</td>
+      <td style="text-align:right;color:${(s.velocity_pct ?? 0) > 0 ? "#4ade80" : "#f87171"}">${vel}</td>
+      <td style="text-align:right">${iv}</td>
+      <td style="text-align:right;color:#fbbf24">${s.entry_price != null ? "$" + parseFloat(s.entry_price).toFixed(2) : "—"}</td>
+      <td style="text-align:right;color:#4ade80">${s.target_price != null ? "$" + parseFloat(s.target_price).toFixed(2) : "—"}</td>
+      <td style="text-align:right;color:#f87171">${s.stop_price != null ? "$" + parseFloat(s.stop_price).toFixed(2) : "—"}</td>
+      <td><span style="color:${color};font-size:0.72rem;font-weight:600">${label}</span></td>
+      ${pnl ? `<td style="color:${s.pnl >= 0 ? "#4ade80" : "#f87171"};font-weight:600">${pnl}</td>` : "<td>—</td>"}
+    </tr>`;
+  }
+
+  const openRows  = (signals.open  ?? []).map(signalRow).join("") || `<tr><td colspan="12" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No open signals</td></tr>`;
+  const recentRows = (signals.recent ?? []).filter(s => s.status !== "open").map(signalRow).join("") || `<tr><td colspan="12" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No recent closed signals</td></tr>`;
+
+  const tableHead = `<thead><tr>
+    <th>Ticker</th><th>Type</th><th>Strike</th><th>Expiry</th>
+    <th style="text-align:right">DTE</th><th style="text-align:right">Velocity</th>
+    <th style="text-align:right">IV</th><th style="text-align:right">Entry</th>
+    <th style="text-align:right">Target</th><th style="text-align:right">Stop</th>
+    <th>Status</th><th>P&L</th>
+  </tr></thead>`;
+
+  return shell("Premium Fade", `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem">
+      <div>
+        <h1 style="font-size:1.5rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">Premium Fade Signals</h1>
+        <p style="font-size:0.78rem;color:rgba(255,255,255,0.35);margin-top:0.2rem">${user.email} · ${user.tier}</p>
+      </div>
+      <a href="/premium-fade" style="font-size:0.78rem;color:rgba(255,255,255,0.4);padding:0.35rem 0.75rem;border:1px solid rgba(255,255,255,0.1);border-radius:6px;text-decoration:none">↻ Refresh</a>
+    </div>
+    ${fetchError ? `<div style="color:#f87171;margin-bottom:1rem;font-size:0.82rem">⚠ ${fetchError}</div>` : ""}
+    <div class="section-label">Open Positions</div>
+    <div class="card" style="overflow-x:auto">
+      <table>${tableHead}<tbody>${openRows}</tbody></table>
+    </div>
+    <div class="section-label" style="margin-top:1.5rem">Recent (14 days)</div>
+    <div class="card" style="overflow-x:auto">
+      <table>${tableHead}<tbody>${recentRows}</tbody></table>
+    </div>
+  `, "premium-fade");
+}
+
+// ── Uniswap Page ─────────────────────────────────────────────────────────────
+
+function renderUniswapPage() {
+  return shell("Uniswap Positions", `
+<style>
+.uni-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; margin-bottom: 1.5rem; }
+@media (max-width: 640px) { .uni-summary { grid-template-columns: repeat(2, 1fr); } }
+.uni-stat { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 0.85rem 1.1rem; }
+.uni-stat .label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(255,255,255,0.4); margin-bottom: 0.3rem; }
+.uni-stat .value { font-size: 1.2rem; font-weight: 700; letter-spacing: -0.02em; }
+.uni-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.uni-table th { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.45); text-align: left; padding: 0.55rem 1rem; border-bottom: 1px solid rgba(255,255,255,0.1); font-weight: 600; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.uni-table th:not(:first-child) { text-align: right; }
+.uni-table td { padding: 0.7rem 1rem; border-bottom: 1px solid rgba(255,255,255,0.06); color: rgba(255,255,255,0.85); vertical-align: middle; }
+.uni-table td:not(:first-child) { text-align: right; }
+.uni-table tbody tr { cursor: pointer; transition: background 0.12s; }
+.uni-table tbody tr:hover td { background: rgba(255,255,255,0.04); }
+.uni-badge-inrange { background: rgba(74,222,128,0.1); color: #4ade80; border: 1px solid rgba(74,222,128,0.25); padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.68rem; font-weight: 600; white-space: nowrap; }
+.uni-badge-outrange { background: rgba(248,113,113,0.1); color: #f87171; border: 1px solid rgba(248,113,113,0.25); padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.68rem; font-weight: 600; white-space: nowrap; }
+.uni-badge-closed { background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.35); border: 1px solid rgba(255,255,255,0.1); padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.68rem; white-space: nowrap; }
+.uni-badge-v4 { background: rgba(167,139,250,0.12); color: #a78bfa; border: 1px solid rgba(167,139,250,0.25); padding: 0.12rem 0.4rem; border-radius: 4px; font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-left: 0.35rem; }
+.uni-badge-v3 { background: rgba(99,179,237,0.1); color: #63b3ed; border: 1px solid rgba(99,179,237,0.25); padding: 0.12rem 0.4rem; border-radius: 4px; font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-left: 0.35rem; }
+.uni-expand-row td { background: rgba(0,0,0,0.25); border-bottom: 1px solid rgba(255,255,255,0.08); }
+.uni-detail-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.25rem; font-size: 0.78rem; }
+@media (max-width: 640px) { .uni-detail-grid { grid-template-columns: 1fr; } }
+.uni-detail-section .dlabel { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(255,255,255,0.4); margin-bottom: 0.5rem; }
+.uni-detail-row { display: flex; justify-content: space-between; margin-bottom: 0.3rem; color: rgba(255,255,255,0.7); }
+.uni-detail-row .dval { color: #fafafa; font-weight: 500; font-variant-numeric: tabular-nums; }
+.uni-pnl-section { border-top: 1px solid rgba(255,255,255,0.08); margin-top: 1rem; padding-top: 1rem; }
+.uni-pnl-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; font-size: 0.78rem; }
+@media (max-width: 640px) { .uni-pnl-grid { grid-template-columns: repeat(2, 1fr); } }
+.uni-pnl-item .plabel { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(255,255,255,0.4); margin-bottom: 0.3rem; }
+.uni-pnl-item .pval { font-size: 0.95rem; font-weight: 700; color: #fafafa; }
+.uni-pnl-item .psub { font-size: 0.7rem; color: rgba(255,255,255,0.35); margin-top: 0.15rem; }
+.uni-collect-btn { font-size: 0.72rem; padding: 0.3rem 0.75rem; border-radius: 6px; border: 1px solid rgba(168,241,247,0.3); color: #A8F1F7; background: transparent; cursor: pointer; transition: background 0.15s; white-space: nowrap; }
+.uni-collect-btn:hover:not(:disabled) { background: rgba(168,241,247,0.08); }
+.uni-collect-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.uni-fees-box { margin-top: 0.75rem; padding: 0.75rem; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 8px; font-size: 0.75rem; color: rgba(255,255,255,0.6); }
+.uni-fees-box .flabel { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(255,255,255,0.35); margin-bottom: 0.4rem; margin-top: 0.6rem; }
+.uni-fees-box .flabel:first-child { margin-top: 0; }
+.uni-fees-row { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+.pos-avatar { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 50%; font-size: 9px; font-weight: 700; color: #fff; flex-shrink: 0; }
+.uni-loading-row td { text-align: center; padding: 3rem; color: rgba(255,255,255,0.4); font-size: 0.85rem; }
+.uni-chevron { color: rgba(255,255,255,0.3); transition: transform 0.2s; display: inline-block; font-size: 0.7rem; }
+.uni-chevron.open { transform: rotate(180deg); }
+</style>
+
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem">
+  <div>
+    <h1 style="font-size:1.5rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">Uniswap Positions</h1>
+    <p id="uniWalletLine" style="font-size:0.78rem;color:rgba(255,255,255,0.4);margin-top:0.25rem">V3 + V4 · Base</p>
+  </div>
+  <button onclick="loadPositions()" id="uniRefreshBtn"
+    style="display:flex;align-items:center;gap:0.4rem;padding:0.4rem 0.9rem;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:rgba(255,255,255,0.6);cursor:pointer;font-size:0.8rem;transition:all 0.15s"
+    onmouseover="this.style.borderColor='rgba(255,255,255,0.25)';this.style.color='#fafafa'"
+    onmouseout="this.style.borderColor='rgba(255,255,255,0.12)';this.style.color='rgba(255,255,255,0.6)'">
+    <span id="uniRefreshIcon">↻</span> Refresh
+  </button>
+</div>
+
+<div id="uniSummary" class="uni-summary" style="display:none">
+  <div class="uni-stat"><div class="label">Positions</div><div class="value" id="sumCount" style="color:#fafafa">—</div></div>
+  <div class="uni-stat"><div class="label">In Range</div><div class="value" id="sumInRange" style="color:#4ade80">—</div></div>
+  <div class="uni-stat"><div class="label">Total Liquidity</div><div class="value" id="sumLiquidity" style="color:#a78bfa">—</div></div>
+  <div class="uni-stat"><div class="label">Uncollected Fees</div><div class="value" id="sumFees" style="color:#A8F1F7">—</div></div>
+</div>
+
+<div id="uniError" style="display:none;align-items:center;gap:0.75rem;padding:0.85rem 1rem;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.25);border-radius:8px;color:#f87171;font-size:0.82rem;margin-bottom:1rem">
+  ⚠ <span id="uniErrorMsg"></span>
+</div>
+
+<div id="uniTableWrap" style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:12px;overflow:hidden">
+  <table class="uni-table">
+    <thead>
+      <tr>
+        <th style="text-align:left">Pair</th>
+        <th style="text-align:left">Status</th>
+        <th>Liquidity</th>
+        <th>Fees</th>
+        <th>Return</th>
+        <th style="width:2rem"></th>
+      </tr>
+    </thead>
+    <tbody id="uniTableBody">
+      <tr class="uni-loading-row"><td colspan="6">Loading positions…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+const _uniPositions = [];
+let _uniAddress = '';
+
+function uFmt(n, prefix) {
+  if (n === null || n === undefined) return '—';
+  const p = prefix !== undefined ? prefix : '$';
+  return p + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+}
+function uFmtPnl(n) {
+  if (n === null || n === undefined) return '—';
+  const abs = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 3 });
+  return (n >= 0 ? '+$' : '-$') + abs;
+}
+function uColorClass(n) { return n === null ? '' : n >= 0 ? 'color:#4ade80' : 'color:#f87171'; }
+function uStatusBadge(pos) {
+  if (!pos.hasLiquidity) return '<span class="uni-badge-closed">Closed</span>';
+  if (pos.inRange === null) return '<span class="uni-badge-closed">Unknown</span>';
+  return pos.inRange
+    ? '<span class="uni-badge-inrange">In Range</span>'
+    : '<span class="uni-badge-outrange">Out of Range</span>';
+}
+function uVersionBadge(v) {
+  return v === 'v4' ? '<span class="uni-badge-v4">v4</span>' : '<span class="uni-badge-v3">v3</span>';
+}
+
+async function loadPositions() {
+  const btn = document.getElementById('uniRefreshBtn');
+  const icon = document.getElementById('uniRefreshIcon');
+  icon.style.display = 'inline-block';
+  icon.style.animation = 'spin 1s linear infinite';
+  btn.disabled = true;
+  document.getElementById('uniError').style.display = 'none';
+  document.getElementById('uniSummary').style.display = 'none';
+  document.getElementById('uniTableBody').innerHTML = '<tr class="uni-loading-row"><td colspan="6">Loading positions…</td></tr>';
+
+  try {
+    const [v3Res, v4Res] = await Promise.allSettled([
+      fetch('/uniswap/positions').then(r => r.json()),
+      fetch('/uniswap/v4/positions').then(r => r.json()),
+    ]);
+
+    const v3Positions = (v3Res.status === 'fulfilled' && v3Res.value.positions) ? v3Res.value.positions : [];
+    const v4Positions = (v4Res.status === 'fulfilled' && v4Res.value.positions) ? v4Res.value.positions : [];
+    const allPositions = [...v3Positions, ...v4Positions];
+
+    _uniPositions.length = 0;
+    allPositions.forEach(p => _uniPositions.push(p));
+
+    // Get wallet address for display
+    try {
+      const addrRes = await fetch('/uniswap/wallet');
+      const addrData = await addrRes.json();
+      _uniAddress = addrData.address || '';
+      const short = _uniAddress ? _uniAddress.slice(0,6) + '…' + _uniAddress.slice(-4) : '';
+      document.getElementById('uniWalletLine').textContent = 'V3 + V4 · Base' + (short ? ' · ' + short : '');
+    } catch {}
+
+    if (allPositions.length === 0) {
+      const noAlchemy = v4Res.status === 'fulfilled' && v4Res.value.noAlchemy;
+      document.getElementById('uniTableBody').innerHTML =
+        '<tr><td colspan="6" style="text-align:center;padding:3rem;color:rgba(255,255,255,0.35);font-size:0.85rem">' +
+        'No Uniswap positions found on Base' +
+        (noAlchemy ? '<br><span style="font-size:0.72rem;color:rgba(255,255,255,0.25)">Add ALCHEMY_API_KEY to .env to also check V4 positions</span>' : '') +
+        '</td></tr>';
+      return;
+    }
+
+    // Summary tiles
+    const totalLiq = allPositions.reduce((s, p) => s + (p.totalLiquidityUsd ?? 0), 0);
+    const totalFees = allPositions.reduce((s, p) => s + (p.totalFeesUsd ?? 0), 0);
+    const inRangeCount = allPositions.filter(p => p.inRange).length;
+    const hasPrices = allPositions.some(p => p.totalLiquidityUsd !== null);
+    document.getElementById('sumCount').textContent = allPositions.length;
+    document.getElementById('sumInRange').textContent = inRangeCount;
+    document.getElementById('sumLiquidity').textContent = hasPrices ? uFmt(totalLiq) : '—';
+    document.getElementById('sumFees').textContent = hasPrices ? uFmt(totalFees) : '—';
+    document.getElementById('uniSummary').style.display = 'grid';
+
+    // Render table
+    renderUniTable(allPositions);
+  } catch (e) {
+    document.getElementById('uniErrorMsg').textContent = e.message || 'Failed to load positions';
+    document.getElementById('uniError').style.display = 'flex';
+    document.getElementById('uniTableBody').innerHTML = '<tr class="uni-loading-row"><td colspan="6" style="color:rgba(248,113,113,0.6)">Failed to load</td></tr>';
+  } finally {
+    icon.style.animation = '';
+    btn.disabled = false;
+  }
+}
+
+function renderUniTable(positions) {
+  const tbody = document.getElementById('uniTableBody');
+  if (!positions.length) {
+    tbody.innerHTML = '<tr class="uni-loading-row"><td colspan="6">No positions found</td></tr>';
+    return;
+  }
+  tbody.innerHTML = positions.map((p, idx) => {
+    const avatarBg0 = ['#4f46e5','#7c3aed','#0891b2','#059669','#d97706'][idx % 5];
+    const avatarBg1 = ['#7c3aed','#0891b2','#059669','#d97706','#4f46e5'][(idx + 2) % 5];
+    const liqVal = p.totalLiquidityUsd !== null ? uFmt(p.totalLiquidityUsd) : '—';
+    const liqSub = p.totalLiquidityUsd !== null && (p.amount0 > 0 || p.amount1 > 0)
+      ? '<div style="font-size:0.68rem;color:rgba(255,255,255,0.35);margin-top:0.1rem">' +
+        p.amount0.toFixed(3) + ' ' + p.token0.symbol + ' + ' + p.amount1.toFixed(3) + ' ' + p.token1.symbol + '</div>'
+      : '';
+    const feesColor = p.hasFees ? '#A8F1F7' : 'rgba(255,255,255,0.3)';
+    const feesSub = p.hasFees
+      ? '<div style="font-size:0.68rem;color:rgba(255,255,255,0.35);margin-top:0.1rem">' +
+        parseFloat(p.fees0).toFixed(3) + ' ' + p.token0.symbol + ' + ' + parseFloat(p.fees1).toFixed(3) + ' ' + p.token1.symbol + '</div>'
+      : '';
+
+    return '<tr id="urow-' + p.tokenId + '" data-id="' + p.tokenId + '" onclick="toggleUniRow(this.dataset.id)">' +
+      '<td><div style="display:flex;align-items:center;gap:0.6rem">' +
+      '<div style="display:flex;margin-right:2px">' +
+      '<div class="pos-avatar" style="background:' + avatarBg0 + ';margin-right:-4px;z-index:1">' + p.token0.symbol.slice(0,2).toUpperCase() + '</div>' +
+      '<div class="pos-avatar" style="background:' + avatarBg1 + '">' + p.token1.symbol.slice(0,2).toUpperCase() + '</div>' +
+      '</div>' +
+      '<div><div style="font-weight:600;color:#fafafa">' + p.token0.symbol + '/' + p.token1.symbol + uVersionBadge(p.version) + '</div>' +
+      '<div style="font-size:0.68rem;color:rgba(255,255,255,0.35)">' + p.feeDisplay + ' · #' + p.tokenId + '</div></div>' +
+      '</div></td>' +
+      '<td>' + uStatusBadge(p) + '</td>' +
+      '<td style="text-align:right"><div style="color:#fafafa;font-weight:500">' + liqVal + '</div>' + liqSub + '</td>' +
+      '<td style="text-align:right"><div style="color:' + feesColor + ';font-weight:500">' + uFmt(p.totalFeesUsd) + '</div>' + feesSub + '</td>' +
+      '<td style="text-align:right"><span id="upct-' + p.tokenId + '" style="color:rgba(255,255,255,0.3);font-size:0.8rem">—</span></td>' +
+      '<td style="text-align:center"><span class="uni-chevron" id="uchev-' + p.tokenId + '">▾</span></td>' +
+      '</tr>' +
+      '<tr id="uexp-' + p.tokenId + '" style="display:none"><td colspan="6" style="padding:0">' +
+      '<div style="padding:1.25rem 1.25rem 1.5rem" id="uexpbody-' + p.tokenId + '">Loading…</div>' +
+      '</td></tr>';
+  }).join('');
+}
+
+const _expandedRows = new Set();
+const _pnlCache = {};
+
+function toggleUniRow(tokenId) {
+  const row = document.getElementById('uexp-' + tokenId);
+  const chev = document.getElementById('uchev-' + tokenId);
+  if (_expandedRows.has(tokenId)) {
+    row.style.display = 'none';
+    chev.classList.remove('open');
+    _expandedRows.delete(tokenId);
+  } else {
+    row.style.display = '';
+    chev.classList.add('open');
+    _expandedRows.add(tokenId);
+    const pos = _uniPositions.find(p => p.tokenId === tokenId);
+    if (pos) renderExpandedRow(pos);
+  }
+}
+
+function renderExpandedRow(pos) {
+  const container = document.getElementById('uexpbody-' + pos.tokenId);
+  container.innerHTML =
+    '<div class="uni-detail-grid">' +
+    // Price Range
+    '<div class="uni-detail-section">' +
+    '<div class="dlabel">Price Range</div>' +
+    '<div class="uni-detail-row"><span>Min</span><span class="dval" style="font-size:0.75rem;font-family:monospace">' + pos.priceLower + ' <span style="color:rgba(255,255,255,0.3)">' + pos.token1.symbol + '/' + pos.token0.symbol + '</span></span></div>' +
+    '<div class="uni-detail-row"><span>Max</span><span class="dval" style="font-size:0.75rem;font-family:monospace">' + pos.priceUpper + ' <span style="color:rgba(255,255,255,0.3)">' + pos.token1.symbol + '/' + pos.token0.symbol + '</span></span></div>' +
+    '</div>' +
+    // Liquidity Breakdown
+    '<div class="uni-detail-section">' +
+    '<div class="dlabel">Liquidity Breakdown</div>' +
+    '<div class="uni-detail-row"><span>' + pos.token0.symbol + '</span><span class="dval">' + pos.amount0.toFixed(4) + (pos.amount0Usd !== null ? ' <span style="color:rgba(255,255,255,0.35);font-size:0.72rem">(' + uFmt(pos.amount0Usd) + ')</span>' : '') + '</span></div>' +
+    '<div class="uni-detail-row"><span>' + pos.token1.symbol + '</span><span class="dval">' + pos.amount1.toFixed(4) + (pos.amount1Usd !== null ? ' <span style="color:rgba(255,255,255,0.35);font-size:0.72rem">(' + uFmt(pos.amount1Usd) + ')</span>' : '') + '</span></div>' +
+    '</div>' +
+    // Fees Breakdown + Collect
+    '<div class="uni-detail-section">' +
+    '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:0.5rem">' +
+    '<div class="dlabel">Uncollected Fees</div>' +
+    (pos.hasFees && pos.version === 'v3' ? '<button class="uni-collect-btn" id="ucollect-' + pos.tokenId + '" data-tid="' + pos.tokenId + '" onclick="doCollect(event,this.dataset.tid)" title="Collect fees on-chain using AGENT_PRIVATE_KEY">Collect fees</button>' : '') +
+    (pos.hasFees && pos.version === 'v4' ? '<a href="https://app.uniswap.org/positions/v4/base/' + pos.tokenId + '" target="_blank" rel="noopener noreferrer" class="uni-collect-btn" style="text-decoration:none;display:inline-block">Collect fees ↗</a>' : '') +
+    '</div>' +
+    '<div class="uni-detail-row"><span>' + pos.token0.symbol + '</span><span class="dval" style="color:#A8F1F7">' + parseFloat(pos.fees0).toFixed(4) + (pos.fees0Usd !== null ? ' <span style="color:rgba(255,255,255,0.35);font-size:0.72rem">(' + uFmt(pos.fees0Usd) + ')</span>' : '') + '</span></div>' +
+    '<div class="uni-detail-row"><span>' + pos.token1.symbol + '</span><span class="dval" style="color:#A8F1F7">' + parseFloat(pos.fees1).toFixed(4) + (pos.fees1Usd !== null ? ' <span style="color:rgba(255,255,255,0.35);font-size:0.72rem">(' + uFmt(pos.fees1Usd) + ')</span>' : '') + '</span></div>' +
+    '</div>' +
+    '</div>' +
+    '<div class="uni-pnl-section"><div id="upnl-' + pos.tokenId + '" style="color:rgba(255,255,255,0.35);font-size:0.8rem">Loading P&L…</div></div>';
+
+  loadPnl(pos);
+}
+
+async function loadPnl(pos) {
+  const container = document.getElementById('upnl-' + pos.tokenId);
+  if (_pnlCache[pos.tokenId]) {
+    renderPnl(pos, _pnlCache[pos.tokenId]);
+    return;
+  }
+  try {
+    const params = new URLSearchParams({
+      version: pos.version, tokenId: pos.tokenId,
+      token0: pos.token0.address, token1: pos.token1.address,
+      decimals0: pos.token0.decimals, decimals1: pos.token1.decimals,
+      walletAddress: _uniAddress, fee: pos.fee,
+    });
+    if (pos.version === 'v4') {
+      params.set('tickLower', pos.tickLower); params.set('tickUpper', pos.tickUpper);
+      params.set('tickSpacing', pos.tickSpacing ?? 0); params.set('hooks', pos.hooks ?? '0x0000000000000000000000000000000000000000');
+      params.set('liquidity', pos.liquidity);
+    }
+    const res = await fetch('/uniswap/pnl?' + params.toString());
+    const data = await res.json();
+    if (data.error) { container.textContent = 'P&L: ' + data.error; return; }
+    _pnlCache[pos.tokenId] = data;
+    renderPnl(pos, data);
+  } catch (e) { container.textContent = 'P&L error: ' + e.message; }
+}
+
+function renderPnl(pos, pnl) {
+  const container = document.getElementById('upnl-' + pos.tokenId);
+  if (!container) return;
+
+  const current = pos.totalLiquidityUsd;
+  const uncollected = pos.totalFeesUsd ?? 0;
+  const unrealized = current !== null && pnl.entryTotalUsd != null ? current - pnl.entryTotalUsd : null;
+  const collected = pnl.totalCollectedUsd ?? 0;
+  const totalReturn = unrealized !== null ? unrealized + collected + uncollected : null;
+  const pctReturn = totalReturn !== null && pnl.entryTotalUsd ? (totalReturn / pnl.entryTotalUsd) * 100 : null;
+  const daysIn = pnl.mintTimestamp ? (Date.now() / 1000 - pnl.mintTimestamp) / 86400 : null;
+  const annualized = pctReturn !== null && daysIn ? (pctReturn / daysIn) * 365 : null;
+  const feeApr = pnl.entryTotalUsd && daysIn
+    ? (((pnl.totalCollectedUsd ?? 0) + uncollected) / pnl.entryTotalUsd) * (365 / daysIn) * 100 : null;
+
+  const entryDate = pnl.mintTimestamp ? new Date(pnl.mintTimestamp * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
+
+  // Update return column in table
+  if (pctReturn !== null) {
+    const pctEl = document.getElementById('upct-' + pos.tokenId);
+    if (pctEl) {
+      pctEl.textContent = (pctReturn >= 0 ? '+' : '') + pctReturn.toFixed(2) + '%';
+      pctEl.style.color = pctReturn >= 0 ? '#4ade80' : '#f87171';
+      pctEl.style.fontWeight = '600';
+    }
+  }
+
+  const openCols = pos.hasLiquidity
+    ? '<div class="uni-pnl-grid">' +
+      '<div class="uni-pnl-item"><div class="plabel">Entry Value</div><div class="pval">' + uFmt(pnl.entryTotalUsd) + '</div><div class="psub">' + entryDate + '</div>' +
+      (pnl.entryAmount0 > 0 ? '<div class="psub">' + pnl.entryAmount0.toFixed(3) + ' ' + pos.token0.symbol + (pnl.entryPrice0 ? ' @$' + pnl.entryPrice0.toFixed(3) : '') + '</div>' : '') +
+      (pnl.entryAmount1 > 0 ? '<div class="psub">' + pnl.entryAmount1.toFixed(3) + ' ' + pos.token1.symbol + (pnl.entryPrice1 ? ' @$' + pnl.entryPrice1.toFixed(3) : '') + '</div>' : '') +
+      '</div>' +
+      '<div class="uni-pnl-item"><div class="plabel">Current Value</div><div class="pval">' + uFmt(current) + '</div></div>' +
+      '<div class="uni-pnl-item"><div class="plabel">Unrealized P&L</div><div class="pval" style="' + uColorClass(unrealized) + '">' + uFmtPnl(unrealized) + '</div><div class="psub">(incl. IL)</div></div>' +
+      '<div class="uni-pnl-item"><div class="plabel">Total Return</div><div class="pval" style="' + uColorClass(totalReturn) + '">' + uFmtPnl(totalReturn) + '</div>' +
+      (pctReturn !== null ? '<div class="psub" style="' + uColorClass(pctReturn) + '">' + (pctReturn >= 0 ? '+' : '') + pctReturn.toFixed(2) + '%</div>' : '') +
+      (annualized !== null && daysIn ? '<div class="psub">' + (annualized >= 0 ? '+' : '') + annualized.toFixed(1) + '% APR (total)</div>' : '') +
+      (feeApr !== null && daysIn ? '<div class="psub" style="color:#A8F1F7">' + (feeApr >= 0 ? '+' : '') + feeApr.toFixed(1) + '% APR (fees · ' + Math.round(daysIn) + 'd)</div>' : '') +
+      '</div></div>'
+    : '<div class="uni-pnl-grid" style="grid-template-columns:repeat(3,1fr)">' +
+      '<div class="uni-pnl-item"><div class="plabel">Entry Value</div><div class="pval">' + uFmt(pnl.entryTotalUsd) + '</div><div class="psub">' + entryDate + '</div></div>' +
+      '<div class="uni-pnl-item"><div class="plabel">Total Collected</div><div class="pval">' + uFmt(collected > 0 ? collected : null) + '</div></div>' +
+      '<div class="uni-pnl-item"><div class="plabel">Net P&L</div><div class="pval" style="' + uColorClass(totalReturn) + '">' + uFmtPnl(totalReturn) + '</div>' +
+      (pctReturn !== null ? '<div class="psub" style="' + uColorClass(totalReturn) + '">' + (pctReturn >= 0 ? '+' : '') + pctReturn.toFixed(2) + '%</div>' : '') +
+      (annualized !== null && daysIn ? '<div class="psub">' + (annualized >= 0 ? '+' : '') + annualized.toFixed(1) + '% APR · ' + Math.round(daysIn) + 'd</div>' : '') +
+      '</div></div>';
+
+  let feesHtml = '';
+  if (!pnl.v4CollectedUnavailable && (pnl.fees0 > 0 || pnl.fees1 > 0 || pnl.collectionsCount > 0)) {
+    feesHtml = '<div class="uni-fees-box">' +
+      '<div class="flabel">Fees earned (taxable income)</div>' +
+      '<div class="uni-fees-row">' +
+      '<span>' + pos.token0.symbol + ': <span style="color:#A8F1F7">' + pnl.fees0.toFixed(4) + (pnl.fees0Usd ? ' (' + uFmt(pnl.fees0Usd) + ')' : '') + '</span></span>' +
+      '<span>' + pos.token1.symbol + ': <span style="color:#A8F1F7">' + pnl.fees1.toFixed(4) + (pnl.fees1Usd ? ' (' + uFmt(pnl.fees1Usd) + ')' : '') + '</span></span>' +
+      '</div>' +
+      '<div class="flabel">Principal returned</div>' +
+      '<div class="uni-fees-row">' +
+      '<span>' + pos.token0.symbol + ': <span style="color:rgba(255,255,255,0.75)">' + (pnl.principal0 ?? 0).toFixed(4) + (pnl.principal0Usd ? ' (' + uFmt(pnl.principal0Usd) + ')' : '') + '</span></span>' +
+      '<span>' + pos.token1.symbol + ': <span style="color:rgba(255,255,255,0.75)">' + (pnl.principal1 ?? 0).toFixed(4) + (pnl.principal1Usd ? ' (' + uFmt(pnl.principal1Usd) + ')' : '') + '</span></span>' +
+      '</div>' +
+      (pos.hasLiquidity ? '<div class="uni-fees-row" style="margin-top:0.5rem;padding-top:0.5rem;border-top:1px solid rgba(255,255,255,0.06)"><span>Uncollected: <span style="color:#A8F1F7">' + uFmt(uncollected > 0 ? uncollected : null) + '</span></span></div>' : '') +
+      '</div>';
+  } else if (pnl.v4CollectedUnavailable) {
+    feesHtml = '<div style="font-size:0.72rem;color:rgba(255,255,255,0.3);margin-top:0.5rem">Collected fees not tracked (V4)</div>';
+  }
+
+  container.innerHTML =
+    '<div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4);margin-bottom:0.75rem">P&L Summary</div>' +
+    openCols + feesHtml;
+}
+
+async function doCollect(e, tokenId) {
+  e.stopPropagation();
+  const btn = document.getElementById('ucollect-' + tokenId);
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = 'Collecting…';
+  try {
+    const pos = _uniPositions.find(p => p.tokenId === tokenId);
+    const body = {
+      tokenId,
+      token0: pos ? { address: pos.token0.address, symbol: pos.token0.symbol, decimals: pos.token0.decimals } : null,
+      token1: pos ? { address: pos.token1.address, symbol: pos.token1.symbol, decimals: pos.token1.decimals } : null,
+    };
+    const res = await fetch('/uniswap/collect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (data.error) {
+      btn.textContent = '✗ ' + (data.error.slice(0, 40));
+      btn.style.color = '#f87171';
+      btn.style.borderColor = 'rgba(248,113,113,0.4)';
+    } else {
+      const swapNote = data.swapHash ? ' + swapped ' + data.wethSwapped.toFixed(4) + ' WETH' : '';
+      btn.textContent = '✓ $' + data.usdcTotal.toFixed(2) + ' USDC' + swapNote;
+      btn.style.color = '#4ade80';
+      btn.style.borderColor = 'rgba(74,222,128,0.4)';
+      setTimeout(() => loadPositions(), 4000);
+    }
+  } catch (err) {
+    btn.textContent = '✗ Error';
+    btn.style.color = '#f87171';
+  }
+}
+
+// Spin animation for refresh button
+const _uniStyle = document.createElement('style');
+_uniStyle.textContent = '@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }';
+document.head.appendChild(_uniStyle);
+
+loadPositions();
+</script>
+`, "uniswap");
+}
+
 // ── Server ────────────────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
@@ -2574,7 +3391,10 @@ const server = createServer(async (req, res) => {
     if (url === "/strategies") return send(strategiesPage());
     if (url === "/signals") return send(signalsPage());
     if (url === "/history") return send(historyPage());
-    if (url === "/settings" && method === "GET") return send(settingsPage());
+    if (url.startsWith("/settings") && method === "GET") {
+      const schwabOk = new URL("http://x" + url).searchParams.get("schwab") === "authorized";
+      return send(settingsPage(false, "", schwabOk));
+    }
     if (url === "/settings" && method === "POST") {
       const body = await readBody();
       const params = new URLSearchParams(body);
@@ -2583,7 +3403,9 @@ const server = createServer(async (req, res) => {
                           "KRAKEN_API_KEY","KRAKEN_API_SECRET",
                           "ALPACA_API_KEY","ALPACA_API_SECRET",
                           "COINBASE_API_KEY","COINBASE_API_SECRET","COINBASE_API_PASSPHRASE",
-                          "X402_PAYMENT_NETWORK"]) {
+                          "X402_PAYMENT_NETWORK","ALCHEMY_API_KEY",
+                          "SCHWAB_API_KEY","SCHWAB_APP_SECRET","SCHWAB_REDIRECT_URI",
+                          "AGENT_API_KEY"]) {
         let v = params.get(key)?.trim();
         if (!v) continue;
         // PEM keys contain real newlines from the textarea — encode to \n for single-line .env storage
@@ -2786,6 +3608,155 @@ const server = createServer(async (req, res) => {
         const account = privateKeyToAccount(pk);
         return json({ address: account.address });
       } catch { return json({ error: "Invalid key" }, 400); }
+    }
+
+    // ── Schwab option writing ─────────────────────────────────────────────────
+
+    if (url.startsWith("/schwab/chains") && method === "GET") {
+      try {
+        const sc = getSchwabClient();
+        if (!sc?.isAuthorized()) return json({ error: "Schwab not authorized" }, 401);
+        const qs = new URL("http://x" + url).searchParams;
+        const symbol = qs.get("symbol");
+        const type   = (qs.get("type") || "CALL").toUpperCase();
+        if (!symbol) return json({ error: "symbol required" }, 400);
+        // Fetch ~60 DTE window
+        const from = new Date(); from.setDate(from.getDate() + 1);
+        const to   = new Date(); to.setDate(to.getDate() + 90);
+        const fmt  = d => d.toISOString().slice(0, 10);
+        const raw  = await sc.getOptionChain(symbol, { contractType: type, strikeCount: 20, fromDate: fmt(from), toDate: fmt(to) });
+        if (!raw) return json({ error: "No chain data" }, 404);
+        const map  = type === "PUT" ? raw.putExpDateMap : raw.callExpDateMap;
+        if (!map) return json({ expirations: [], byExpiry: {} });
+        const byExpiry = {};
+        for (const [expKey, strikes] of Object.entries(map)) {
+          const expDate = expKey.split(":")[0]; // "2026-06-12:18" → "2026-06-12"
+          const contracts = [];
+          for (const [, ctrs] of Object.entries(strikes)) {
+            for (const c of ctrs) {
+              if (c.nonStandard) continue;
+              contracts.push({
+                symbol: c.symbol,
+                strike: c.strikePrice,
+                bid:    c.bid ?? 0,
+                ask:    c.ask ?? 0,
+                mid:    parseFloat(((( c.bid ?? 0) + (c.ask ?? 0)) / 2).toFixed(2)),
+                delta:  c.delta ?? null,
+                dte:    c.daysToExpiration ?? null,
+              });
+            }
+          }
+          if (contracts.length) byExpiry[expDate] = contracts.sort((a, b) => a.strike - b.strike);
+        }
+        const expirations = Object.keys(byExpiry).sort();
+        return json({ expirations, byExpiry });
+      } catch (e) { return json({ error: e.message }, 500); }
+    }
+
+    if (url === "/schwab/write" && method === "POST") {
+      try {
+        const sc = getSchwabClient();
+        if (!sc?.isAuthorized()) return json({ error: "Schwab not authorized" }, 401);
+        const { optionSymbol, contracts, limitPrice } = JSON.parse(await readBody());
+        if (!optionSymbol || !contracts || !limitPrice) return json({ error: "optionSymbol, contracts, limitPrice required" }, 400);
+        const nums = await sc.getAccountNumbers();
+        const hash = process.env.SCHWAB_ACCOUNT_HASH || nums?.[0]?.hashValue;
+        if (!hash) return json({ error: "No account hash found" }, 500);
+        await sc.placeOrder(hash, {
+          orderType:          "LIMIT",
+          session:            "NORMAL",
+          duration:           "DAY",
+          price:              parseFloat(limitPrice.toFixed(2)),
+          orderStrategyType:  "SINGLE",
+          orderLegCollection: [{
+            instruction: "SELL_TO_OPEN",
+            quantity:    parseInt(contracts),
+            instrument:  { symbol: optionSymbol, assetType: "OPTION" },
+          }],
+        });
+        return json({ ok: true });
+      } catch (e) { return json({ error: e.message }, 500); }
+    }
+
+    // ── Uniswap ────────────────────────────────────────────────────────────────
+
+    if (url === "/premium-fade" && method === "GET") return send(await premiumFadePage());
+    if (url === "/uniswap" && method === "GET") return send(renderUniswapPage());
+
+    if (url === "/uniswap/wallet" && method === "GET") {
+      try {
+        if (!PRIVATE_KEY) return json({ address: null });
+        const { privateKeyToAccount } = await import("viem/accounts");
+        const acct = privateKeyToAccount(PRIVATE_KEY);
+        return json({ address: acct.address });
+      } catch { return json({ address: null }); }
+    }
+
+    if (url === "/uniswap/positions" && method === "GET") {
+      try {
+        if (!PRIVATE_KEY) return json({ error: "AGENT_PRIVATE_KEY not set" }, 400);
+        const { privateKeyToAccount } = await import("viem/accounts");
+        const { address } = privateKeyToAccount(PRIVATE_KEY);
+        return json(await getV3Positions(address));
+      } catch (e) { return json({ error: e.message }, 500); }
+    }
+
+    if (url === "/uniswap/v4/positions" && method === "GET") {
+      try {
+        if (!PRIVATE_KEY) return json({ error: "AGENT_PRIVATE_KEY not set" }, 400);
+        const { privateKeyToAccount } = await import("viem/accounts");
+        const { address } = privateKeyToAccount(PRIVATE_KEY);
+        return json(await getV4Positions(address));
+      } catch (e) { return json({ error: e.message }, 500); }
+    }
+
+    if (url.startsWith("/uniswap/pnl") && method === "GET") {
+      try {
+        if (!PRIVATE_KEY) return json({ error: "AGENT_PRIVATE_KEY not set" }, 400);
+        const { privateKeyToAccount } = await import("viem/accounts");
+        const { address } = privateKeyToAccount(PRIVATE_KEY);
+        const qp = Object.fromEntries(new URL("http://x" + url).searchParams.entries());
+        // Map client param names → getPnl param names; wallet comes from server
+        qp.token0Raw = qp.token0;
+        qp.token1Raw = qp.token1;
+        qp.walletRaw = address;
+        return json(await getPnl(qp));
+      } catch (e) { return json({ error: e.message }, 500); }
+    }
+
+    if (url === "/uniswap/collect" && method === "POST") {
+      try {
+        if (!PRIVATE_KEY) return json({ error: "AGENT_PRIVATE_KEY not set" }, 400);
+        const { tokenId, token0, token1 } = JSON.parse(await readBody());
+        if (!tokenId) return json({ error: "tokenId required" }, 400);
+        const { privateKeyToAccount } = await import("viem/accounts");
+        const { address } = privateKeyToAccount(PRIVATE_KEY);
+        const result = await collectAndSwap(tokenId, address, PRIVATE_KEY, token0, token1);
+        // Record in trade history
+        insertTrade({
+          strategy_id: 'uniswap',
+          action: 'COLLECT FEES',
+          asset: result.pool,
+          size: result.usdcTotal,
+          price: 1,
+          leverage: 1,
+          pnl: result.usdcTotal,
+          result: {
+            tokenId,
+            collectHash: result.collectHash,
+            swapHash: result.swapHash,
+            collected0: result.collected0,
+            collected1: result.collected1,
+            sym0: result.sym0,
+            sym1: result.sym1,
+            wethSwapped: result.wethSwapped,
+            usdcFromSwap: result.usdcFromSwap,
+            directUsdc: result.directUsdc,
+            usdcTotal: result.usdcTotal,
+          },
+        });
+        return json(result);
+      } catch (e) { return json({ error: e.message }, 500); }
     }
 
     redirect("/positions");
