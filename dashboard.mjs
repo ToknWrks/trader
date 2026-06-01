@@ -395,6 +395,11 @@ function shell(title, body, active = "") {
             <div style="font-size:0.67rem;color:rgba(255,255,255,0.25);margin-top:0.2rem">% drop from peak before closing.</div>
           </div>
           <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Stop Loss %</label>
+            <input id="em_sl_pct" type="number" step="0.5" placeholder="optional" style="width:100%" />
+            <div style="font-size:0.67rem;color:rgba(255,255,255,0.25);margin-top:0.2rem">% drop from entry before closing.</div>
+          </div>
+          <div>
             <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Max Size (USD)</label>
             <input id="em_max_size_usd" type="number" placeholder="optional" style="width:100%" />
           </div>
@@ -1476,11 +1481,17 @@ function strategiesPage() {
       sel('em_interval_minutes', s.interval_minutes ?? 60);
       f('em_tp_pct', s.tp_pct);
       f('em_trail_pct', s.trail_pct);
+      f('em_sl_pct', s.sl_pct);
       f('em_max_size_usd', s.max_size_usd);
       f('em_cooldown_minutes', s.cooldown_minutes);
+      // Clear placeholders until strategy def loads
+      ['em_tp_pct','em_trail_pct','em_sl_pct'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.placeholder = 'optional';
+      });
       document.getElementById('editModal').classList.add('open');
 
-      // Fetch candle interval from AgentSignal and show hint
+      // Fetch candle interval + AgentSignal risk for placeholders
       const hint = document.getElementById('em_candle_hint');
       hint.style.display = 'none';
       try {
@@ -1492,6 +1503,22 @@ function strategiesPage() {
           const defExit  = parseJ(def.long_exit)  ?? parseJ(def.exit);
           const conds = [...(defEntry?.conditions ?? []), ...(defExit?.conditions ?? [])];
           const candleInterval = conds.find(c => c.interval)?.interval;
+          // Lock exchange to Hyperliquid for scalper strategies (candle/trigger-based)
+          const isScalper = conds.some(c => c.source === 'trigger');
+          const exchSel = document.getElementById('em_exchange');
+          if (isScalper) {
+            exchSel.value = 'hyperliquid';
+            exchSel.disabled = true;
+            exchSel.title = 'Scalper strategies require Hyperliquid';
+          } else {
+            exchSel.disabled = false;
+            exchSel.title = '';
+          }
+          // Show AgentSignal risk values as placeholders when trader has no override
+          const risk = def.risk ?? {};
+          if (risk.tp_pct    != null && !s.tp_pct)    document.getElementById('em_tp_pct').placeholder    = 'from strategy: ' + risk.tp_pct + '%';
+          if (risk.trail_pct != null && !s.trail_pct) document.getElementById('em_trail_pct').placeholder = 'from strategy: ' + risk.trail_pct + '%';
+          if (risk.sl_pct    != null && !s.sl_pct)    document.getElementById('em_sl_pct').placeholder    = 'from strategy: ' + risk.sl_pct + '%';
           if (candleInterval) {
             const candleMin = CANDLE_TO_MIN[candleInterval];
             const mismatch = candleMin && candleMin !== (s.interval_minutes ?? 60);
@@ -1537,10 +1564,11 @@ function strategiesPage() {
         symbol: get('em_symbol'),
         leverage: parseInt(get('em_leverage')) || 1,
         position_size_usd: get('em_position_size_usd') ? parseFloat(get('em_position_size_usd')) : null,
-        exchange: get('em_exchange') || 'hyperliquid',
+        exchange: document.getElementById('em_exchange')?.value || 'hyperliquid',
         interval_minutes: parseInt(get('em_interval_minutes')) || 60,
         tp_pct: get('em_tp_pct') ? parseFloat(get('em_tp_pct')) : null,
         trail_pct: get('em_trail_pct') ? parseFloat(get('em_trail_pct')) : null,
+        sl_pct: get('em_sl_pct') ? parseFloat(get('em_sl_pct')) : null,
         max_size_usd: get('em_max_size_usd') ? parseFloat(get('em_max_size_usd')) : null,
         cooldown_minutes: get('em_cooldown_minutes') ? parseInt(get('em_cooldown_minutes')) : null,
       };
@@ -1941,11 +1969,44 @@ function addStrategyPage(error = "") {
             <p style="font-size:0.68rem;color:rgba(255,255,255,0.25);margin:0.25rem 0 0">% drop from peak to close</p>
           </div>
         </div>
+        <div id="as_exchange_hint" style="font-size:0.67rem;color:rgba(168,241,247,0.6);display:none;margin-top:-0.5rem">
+          Scalper strategies require Hyperliquid.
+        </div>
         <button type="submit" style="background:#A8F1F7;color:#09090b;border:none;border-radius:8px;padding:0.6rem 1.25rem;font-weight:600;cursor:pointer;font-size:0.875rem;margin-top:0.25rem">
           Add Strategy
         </button>
       </form>
     </div>
+    <script>
+    (function() {
+      const idInput  = document.querySelector('input[name="id"]');
+      const exchSel  = document.querySelector('select[name="exchange"]');
+      const hint     = document.getElementById('as_exchange_hint');
+      if (!idInput || !exchSel) return;
+
+      async function checkScalper(id) {
+        id = id.trim();
+        if (!id) return;
+        try {
+          const r = await fetch('/api/strategy-details/' + encodeURIComponent(id));
+          if (!r.ok) return;
+          const def = await r.json();
+          const parseJ = v => { try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return v; } };
+          const entry = parseJ(def.long_entry) ?? parseJ(def.entry);
+          const exit  = parseJ(def.long_exit)  ?? parseJ(def.exit);
+          const conds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
+          const isScalper = conds.some(c => c.source === 'trigger');
+          exchSel.disabled = isScalper;
+          hint.style.display = isScalper ? 'block' : 'none';
+          if (isScalper) exchSel.value = 'hyperliquid';
+        } catch {}
+      }
+
+      idInput.addEventListener('blur', e => checkScalper(e.target.value));
+      // Re-enable before POST so the value is submitted
+      idInput.closest('form').addEventListener('submit', () => { exchSel.disabled = false; });
+    })();
+    </script>
   `, "strategies");
 }
 

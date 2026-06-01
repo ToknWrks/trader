@@ -187,13 +187,21 @@ function computeEMA(values, period) {
   return ema;
 }
 
+// ── Strategy definition fetch (free, no x402) ────────────────────────────────
+
+async function fetchStrategyDef(strategyId) {
+  try {
+    const res = await fetch(`${AGENT_SIGNAL_URL}/api/strategy/${strategyId}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
 // ── Local eval — price thresholds + candle indicators (no x402) ──────────────
 
-async function tryLocalEval(strategy) {
+async function tryLocalEval(strategy, def) {
   try {
-    const res = await fetch(`${AGENT_SIGNAL_URL}/api/strategy/${strategy.id}`);
-    if (!res.ok) return null;
-    const def = await res.json();
+    if (!def) return null;
     const parse = v => typeof v === "string" ? JSON.parse(v) : v;
     const hasConditions = r => r?.conditions?.length > 0;
     const entry = hasConditions(parse(def.long_entry)) ? parse(def.long_entry) : parse(def.entry);
@@ -465,10 +473,36 @@ async function checkTpTrail(strategy) {
     }
   }
 
-  if (!state) return false;
-
   const price = await withRetry(() => exchange.getMidPrice(asset));
   if (!price) return false;
+
+  // Stop loss check — runs before TP/trail
+  if (strategy.sl_pct) {
+    const entryPx = parseFloat(position?.entryPx ?? "0");
+    if (entryPx > 0) {
+      const isLong   = positionSzi > 0;
+      const slPrice  = isLong ? entryPx * (1 - strategy.sl_pct / 100) : entryPx * (1 + strategy.sl_pct / 100);
+      const slHit    = isLong ? price <= slPrice : price >= slPrice;
+      if (slHit) {
+        const size = Math.abs(positionSzi);
+        const pnl  = parseFloat(((price - entryPx) * size * (isLong ? 1 : -1)).toFixed(2));
+        console.log(`[trader] 🛑 Stop loss @ $${price.toLocaleString()} (entry $${entryPx.toLocaleString()}, SL $${slPrice.toLocaleString()})`);
+        if (!isDryRun) await exchange.closePosition(asset);
+        else console.log(`[trader] [DRY RUN] Would close via stop loss`);
+        clearTpState(strategy.id);
+        insertTrade({
+          strategy_id: strategy.id,
+          action: `STOP LOSS @ $${price.toLocaleString()} (entry $${entryPx.toLocaleString()})`,
+          asset, size, price, leverage: strategy.leverage ?? 1, pnl,
+          result: { stop_loss: true, entry_price: entryPx, sl_price: slPrice },
+        });
+        console.log(`[trader] P&L: ${pnl >= 0 ? "+" : ""}$${pnl}`);
+        return true;
+      }
+    }
+  }
+
+  if (!state) return false;
 
   if (!state.trail_mode) {
     // Waiting for TP to be hit
@@ -629,8 +663,18 @@ for (const strategy of strategies) {
     continue;
   }
 
-  // Try local price eval first, fall back to x402 fetch
-  const signalData = await tryLocalEval(strategy) ?? await fetchSignal(strategy);
+  // Fetch strategy definition once — used for local eval + risk fallback
+  const def  = await fetchStrategyDef(strategy.id);
+  const risk = def?.risk ?? {};
+  const effectiveStrategy = {
+    ...strategy,
+    tp_pct:    strategy.tp_pct    ?? risk.tp_pct    ?? null,
+    trail_pct: strategy.trail_pct ?? risk.trail_pct ?? null,
+    sl_pct:    strategy.sl_pct    ?? risk.sl_pct    ?? null,
+  };
+
+  // Try local candle/indicator eval first, fall back to x402 fetch
+  const signalData = await tryLocalEval(effectiveStrategy, def) ?? await fetchSignal(effectiveStrategy);
   if (!signalData) {
     console.warn(`[trader] Skipping ${strategy.name} — could not fetch signal`);
     continue;
@@ -671,8 +715,8 @@ for (const strategy of strategies) {
       notes: scoreNotes || null,
       type: "check",
     });
-    // Check TP/trail based on actual exchange position, not signal
-    await checkTpTrail(strategy);
+    // Check TP/trail/SL based on actual exchange position, not signal
+    await checkTpTrail(effectiveStrategy);
     continue;
   }
 
@@ -689,7 +733,7 @@ for (const strategy of strategies) {
   console.log(`[trader] 🔄 Signal flip: ${priorSignal?.signal ?? "N/A"} → ${signal}`);
 
   try {
-    await executeTrade(strategy, signal, priorSignal);
+    await executeTrade(effectiveStrategy, signal, priorSignal);
   } catch (err) {
     console.error(`[trader] ❌ Execution error for ${strategy.name}: ${err.message}`);
   }

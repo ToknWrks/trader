@@ -60,6 +60,7 @@ db.exec(`
 for (const col of [
   "ALTER TABLE strategies ADD COLUMN tp_pct REAL",
   "ALTER TABLE strategies ADD COLUMN trail_pct REAL",
+  "ALTER TABLE strategies ADD COLUMN sl_pct REAL",
   "ALTER TABLE strategies ADD COLUMN max_size_usd REAL",
   "ALTER TABLE strategies ADD COLUMN cooldown_minutes INTEGER",
   "ALTER TABLE strategies ADD COLUMN subscription_period TEXT",
@@ -81,10 +82,10 @@ export function getStrategy(id) {
   return db.prepare("SELECT * FROM strategies WHERE id = ?").get(id);
 }
 
-export function upsertStrategy({ id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct, max_size_usd, cooldown_minutes, subscription_period }) {
+export function upsertStrategy({ id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct, sl_pct, max_size_usd, cooldown_minutes, subscription_period }) {
   db.prepare(`
-    INSERT INTO strategies (id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct, max_size_usd, cooldown_minutes, subscription_period)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO strategies (id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, tp_pct, trail_pct, sl_pct, max_size_usd, cooldown_minutes, subscription_period)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       symbol = excluded.symbol,
@@ -94,10 +95,11 @@ export function upsertStrategy({ id, name, symbol, leverage, position_size_usd, 
       interval_minutes = excluded.interval_minutes,
       tp_pct = excluded.tp_pct,
       trail_pct = excluded.trail_pct,
+      sl_pct = excluded.sl_pct,
       max_size_usd = excluded.max_size_usd,
       cooldown_minutes = excluded.cooldown_minutes,
       subscription_period = excluded.subscription_period
-  `).run(id, name, symbol, leverage ?? 1, position_size_usd ?? null, exchange ?? "hyperliquid", interval_minutes ?? 60, tp_pct ?? null, trail_pct ?? null, max_size_usd ?? null, cooldown_minutes ?? null, subscription_period ?? null);
+  `).run(id, name, symbol, leverage ?? 1, position_size_usd ?? null, exchange ?? "hyperliquid", interval_minutes ?? 60, tp_pct ?? null, trail_pct ?? null, sl_pct ?? null, max_size_usd ?? null, cooldown_minutes ?? null, subscription_period ?? null);
 }
 
 export function setSubscriptionPeriod(id, period) {
