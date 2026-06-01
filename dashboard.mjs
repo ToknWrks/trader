@@ -5,7 +5,7 @@
  */
 
 import { createServer } from "http";
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -261,7 +261,7 @@ function shell(title, body, active = "") {
 <body>
   <header>
     <div class="logo">
-      <img src="${getSignalUrl()}/icon.png" alt="" onerror="this.style.display='none'" />
+      <img src="/public/logo.png" alt="AgentSignal" style="width:28px;height:28px;border-radius:6px" />
       AgentSignal Trader
     </div>
     <div class="nav-links">
@@ -2101,8 +2101,12 @@ function settingsPage(saved = false, error = "", schwabAuthorized = false) {
   }
 
   return shell("Settings", `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem">
-      <p class="section-label" style="margin:0">Settings</p>
+    <div style="display:flex;align-items:center;gap:1rem;margin-bottom:2rem">
+      <img src="/public/logo.png" alt="AgentSignal" style="width:52px;height:52px;border-radius:12px" />
+      <div>
+        <div style="font-size:1.25rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">AgentSignal Trader</div>
+        <div style="font-size:0.75rem;color:rgba(255,255,255,0.35);margin-top:0.1rem">Local trading agent — your keys never leave this machine</div>
+      </div>
     </div>
     ${saved ? `<div style="color:#4ade80;font-size:0.82rem;margin-bottom:1rem;padding:0.6rem 0.85rem;background:rgba(74,222,128,0.08);border:1px solid rgba(74,222,128,0.2);border-radius:8px">✓ Settings saved. Restart the trader processes for key changes to take effect.</div>` : ""}
     ${schwabAuthorized ? `<div style="color:#fbbf24;font-size:0.82rem;margin-bottom:1rem;padding:0.6rem 0.85rem;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);border-radius:8px">✓ Schwab authorized successfully. Tokens stored and ready.</div>` : ""}
@@ -3384,6 +3388,17 @@ const server = createServer(async (req, res) => {
   const readBody = () => new Promise(r => { let b = ""; req.on("data", d => b += d); req.on("end", () => r(b)); });
 
   try {
+    if (url.startsWith("/public/") && method === "GET") {
+      const filePath = resolve(__dirname, "." + url);
+      if (existsSync(filePath) && filePath.startsWith(resolve(__dirname, "public"))) {
+        const ext = url.split(".").pop();
+        const mime = { png: "image/png", svg: "image/svg+xml", ico: "image/x-icon" }[ext] ?? "application/octet-stream";
+        res.writeHead(200, { "Content-Type": mime, "Cache-Control": "public, max-age=86400" });
+        res.end(readFileSync(filePath));
+        return;
+      }
+    }
+
     if (url === "/" || url === "") return redirect("/positions");
 
     if (url === "/portfolio") return send(await portfolioPage());
