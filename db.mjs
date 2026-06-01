@@ -329,6 +329,7 @@ export function insertTrade({ strategy_id, action, asset, size, price, leverage,
 // Migrate existing DB: add pnl column if it doesn't exist yet
 try { db.exec("ALTER TABLE trades ADD COLUMN pnl REAL"); } catch {}
 
+
 export function getTradeHistory(strategy_id, limit = 30) {
   return db.prepare(`
     SELECT * FROM trades WHERE strategy_id = ?

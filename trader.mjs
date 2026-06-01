@@ -670,7 +670,7 @@ for (const strategy of strategies) {
     ...strategy,
     tp_pct:    strategy.tp_pct    ?? risk.tp_pct    ?? null,
     trail_pct: strategy.trail_pct ?? risk.trail_pct ?? null,
-    sl_pct:    strategy.sl_pct    ?? risk.sl_pct    ?? null,
+    sl_pct:    strategy.sl_pct    ?? risk.sl_pct ?? risk.stop_loss_pct ?? null,
   };
 
   // Try local candle/indicator eval first, fall back to x402 fetch

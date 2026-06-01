@@ -1279,6 +1279,7 @@ function strategiesPage() {
       <a href="/add-strategy" class="nav-link btn-cyan" style="font-size:0.78rem;padding:0.3rem 0.75rem;border-radius:6px;border:1px solid rgba(168,241,247,0.3);color:#A8F1F7">+ Add Strategy</a>
     </div>
     ${cards}
+    <script src="https://s3.tradingview.com/tv.js"></script>
     <script>
     const TV_SYMBOLS = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, tvSymbol(s.symbol, s.exchange)])))};
     const STRAT_INFO  = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, { exchange: s.exchange ?? "hyperliquid", symbol: s.symbol.replace(/-USD$|\/USD$/i, "") }])))};
@@ -1303,7 +1304,7 @@ function strategiesPage() {
       const body = document.getElementById('acc-body-' + id);
       const isOpen = item.classList.contains('open');
       item.classList.toggle('open');
-      if (!isOpen && !body.querySelector('iframe')) {
+      if (!isOpen && !body.querySelector('.tv-widget-container')) {
         const tv = TV_SYMBOLS[id] || 'BINANCE:BTCUSDT';
 
         // Fetch strategy conditions + funding rate in parallel
@@ -1350,8 +1351,51 @@ function strategiesPage() {
               + '</div>';
           }
         } catch {}
-        const studyParams = studies.map(s => '&studies=' + encodeURIComponent(s)).join('');
-        body.innerHTML = fundingHtml + '<iframe src="https://www.tradingview.com/widgetembed/?symbol=' + encodeURIComponent(tv) + '&interval=' + tvInterval + '&theme=dark&style=1&hide_side_toolbar=0&allow_symbol_change=1&save_image=0&locale=en&hide_legend=0&hide_volume=0' + studyParams + '" width="100%" height="480" frameborder="0" allowtransparency="true" scrolling="no" style="display:block"></iframe>';
+        const containerId = 'tv_' + id.replace(/-/g, '');
+        body.innerHTML = fundingHtml + '<div id="' + containerId + '" class="tv-widget-container" style="height:480px"></div>';
+
+        new TradingView.widget({
+          container_id:        containerId,
+          symbol:              tv,
+          interval:            tvInterval,
+          theme:               'dark',
+          style:               '1',
+          locale:              'en',
+          toolbar_bg:          '#111113',
+          allow_symbol_change: true,
+          hide_side_toolbar:   false,
+          save_image:          false,
+          width:               '100%',
+          height:              480,
+          studies:             studies,
+          overrides: {
+            'paneProperties.background':                   '#111113',
+            'paneProperties.backgroundGradientStartColor': '#111113',
+            'paneProperties.backgroundGradientEndColor':   '#111113',
+            'paneProperties.backgroundType':               'solid',
+            'paneProperties.vertGridProperties.color':     'rgba(255,255,255,0.04)',
+            'paneProperties.horzGridProperties.color':     'rgba(255,255,255,0.04)',
+          },
+          studies_overrides: {
+            'RSI.Background.color':              '#111113',
+            'RSI.Background.transparency':       0,
+            'RSI.Background.visible':            false,
+            'RSI.Upper Band BG.color':           '#111113',
+            'RSI.Upper Band BG.transparency':    0,
+            'RSI.Upper Band BG.visible':         false,
+            'RSI.Lower Band BG.color':           '#111113',
+            'RSI.Lower Band BG.transparency':    0,
+            'RSI.Lower Band BG.visible':         false,
+            'RSI.Overbought BG.color':           '#111113',
+            'RSI.Overbought BG.transparency':    0,
+            'RSI.Overbought BG.visible':         false,
+            'RSI.Oversold BG.color':             '#111113',
+            'RSI.Oversold BG.transparency':      0,
+            'RSI.Oversold BG.visible':           false,
+            'RSI.Hlines Background.color':       '#111113',
+            'RSI.Hlines Background.transparency': 0,
+          },
+        });
       }
     }
     function runNow(btn, id, name) {
@@ -1518,7 +1562,8 @@ function strategiesPage() {
           const risk = def.risk ?? {};
           if (risk.tp_pct    != null && !s.tp_pct)    document.getElementById('em_tp_pct').placeholder    = 'from strategy: ' + risk.tp_pct + '%';
           if (risk.trail_pct != null && !s.trail_pct) document.getElementById('em_trail_pct').placeholder = 'from strategy: ' + risk.trail_pct + '%';
-          if (risk.sl_pct    != null && !s.sl_pct)    document.getElementById('em_sl_pct').placeholder    = 'from strategy: ' + risk.sl_pct + '%';
+          const riskSl = risk.sl_pct ?? risk.stop_loss_pct ?? null;
+          if (riskSl != null && !s.sl_pct) document.getElementById('em_sl_pct').placeholder = 'from strategy: ' + riskSl + '%';
           if (candleInterval) {
             const candleMin = CANDLE_TO_MIN[candleInterval];
             const mismatch = candleMin && candleMin !== (s.interval_minutes ?? 60);
@@ -1680,7 +1725,7 @@ function historyPage() {
             : "—";
           return `<tr>
             <td>${t.created_at.slice(0, 16)}</td>
-            <td>${t.strategy_name ?? t.strategy_id.slice(0,8)}</td>
+            <td>${t.strategy_name ?? (t.strategy_id === 'manual' ? 'Manual' : t.strategy_id ? t.strategy_id.slice(0,8) : '—')}</td>
             <td style="color:${isEntry ? "#4ade80" : "#f87171"}">${t.action}</td>
             <td>${t.price ? "$" + parseFloat(t.price).toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
             <td>${pnlStr}</td>
@@ -2012,18 +2057,51 @@ function addStrategyPage(error = "") {
 
 // ── Local price-threshold evaluation (no x402) ───────────────────────────────
 
+function computeRSIDash(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) gains += d; else losses -= d;
+  }
+  let avgGain = gains / period, avgLoss = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (period - 1) + Math.max(d, 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(-d, 0)) / period;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
+function computeSMADash(values, period) {
+  if (values.length < period) return null;
+  return values.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+function computeEMADash(values, period) {
+  if (values.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < values.length; i++) ema = values[i] * k + ema * (1 - k);
+  return ema;
+}
+
 async function tryLocalEvalDash(strategy) {
   try {
     const res = await fetch(`${getSignalUrl()}/api/strategy/${strategy.id}`);
     if (!res.ok) return null;
     const def = await res.json();
-    const entry = typeof def.entry === "string" ? JSON.parse(def.entry) : def.entry;
-    const exit  = typeof def.exit  === "string" ? JSON.parse(def.exit)  : def.exit;
+    const parseJ = v => { try { return typeof v === "string" ? JSON.parse(v) : v; } catch { return v; } };
+    const hasConditions = r => r?.conditions?.length > 0;
+    const entry = hasConditions(parseJ(def.long_entry)) ? parseJ(def.long_entry) : parseJ(def.entry);
+    const exit  = hasConditions(parseJ(def.long_exit))  ? parseJ(def.long_exit)  : parseJ(def.exit);
 
     const allConds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
     if (!allConds.length) return null;
-    const priceFlds = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
-    if (!allConds.every(c => priceFlds.has((c.field ?? "close").toLowerCase()))) return null;
+
+    const priceFlds     = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
+    const indicatorFlds = new Set(["rsi", "sma", "ema"]);
+    const knownFlds     = new Set([...priceFlds, ...indicatorFlds]);
+    if (!allConds.every(c => knownFlds.has((c.field ?? "close").toLowerCase()))) return null;
 
     const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
     const { KrakenExchange }      = await import("./exchanges/kraken.mjs");
@@ -2035,33 +2113,77 @@ async function tryLocalEvalDash(strategy) {
       : new HyperliquidExchange(PRIVATE_KEY);
 
     const asset = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
+    const needsCandles = allConds.some(c => indicatorFlds.has((c.field ?? "close").toLowerCase()));
+
     const [price, position] = await Promise.all([
       exch.getMidPrice(asset),
       exch.getPosition(asset).catch(() => null),
     ]);
     if (!price) return null;
-
     const hasPosition = parseFloat(position?.szi ?? "0") !== 0;
 
-    const evalRules = (rules, p) => {
+    // Compute indicators from candles if needed
+    const indicatorValues = {};
+    if (needsCandles && typeof exch.getCandles === "function") {
+      const MINS_TO_IV = { 1:"1m",3:"3m",5:"5m",15:"15m",30:"30m",60:"1h",120:"2h",240:"4h",480:"8h",720:"12h",1440:"1d" };
+      // navigator (source=price) → daily candles; scalper (source=trigger) → condition interval
+      const defaultInterval = allConds.some(c => c.source === "trigger")
+        ? (MINS_TO_IV[strategy.interval_minutes ?? 60] ?? "1h")
+        : "1d";
+      const intervals = new Set(allConds.map(c => c.interval ?? defaultInterval));
+      const candlesByInterval = {};
+      for (const iv of intervals) {
+        const candles = await exch.getCandles(asset, iv, 100);
+        candlesByInterval[iv] = candles.map(c => parseFloat(c.c));
+      }
+      for (const c of allConds) {
+        const field  = (c.field ?? "close").toLowerCase();
+        if (!indicatorFlds.has(field)) continue;
+        const iv     = c.interval ?? defaultInterval;
+        const period = parseInt(c.period ?? 14);
+        const key    = `${field}_${period}_${iv}`;
+        if (indicatorValues[key] !== undefined) continue;
+        const closes = candlesByInterval[iv];
+        if (!closes?.length) continue;
+        switch (field) {
+          case "rsi": indicatorValues[key] = computeRSIDash(closes, period); break;
+          case "sma": indicatorValues[key] = computeSMADash(closes, period); break;
+          case "ema": indicatorValues[key] = computeEMADash(closes, period); break;
+        }
+      }
+    }
+
+    const defaultInterval = allConds.some(c => c.source === "trigger")
+      ? ({ 1:"1m",3:"3m",5:"5m",15:"15m",30:"30m",60:"1h",120:"2h",240:"4h",480:"8h",720:"12h",1440:"1d" }[strategy.interval_minutes ?? 60] ?? "1h")
+      : "1d";
+
+    const evalRules = (rules) => {
       if (!rules?.conditions?.length) return false;
       const results = rules.conditions.map(c => {
-        const v = parseFloat(c.value);
-        switch (c.op) {
-          case "<=": return p <= v;
-          case ">=": return p >= v;
-          case "<":  return p <  v;
-          case ">":  return p >  v;
-          default:   return false;
+        const field = (c.field ?? "close").toLowerCase();
+        const v     = parseFloat(c.value);
+        let actual;
+        if (indicatorFlds.has(field)) {
+          const period = parseInt(c.period ?? 14);
+          const iv     = c.interval ?? defaultInterval;
+          actual = indicatorValues[`${field}_${period}_${iv}`];
+        } else {
+          actual = price;
         }
+        if (actual == null) return false;
+        const op = c.op;
+        if (op === "<="  || op === "lte") return actual <= v;
+        if (op === ">="  || op === "gte") return actual >= v;
+        if (op === "<"   || op === "lt")  return actual <  v;
+        if (op === ">"   || op === "gt")  return actual >  v;
+        return false;
       });
       return rules.operator === "AND" ? results.every(Boolean) : results.some(Boolean);
     };
 
-    // Scalper model: derived from actual position + conditions, not signal history
     const signal = hasPosition
-      ? (evalRules(exit, price) ? "FLAT" : "LONG")
-      : (evalRules(entry, price) ? "LONG" : "FLAT");
+      ? (evalRules(exit)  ? "FLAT" : "LONG")
+      : (evalRules(entry) ? "LONG" : "FLAT");
 
     return { signal, price };
   } catch {
@@ -2410,7 +2532,7 @@ async function handleAddToPosition(body) {
   await exch.placeMarketOrder(asset, side, size);
   const action = `ADD ${side === "buy" ? "LONG" : "SHORT"} +${size} ${asset} @ ~$${midPrice.toLocaleString()} ($${sizeUsd})`;
   const { insertTrade } = await import("./db.mjs");
-  insertTrade({ strategy_id: null, action, asset, size, price: midPrice, leverage: 1 });
+  insertTrade({ strategy_id: "manual", action, asset, size, price: midPrice, leverage: 1 });
   return { ok: true, action };
 }
 
