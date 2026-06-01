@@ -2895,14 +2895,15 @@ async function premiumFadePage() {
       </div>`, "premium-fade");
   }
 
-  let signals = { recent: [], open: [] };
+  let signals = { recent: [], open: [], tickers: [], noTickers: false };
   let fetchError = null;
   try {
-    const res = await fetch(`${getSignalUrl()}/api/premium-fade`, {
+    const res = await fetch(`${getSignalUrl()}/api/premium-fade/my`, {
       headers: { "Authorization": "Bearer " + process.env.AGENT_API_KEY },
     });
-    if (res.ok) signals = await res.json();
-    else fetchError = "API returned " + res.status;
+    const data = await res.json();
+    if (!res.ok) fetchError = data.error ?? "API returned " + res.status;
+    else signals = data;
   } catch (e) { fetchError = e.message; }
 
   const statusColor = { open: "#A8F1F7", target_hit: "#4ade80", stopped_out: "#f87171", expired: "rgba(255,255,255,0.25)", closed: "rgba(255,255,255,0.4)" };
@@ -2932,8 +2933,8 @@ async function premiumFadePage() {
     </tr>`;
   }
 
-  const openRows  = (signals.open  ?? []).map(signalRow).join("") || `<tr><td colspan="12" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No open signals</td></tr>`;
-  const recentRows = (signals.recent ?? []).filter(s => s.status !== "open").map(signalRow).join("") || `<tr><td colspan="12" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No recent closed signals</td></tr>`;
+  const openRows   = (signals.open   ?? []).map(signalRow).join("") || `<tr><td colspan="12" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No open signals</td></tr>`;
+  const recentRows = (signals.recent ?? []).map(signalRow).join("") || `<tr><td colspan="12" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No recent closed signals</td></tr>`;
 
   const tableHead = `<thead><tr>
     <th>Ticker</th><th>Type</th><th>Strike</th><th>Expiry</th>
@@ -2952,14 +2953,16 @@ async function premiumFadePage() {
       <a href="/premium-fade" style="font-size:0.78rem;color:rgba(255,255,255,0.4);padding:0.35rem 0.75rem;border:1px solid rgba(255,255,255,0.1);border-radius:6px;text-decoration:none">↻ Refresh</a>
     </div>
     ${fetchError ? `<div style="color:#f87171;margin-bottom:1rem;font-size:0.82rem">⚠ ${fetchError}</div>` : ""}
+    ${signals.tickers?.length > 0 ? `<div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:1.25rem">${signals.tickers.map(t => `<span style="padding:0.15rem 0.55rem;border-radius:999px;background:rgba(168,241,247,0.08);border:1px solid rgba(168,241,247,0.2);font-size:0.72rem;color:#A8F1F7;font-weight:600">${t}</span>`).join("")}</div>` : ""}
+    ${signals.noTickers ? `<div class="card" style="text-align:center;padding:2rem"><p style="color:rgba(255,255,255,0.4);margin-bottom:0.5rem">No tickers in your watchlist yet.</p><a href="${getSignalUrl()}/premium-fade" target="_blank" rel="noopener noreferrer" style="color:#A8F1F7;font-size:0.82rem">Add tickers at agentsignal.app/premium-fade →</a></div>` : `
     <div class="section-label">Open Positions</div>
     <div class="card" style="overflow-x:auto">
       <table>${tableHead}<tbody>${openRows}</tbody></table>
     </div>
-    <div class="section-label" style="margin-top:1.5rem">Recent (14 days)</div>
+    <div class="section-label" style="margin-top:1.5rem">Recent (30 days)</div>
     <div class="card" style="overflow-x:auto">
       <table>${tableHead}<tbody>${recentRows}</tbody></table>
-    </div>
+    </div>`}
   `, "premium-fade");
 }
 
