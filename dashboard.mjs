@@ -576,7 +576,16 @@ function shell(title, body, active = "") {
     });
 
     function renderCond(c) {
-      return '<span style="color:#A8F1F7">' + (c.source || '') + '</span> ' + (c.field || '') + ' ' + (c.op || '') + ' ' + (c.value !== undefined ? c.value : '');
+      const FIELD_LABELS = { pct_above_entry: '% Above Entry', pct_below_entry: '% Below Entry' };
+      const OP_LABELS    = { gte: '≥', lte: '≤', gt: '>', lt: '<' };
+      const field = c.field || '';
+      const label = FIELD_LABELS[field] || field;
+      const op    = OP_LABELS[c.op] || c.op || '';
+      const isPctField = field === 'pct_above_entry' || field === 'pct_below_entry';
+      const valStr = c.value !== undefined ? c.value + (isPctField ? '%' : '') : '';
+      const sourceTag = (c.source && !isPctField) ? '<span style="color:#A8F1F7">' + c.source + '</span> ' : '';
+      const periodTag = (c.period && !isPctField) ? '<span style="color:rgba(255,255,255,0.3)">('+c.period+')</span> ' : '';
+      return sourceTag + label + ' ' + periodTag + op + ' ' + valStr;
     }
     function renderRules(rs) {
       if (!rs || !Array.isArray(rs.conditions) || !rs.conditions.length) return '<span style="color:rgba(255,255,255,0.3)">—</span>';
@@ -588,7 +597,10 @@ function shell(title, body, active = "") {
     });
     async function showStrategyInfo(btn) {
       const s = JSON.parse(btn.dataset.strategy);
-      const sched = isCrypto(s.symbol) ? SCHEDULES.crypto : SCHEDULES.stocks;
+      const iv = s.interval_minutes ?? 60;
+      const schedLabel = isCrypto(s.symbol)
+        ? (iv >= 1440 ? 'every day' : 'every ' + iv + 'min')
+        : SCHEDULES.stocks.label;
       const size = s.position_size_usd ? '$' + s.position_size_usd : 'default';
       const AGENT_SIGNAL_URL = '${getSignalUrl()}';
       const pop = document.getElementById('infoPopover');
@@ -628,7 +640,7 @@ function shell(title, body, active = "") {
         + (shortEntry ? '<div>' + sectionLabel('Short Entry', 'rgba(248,113,113,0.7)') + '<br><span style="font-size:0.75rem">' + renderRules(shortEntry) + '</span></div>' : '')
         + (shortExit  ? '<div>' + sectionLabel('Short Exit',  'rgba(248,113,113,0.7)') + '<br><span style="font-size:0.75rem">' + renderRules(shortExit)  + '</span></div>' : '')
         + '</div>'
-        + '<div class="sched">⏱ ' + sched.label + '</div>';
+        + '<div class="sched">⏱ ' + schedLabel + '</div>';
     }
     document.addEventListener('click', function(e) {
       const pop = document.getElementById('infoPopover');

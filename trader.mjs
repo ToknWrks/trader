@@ -225,7 +225,8 @@ async function tryLocalEval(strategy, def) {
 
     const priceFlds     = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
     const indicatorFlds = new Set(["rsi", "sma", "ema"]);
-    const knownFlds     = new Set([...priceFlds, ...indicatorFlds]);
+    const passthroughFlds = new Set(["pct_above_entry", "pct_below_entry"]);
+    const knownFlds     = new Set([...priceFlds, ...indicatorFlds, ...passthroughFlds]);
     if (!allConds.every(c => knownFlds.has((c.field ?? "close").toLowerCase()))) return null;
 
     const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
@@ -283,6 +284,7 @@ async function tryLocalEval(strategy, def) {
         } else {
           actual = price;
         }
+        if (passthroughFlds.has(field)) return true; // no entry price context in live — pass through, tp_pct/sl_pct governs
         if (actual == null) return false;
         const op = c.op;
         if (op === "<="  || op === "lte") return actual <= v;
