@@ -603,24 +603,30 @@ function shell(title, body, active = "") {
       pop.classList.add('open');
 
       // Fetch full strategy via local proxy (avoids CORS)
-      let entry = null, exit = null;
+      let longEntry = null, longExit = null, shortEntry = null, shortExit = null;
       try {
         const res = await fetch('/api/strategy-details/' + s.id);
         if (res.ok) {
           const full = await res.json();
           const parse = v => typeof v === 'string' ? JSON.parse(v) : v;
           const hasConditions = r => r?.conditions?.length > 0;
-          entry = hasConditions(parse(full.long_entry)) ? parse(full.long_entry) : parse(full.entry);
-          exit  = hasConditions(parse(full.long_exit))  ? parse(full.long_exit)  : parse(full.exit);
+          longEntry  = hasConditions(parse(full.long_entry))  ? parse(full.long_entry)  : (hasConditions(parse(full.entry)) ? parse(full.entry) : null);
+          longExit   = hasConditions(parse(full.long_exit))   ? parse(full.long_exit)   : (hasConditions(parse(full.exit))  ? parse(full.exit)  : null);
+          shortEntry = hasConditions(parse(full.short_entry)) ? parse(full.short_entry) : null;
+          shortExit  = hasConditions(parse(full.short_exit))  ? parse(full.short_exit)  : null;
         }
       } catch {}
 
+      const hasShort = shortEntry || shortExit;
+      const sectionLabel = (label, color) => '<span style="color:' + color + ';font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">' + label + '</span>';
       pop.innerHTML = '<strong>' + s.name + '</strong>'
         + '<div style="margin:0.4rem 0 0;font-family:monospace;font-size:0.7rem;color:rgba(255,255,255,0.35);word-break:break-all">' + s.id + '</div>'
         + '<div style="margin-top:0.75rem;display:flex;flex-direction:column;gap:0.5rem">'
         + '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Symbol</span><br>' + s.symbol + ' · ' + s.leverage + 'x · ' + size + '</div>'
-        + (entry ? '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Entry</span><br><span style="font-size:0.75rem">' + renderRules(entry) + '</span></div>' : '')
-        + (exit  ? '<div><span style="color:rgba(255,255,255,0.4);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em">Exit</span><br><span style="font-size:0.75rem">'  + renderRules(exit)  + '</span></div>' : '')
+        + (longEntry  ? '<div>' + sectionLabel(hasShort ? 'Long Entry' : 'Entry', 'rgba(255,255,255,0.4)') + '<br><span style="font-size:0.75rem">' + renderRules(longEntry)  + '</span></div>' : '')
+        + (longExit   ? '<div>' + sectionLabel(hasShort ? 'Long Exit'  : 'Exit',  'rgba(255,255,255,0.4)') + '<br><span style="font-size:0.75rem">' + renderRules(longExit)   + '</span></div>' : '')
+        + (shortEntry ? '<div>' + sectionLabel('Short Entry', 'rgba(248,113,113,0.7)') + '<br><span style="font-size:0.75rem">' + renderRules(shortEntry) + '</span></div>' : '')
+        + (shortExit  ? '<div>' + sectionLabel('Short Exit',  'rgba(248,113,113,0.7)') + '<br><span style="font-size:0.75rem">' + renderRules(shortExit)  + '</span></div>' : '')
         + '</div>'
         + '<div class="sched">⏱ ' + sched.label + '</div>';
     }
