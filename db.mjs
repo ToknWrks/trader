@@ -64,6 +64,7 @@ for (const col of [
   "ALTER TABLE strategies ADD COLUMN max_size_usd REAL",
   "ALTER TABLE strategies ADD COLUMN cooldown_minutes INTEGER",
   "ALTER TABLE strategies ADD COLUMN subscription_period TEXT",
+  "ALTER TABLE strategies ADD COLUMN subscription_expires_at TEXT",
   "ALTER TABLE strategies ADD COLUMN option_mode TEXT",
   "ALTER TABLE strategies ADD COLUMN dte_target INTEGER",
   "ALTER TABLE strategies ADD COLUMN delta_target REAL",
@@ -108,6 +109,10 @@ export function upsertStrategy({ id, name, symbol, leverage, position_size_usd, 
 
 export function setSubscriptionPeriod(id, period) {
   db.prepare("UPDATE strategies SET subscription_period = ? WHERE id = ?").run(period ?? null, id);
+}
+
+export function setSubscriptionExpiry(id, expires_at) {
+  db.prepare("UPDATE strategies SET subscription_expires_at = ? WHERE id = ?").run(expires_at ?? null, id);
 }
 
 export function touchStrategyRun(id) {

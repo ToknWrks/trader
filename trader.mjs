@@ -64,6 +64,7 @@ const HL_SIZE_USD      = parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
 const isDryRun         = argv.includes("--dry-run");
 const cryptoOnly       = argv.includes("--crypto-only");
 const stocksOnly       = argv.includes("--stocks-only");
+const strategyFilter   = argv[argv.indexOf("--strategy") + 1] || null;
 const today            = new Date().toISOString().slice(0, 10);
 
 // Crypto tickers traded on 24/7 markets (Hyperliquid perps)
@@ -92,6 +93,7 @@ import {
   getPriorSignal, insertTrade, isStrategyDue, touchStrategyRun,
   insertSignalEvent, setTpState, getTpState, updateTpTrailMode,
   updateTpHighWater, clearTpState, logFetch, getLastTradeTime,
+  setSubscriptionExpiry,
 } from "./db.mjs";
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
@@ -216,6 +218,14 @@ async function tryLocalEval(strategy, def) {
   try {
     if (!def) return null;
     const parse = v => typeof v === "string" ? JSON.parse(v) : v;
+
+    // Crypto RADAR gate — must check before any local eval attempt
+    const risk = parse(def.risk) ?? {};
+    if (risk.crypto_radar_long_gate != null || risk.crypto_radar_short_gate != null) {
+      console.log(`[trader] 📡 Crypto RADAR gate configured — deferring to server`);
+      return null;
+    }
+
     const hasConditions = r => r?.conditions?.length > 0;
     const entry       = hasConditions(parse(def.long_entry))  ? parse(def.long_entry)  : parse(def.entry);
     const exit        = hasConditions(parse(def.long_exit))   ? parse(def.long_exit)   : parse(def.exit);
@@ -300,13 +310,6 @@ async function tryLocalEval(strategy, def) {
       });
       return rules.operator === "AND" ? results.every(Boolean) : results.some(Boolean);
     };
-
-    // Crypto RADAR gate — score not available locally; defer to server
-    const risk = parse(def.risk) ?? {};
-    if (risk.crypto_radar_long_gate != null || risk.crypto_radar_short_gate != null) {
-      console.log(`[trader] 📡 Crypto RADAR gate configured — deferring to server`);
-      return null;
-    }
 
     // Funding gate check (mirrors server-side fail-closed logic)
     let fundingRate = null;
@@ -434,12 +437,16 @@ async function fetchSignal(strategy) {
     }
     if (probe.status !== 402) throw new Error(`Signal API ${probe.status}`);
 
-    // Auto-renew subscription if strategy has a preferred period
+    // Auto-renew subscription if strategy has a preferred period and it has expired locally
     const subPeriod = typeof strategy === "object" ? strategy.subscription_period : null;
-    if (subPeriod) {
+    const subExpiresAt = typeof strategy === "object" ? strategy.subscription_expires_at : null;
+    const subStillValid = subExpiresAt && new Date(subExpiresAt) > new Date();
+    if (subPeriod && !subStillValid) {
       try {
         const iv = typeof strategy === "object" ? (strategy.interval_minutes ?? 60) : 60;
-        await subscribeStrategy(strategyId, iv, subPeriod);
+        const subResult = await subscribeStrategy(strategyId, iv, subPeriod);
+        // Record expiry locally so we don't try again until it actually expires
+        if (subResult?.expires_at) setSubscriptionExpiry(strategyId, subResult.expires_at);
         // Retry — subscription now active
         const retried = await fetch(url, { headers: { "X-Wallet-Address": account.address } });
         if (retried.ok) {
@@ -451,6 +458,8 @@ async function fetchSignal(strategy) {
       } catch (e) {
         console.warn(`[trader] Auto-renew failed: ${e.message} — falling back to per-call`);
       }
+    } else if (subStillValid) {
+      console.log(`[trader] 📋 Subscription valid until ${subExpiresAt} — skipping auto-renew`);
     }
 
     // Step 2: decode payment requirement — network comes FROM the server's 402 response
@@ -710,13 +719,14 @@ console.log(`[trader] ═══════════════════�
 
 const allStrategies = getActiveStrategies();
 const strategies = allStrategies.filter(s => {
+  if (strategyFilter) return s.id === strategyFilter;
   if (cryptoOnly) return isCrypto(s.symbol);
   if (stocksOnly) return !isCrypto(s.symbol);
   return true;
 });
 
 if (!strategies.length) {
-  const scope = cryptoOnly ? "crypto" : stocksOnly ? "stock" : "active";
+  const scope = strategyFilter ? `strategy ${strategyFilter}` : cryptoOnly ? "crypto" : stocksOnly ? "stock" : "active";
   console.log(`[trader] No ${scope} strategies. Activate one from the dashboard: npm run dashboard`);
   process.exit(0);
 }

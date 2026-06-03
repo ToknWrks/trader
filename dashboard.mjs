@@ -87,7 +87,7 @@ function parseSchedules() {
 const SCHEDULES = parseSchedules();
 
 import {
-  getStrategies, getStrategy, upsertStrategy, setStrategyActive, setSubscriptionPeriod,
+  getStrategies, getStrategy, upsertStrategy, setStrategyActive, setSubscriptionPeriod, setSubscriptionExpiry,
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
   countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents, getYtdPnl,
   getSnapshots, insertSnapshot, hasSnapshots, backfillSnapshotsFromTrades, insertTrade,
@@ -561,11 +561,11 @@ function shell(title, body, active = "") {
           return;
         }
         console.log('[subscribe] ✅ Subscribed until', subData.expires_at);
-        // Save period to strategy for auto-renew
+        // Save period + expiry locally so auto-renew doesn't fire until actually expired
         await fetch('/api/set-subscription-period', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ strategy_id: id, period: selectedPeriod }),
+          body: JSON.stringify({ strategy_id: id, period: selectedPeriod, expires_at: subData.expires_at }),
         });
       }
 
@@ -3746,9 +3746,10 @@ const server = createServer(async (req, res) => {
     if (url === "/api/set-subscription-period" && method === "POST") {
       const body = await readBody();
       try {
-        const { strategy_id, period } = JSON.parse(body);
+        const { strategy_id, period, expires_at } = JSON.parse(body);
         if (!strategy_id) return json({ ok: false, error: "strategy_id required" });
         setSubscriptionPeriod(strategy_id, period ?? null);
+        if (expires_at) setSubscriptionExpiry(strategy_id, expires_at);
         return json({ ok: true });
       } catch (e) { return json({ ok: false, error: e.message }); }
     }
