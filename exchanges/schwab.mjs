@@ -164,13 +164,13 @@ export class SchwabClient {
     return this._req("GET", TRADER + "/accounts/" + hash + "?fields=positions");
   }
 
-  async getOrders(hash) {
+  async getOrders(hash, { days = 7, status } = {}) {
     const now  = new Date();
-    const from = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+    const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const params = new URLSearchParams({
-      fromEnteredTime: from.toISOString().slice(0, 19) + "+0000",
-      toEnteredTime:   now.toISOString().slice(0, 19)  + "+0000",
-      status: "WORKING",
+      fromEnteredTime: from.toISOString().slice(0, 19) + "+00:00",
+      toEnteredTime:   now.toISOString().slice(0, 19)  + "+00:00",
+      ...(status ? { status } : {}),
     });
     return this._req("GET", TRADER + "/accounts/" + hash + "/orders?" + params);
   }
@@ -379,6 +379,32 @@ export class SchwabExchange {
         instruction,
         quantity: qty,
         instrument: { symbol: pos.symbol ?? asset, assetType },
+      }],
+    };
+    await this.client.placeOrder(hash, order);
+    return { ok: true };
+  }
+
+  async cancelOrder(orderId) {
+    const hash = await this._hash();
+    await this.client.cancelOrder(hash, orderId);
+    return { ok: true };
+  }
+
+  async editOrder(orderId, asset, side, size, limitPrice, duration = "GOOD_TILL_CANCEL") {
+    const hash = await this._hash();
+    await this.client.cancelOrder(hash, orderId);
+    const instruction = side === "buy" ? "BUY" : "SELL";
+    const order = {
+      orderType:          "LIMIT",
+      session:            "NORMAL",
+      duration,
+      price:              parseFloat(limitPrice),
+      orderStrategyType:  "SINGLE",
+      orderLegCollection: [{
+        instruction,
+        quantity: parseFloat(size),
+        instrument: { symbol: asset, assetType: "EQUITY" },
       }],
     };
     await this.client.placeOrder(hash, order);

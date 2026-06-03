@@ -52,6 +52,12 @@ export class HyperliquidExchange {
     return hlCancelOrder(this.privateKey, asset, orderId);
   }
 
+  async editOrder(orderId, asset, side, size, limitPrice) {
+    console.log(`[hyperliquid] Editing order ${orderId} (cancel + replace): ${size} ${asset} @ $${limitPrice}`);
+    await hlCancelOrder(this.privateKey, asset, orderId);
+    return hlPlaceLimitOrder(this.privateKey, asset, side, size, limitPrice);
+  }
+
   async closePosition(asset) {
     return hlClose(this.privateKey, asset);
   }

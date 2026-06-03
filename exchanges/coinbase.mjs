@@ -213,6 +213,19 @@ export class CoinbaseExchange {
     });
   }
 
+  async editOrder(orderId, asset, side, size, limitPrice) {
+    console.log(`[coinbase] Editing order ${orderId}: ${size} ${asset} @ $${limitPrice}`);
+    return this._request("POST", "/api/v3/brokerage/orders/edit", {
+      order_id: orderId,
+      order_configuration: {
+        limit_limit_gtc: {
+          base_size: size.toString(),
+          limit_price: limitPrice.toString(),
+        },
+      },
+    });
+  }
+
   async setLeverage(asset, leverage) {
     if (leverage > 1) console.warn(`[coinbase] Leverage >1 not supported — ignoring`);
   }

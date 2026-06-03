@@ -151,6 +151,18 @@ export class KrakenExchange {
     return krakenRequest(this.apiKey, this.apiSecret, "/0/private/CancelOrder", { txid: orderId });
   }
 
+  async editOrder(orderId, asset, side, size, limitPrice) {
+    const pair = toKrakenPair(asset);
+    const params = {
+      txid: orderId,
+      pair,
+      volume: size.toString(),
+      price: limitPrice.toString(),
+    };
+    console.log(`[kraken] Editing order ${orderId}: ${size} ${asset} @ $${limitPrice}`);
+    return krakenRequest(this.apiKey, this.apiSecret, "/0/private/EditOrder", params);
+  }
+
   async setLeverage(asset, leverage) {
     // Stored and applied at order time (Kraken specifies leverage per-order)
     this._leverage = leverage;

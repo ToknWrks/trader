@@ -250,10 +250,11 @@ export function getLatestSignal(strategy_id) {
 }
 
 export function getPriorSignal(strategy_id) {
+  const today = new Date().toISOString().slice(0, 10);
   return db.prepare(`
-    SELECT * FROM signals WHERE strategy_id = ?
-    ORDER BY date DESC LIMIT 1 OFFSET 1
-  `).get(strategy_id);
+    SELECT * FROM signals WHERE strategy_id = ? AND date < ?
+    ORDER BY date DESC LIMIT 1
+  `).get(strategy_id, today);
 }
 
 export function countSignals() {

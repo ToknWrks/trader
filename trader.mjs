@@ -217,10 +217,15 @@ async function tryLocalEval(strategy, def) {
     if (!def) return null;
     const parse = v => typeof v === "string" ? JSON.parse(v) : v;
     const hasConditions = r => r?.conditions?.length > 0;
-    const entry = hasConditions(parse(def.long_entry)) ? parse(def.long_entry) : parse(def.entry);
-    const exit  = hasConditions(parse(def.long_exit))  ? parse(def.long_exit)  : parse(def.exit);
+    const entry       = hasConditions(parse(def.long_entry))  ? parse(def.long_entry)  : parse(def.entry);
+    const exit        = hasConditions(parse(def.long_exit))   ? parse(def.long_exit)   : parse(def.exit);
+    const shortEntry  = hasConditions(parse(def.short_entry)) ? parse(def.short_entry) : null;
+    const shortExit   = hasConditions(parse(def.short_exit))  ? parse(def.short_exit)  : null;
 
-    const allConds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
+    const allConds = [
+      ...(entry?.conditions ?? []), ...(exit?.conditions ?? []),
+      ...(shortEntry?.conditions ?? []), ...(shortExit?.conditions ?? []),
+    ];
     if (!allConds.length) return null;
 
     const priceFlds     = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
@@ -296,10 +301,48 @@ async function tryLocalEval(strategy, def) {
       return rules.operator === "AND" ? results.every(Boolean) : results.some(Boolean);
     };
 
-    // Scalper model: signal derived from actual position + conditions, not signal history
-    const signal = hasPosition
-      ? (evalRules(exit)  ? "FLAT" : "LONG")
-      : (evalRules(entry) ? "LONG" : "FLAT");
+    // Crypto RADAR gate — score not available locally; defer to server
+    const risk = parse(def.risk) ?? {};
+    if (risk.crypto_radar_long_gate != null || risk.crypto_radar_short_gate != null) {
+      console.log(`[trader] 📡 Crypto RADAR gate configured — deferring to server`);
+      return null;
+    }
+
+    // Funding gate check (mirrors server-side fail-closed logic)
+    let fundingRate = null;
+    if (risk.funding_long_gate != null || risk.funding_short_gate != null) {
+      try {
+        const fRes = await fetch("https://api.hyperliquid.xyz/info", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "metaAndAssetCtxs" }),
+        });
+        const [meta, ctxs] = await fRes.json();
+        const idx = meta.universe.findIndex(a => a.name === asset);
+        if (idx !== -1) fundingRate = parseFloat(ctxs[idx].funding);
+      } catch { /* funding unavailable — fail closed */ }
+    }
+    const longGateOk  = risk.funding_long_gate  == null || (fundingRate !== null && fundingRate <= risk.funding_long_gate);
+    const shortGateOk = risk.funding_short_gate == null || (fundingRate !== null && fundingRate >= risk.funding_short_gate);
+
+    // 4-ruleset scalper model: long + short independent entry/exit
+    let signal;
+    if (shortEntry) {
+      if (hasPosition) {
+        const isLong  = parseFloat(position?.szi ?? "0") > 0;
+        signal = isLong
+          ? (evalRules(exit)      ? "FLAT" : "LONG")
+          : (evalRules(shortExit) ? "FLAT" : "SHORT");
+      } else {
+        if      (evalRules(entry)      && longGateOk)  signal = "LONG";
+        else if (evalRules(shortEntry) && shortGateOk) signal = "SHORT";
+        else                                            signal = "FLAT";
+      }
+    } else {
+      // Legacy long-only model
+      signal = hasPosition
+        ? (evalRules(exit)  ? "FLAT" : "LONG")
+        : (evalRules(entry) ? "LONG" : "FLAT");
+    }
 
     const indLog = Object.entries(indicatorValues)
       .map(([k, v]) => {
@@ -363,7 +406,10 @@ async function subscribeStrategy(strategyId, intervalMinutes, period) {
 
 async function fetchSignal(strategy) {
   const strategyId = typeof strategy === "string" ? strategy : strategy.id;
-  const url = `${AGENT_SIGNAL_URL}/api/strategy/${strategyId}/signal`;
+  const isScalper = strategy.risk?.mode === "scalp";
+  const url = isScalper
+    ? `${AGENT_SIGNAL_URL}/api/scalper/${strategyId}/signal`
+    : `${AGENT_SIGNAL_URL}/api/strategy/${strategyId}/signal`;
   try {
     const { x402Client } = await import("@x402/core/client");
     const { decodePaymentRequiredHeader, encodePaymentSignatureHeader } = await import("@x402/core/http");
@@ -619,9 +665,15 @@ async function executeTrade(strategy, signal, priorSignal) {
       result = await withRetry(() => exchange.closePosition(asset));
     }
     clearTpState(strategy.id);
-  } else if (signal === "SHORT" && !isFlat) {
-    action = `SHORTED ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
-    if (entryPrice > 0 && isLong) {
+  } else if (signal === "SHORT" && isFlat) {
+    action = `ENTERED SHORT ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
+    if (!isDryRun) {
+      await withRetry(() => exchange.setLeverage(asset, leverage));
+      result = await withRetry(() => exchange.placeMarketOrder(asset, "sell", positionSize));
+    }
+  } else if (signal === "SHORT" && !isFlat && isLong) {
+    action = `FLIPPED SHORT ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
+    if (entryPrice > 0) {
       pnl = new Decimal(midPrice).minus(entryPrice).times(Math.abs(currentSize)).toDecimalPlaces(2).toNumber();
       console.log(`[trader] Closed long P&L: ${pnl >= 0 ? "+" : ""}$${pnl}`);
     }
@@ -682,9 +734,11 @@ for (const strategy of strategies) {
 
   // Fetch strategy definition once — used for local eval + risk fallback
   const def  = await fetchStrategyDef(strategy.id);
-  const risk = def?.risk ?? {};
+  const parseJson = v => { try { return typeof v === "string" ? JSON.parse(v) : (v ?? {}); } catch { return {}; } };
+  const risk = parseJson(def?.risk);
   const effectiveStrategy = {
     ...strategy,
+    risk,  // expose parsed risk so fetchSignal can detect scalper mode + gate checks
     tp_pct:    strategy.tp_pct    ?? risk.tp_pct    ?? null,
     trail_pct: strategy.trail_pct ?? risk.trail_pct ?? null,
     sl_pct:    strategy.sl_pct    ?? risk.sl_pct ?? risk.stop_loss_pct ?? null,
@@ -719,6 +773,7 @@ for (const strategy of strategies) {
   });
 
   // Get prior signal to detect flips
+  // priorSignal is the most recent signal from a previous day (not today)
   const priorSignal = getPriorSignal(strategy.id);
   const signalChanged = !priorSignal || priorSignal.signal !== signal;
 

@@ -658,6 +658,30 @@ function shell(title, body, active = "") {
       setTimeout(() => { btn.textContent = orig; btn.style.color = ''; btn.style.borderColor = ''; }, 1500);
     }
   </script>
+    <div class="modal-overlay" id="editOrderModal" onclick="if(event.target===this)document.getElementById('editOrderModal').style.display='none'">
+      <div class="modal" style="max-width:360px">
+        <div class="modal-title" id="editOrderTitle">Edit Order</div>
+        <div class="modal-body" style="display:flex;flex-direction:column;gap:1rem;margin-top:1rem">
+          <input type="hidden" id="editOrderExchange">
+          <input type="hidden" id="editOrderOrderId">
+          <input type="hidden" id="editOrderAsset">
+          <input type="hidden" id="editOrderSide">
+          <input type="hidden" id="editOrderDuration">
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Size</label>
+            <input id="editOrderSize" type="number" step="any" style="width:100%" />
+          </div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Limit Price</label>
+            <input id="editOrderPrice" type="number" step="any" style="width:100%" />
+          </div>
+          <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
+            <button id="editOrderSubmitBtn" onclick="submitEditOrder()" style="flex:1;padding:0.6rem;border-radius:8px;background:#A8F1F7;color:#000;font-size:0.8rem;font-weight:600;border:none;cursor:pointer">Update Order</button>
+            <button onclick="document.getElementById('editOrderModal').style.display='none'" style="flex:1;padding:0.6rem;border-radius:8px;background:rgba(255,255,255,0.05);color:#fff;font-size:0.8rem;border:1px solid rgba(255,255,255,0.1);cursor:pointer">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>
 </body>
 </html>`;
 }
@@ -890,6 +914,30 @@ async function portfolioPage() {
         return s + eq;
       }, 0);
     } catch {}
+    // Schwab open orders
+    try {
+      const nums = await schwab.getAccountNumbers();
+      const hash = process.env.SCHWAB_ACCOUNT_HASH || nums?.[0]?.hashValue;
+      if (hash) {
+        const SCHWAB_TERMINAL = new Set(["REJECTED","CANCELED","FILLED","EXPIRED","REPLACED"]);
+        const schwabOrders = (await schwab.getOrders(hash) ?? [])
+          .filter(o => !SCHWAB_TERMINAL.has(o.status));
+        openOrders.push(...schwabOrders.map(o => {
+          const leg   = o.orderLegCollection?.[0] ?? {};
+          const instr = (leg.instruction ?? "").toUpperCase();
+          const side  = (instr === "BUY" || instr === "BUY_TO_OPEN") ? "buy" : "sell";
+          return {
+            exchange:   "Schwab",
+            id:         String(o.orderId),
+            asset:      leg.instrument?.symbol ?? "—",
+            side,
+            size:       parseFloat(leg.quantity ?? "0"),
+            limitPrice: parseFloat(o.price ?? "0"),
+            duration:   o.duration ?? "GOOD_TILL_CANCEL",
+          };
+        }));
+      }
+    } catch (e) { console.error("[dashboard] Schwab open orders:", e.message); }
   }
 
   // ── Uniswap positions ───────────────────────────────────────────────────────
@@ -1049,11 +1097,6 @@ async function portfolioPage() {
           const avgPx  = parseFloat(p.averagePrice ?? 0);
           const dayPnl = parseFloat(p.currentDayProfitLoss ?? 0);
           const type   = p.instrument?.assetType ?? "";
-          const isEquity = (type === "EQUITY" || type === "COLLECTIVE_INVESTMENT") && p.longQuantity > 0;
-          const maxC   = isEquity ? Math.floor(p.longQuantity / 100) : 0;
-          const writeBtn = isEquity && maxC > 0
-            ? "<button data-sym='" + sym + "' data-maxc='" + maxC + "' onclick='openSchwabWriteModal(this)' style='font-size:0.68rem;padding:0.2rem 0.55rem;border-radius:5px;border:1px solid rgba(251,191,36,0.35);background:rgba(251,191,36,0.07);color:#fbbf24;cursor:pointer;white-space:nowrap'>Write</button>"
-            : "";
           return "<tr>" +
             "<td style='font-weight:600'>" + sym + (type === "OPTION" ? " <span style='font-size:0.65rem;color:rgba(255,255,255,0.4)'>OPT</span>" : "") + "</td>" +
             "<td><span class='" + (side === "LONG" ? "pos-long" : "pos-short") + "'>" + side + "</span></td>" +
@@ -1061,11 +1104,10 @@ async function portfolioPage() {
             "<td>$" + avgPx.toFixed(2) + "</td>" +
             "<td>$" + mv.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) + "</td>" +
             "<td style='color:" + (dayPnl >= 0 ? "#4ade80" : "#f87171") + "'>" + (dayPnl >= 0 ? "+" : "") + "$" + Math.abs(dayPnl).toFixed(2) + "</td>" +
-            "<td>" + writeBtn + "</td>" +
             "</tr>";
-        }).join("") || "<tr><td colspan='7' style='color:rgba(255,255,255,0.25);text-align:center;padding:1rem'>No open positions</td></tr>";
+        }).join("") || "<tr><td colspan='6' style='color:rgba(255,255,255,0.25);text-align:center;padding:1rem'>No open positions</td></tr>";
         return "<div class='card'><table>" +
-          "<thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Price</th><th>Mkt Value</th><th>Day P&L</th><th></th></tr></thead>" +
+          "<thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Price</th><th>Mkt Value</th><th>Day P&L</th></tr></thead>" +
           "<tbody>" + posRows + "</tbody></table>" +
           "<div style='display:flex;gap:1.5rem;margin-top:0.75rem;font-size:0.78rem;color:rgba(255,255,255,0.45)'>" +
           "<span>Account: <strong style='color:#fafafa'>" + (sa?.accountNumber ?? "—") + "</strong></span>" +
@@ -1074,140 +1116,6 @@ async function portfolioPage() {
           "</div></div>";
       }).join("") : `<p class="hint">No Schwab accounts found or credentials not configured.</p>`}
     </div>
-
-    <!-- Schwab option write modal -->
-    <div class="modal-overlay" id="schwabWriteModal" onclick="if(event.target===this)closeSchwabWrite()">
-      <div class="modal" style="max-width:460px">
-        <div class="modal-title" id="swTitle">Write Option</div>
-        <div class="modal-body" style="display:flex;flex-direction:column;gap:0.75rem;margin-top:0.85rem">
-          <div style="display:flex;gap:0.4rem">
-            <button id="swBtnCall" onclick="swSetType('CALL')" style="flex:1;padding:0.35rem;border-radius:6px;border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.12);color:#fbbf24;font-size:0.78rem;font-weight:600;cursor:pointer">Call</button>
-            <button id="swBtnPut"  onclick="swSetType('PUT')"  style="flex:1;padding:0.35rem;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:transparent;color:rgba(255,255,255,0.4);font-size:0.78rem;cursor:pointer">Put</button>
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Expiration</label>
-            <select id="swExpiry" onchange="swLoadStrikes()" style="width:100%"><option>Loading…</option></select>
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Strike</label>
-            <select id="swStrike" onchange="swUpdatePreview()" style="width:100%"><option>Select expiry first</option></select>
-          </div>
-          <div>
-            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Contracts</label>
-            <input id="swContracts" type="number" min="1" value="1" oninput="swUpdatePreview()" style="width:100%" />
-          </div>
-          <div id="swPreview" style="padding:0.65rem 0.85rem;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:0.8rem;color:rgba(255,255,255,0.6);min-height:2.5rem"></div>
-          <div id="swError" style="color:#f87171;font-size:0.75rem;display:none"></div>
-        </div>
-        <div class="modal-actions">
-          <button class="modal-cancel" onclick="closeSchwabWrite()">Cancel</button>
-          <button id="swSubmit" onclick="submitSchwabWrite()" style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.35);color:#fbbf24;border-radius:7px;padding:0.45rem 1rem;font-size:0.82rem;font-weight:600;cursor:pointer">Sell to Open</button>
-        </div>
-      </div>
-    </div>
-    <script>
-    var _swSym = '', _swType = 'CALL', _swMaxC = 1, _swChain = null;
-
-    function openSchwabWriteModal(btn) {
-      _swSym  = btn.dataset.sym;
-      _swMaxC = parseInt(btn.dataset.maxc) || 1;
-      _swType = 'CALL';
-      document.getElementById('swTitle').textContent = 'Write Option — ' + _swSym;
-      document.getElementById('swContracts').value = _swMaxC;
-      document.getElementById('swContracts').max = _swMaxC;
-      document.getElementById('swExpiry').innerHTML = '<option>Loading…</option>';
-      document.getElementById('swStrike').innerHTML = '<option>Select expiry first</option>';
-      document.getElementById('swPreview').textContent = '';
-      document.getElementById('swError').style.display = 'none';
-      swSetType('CALL');
-      document.getElementById('schwabWriteModal').classList.add('open');
-      swFetchChain();
-    }
-
-    function closeSchwabWrite() {
-      document.getElementById('schwabWriteModal').classList.remove('open');
-    }
-
-    function swSetType(t) {
-      _swType = t;
-      var callBtn = document.getElementById('swBtnCall');
-      var putBtn  = document.getElementById('swBtnPut');
-      var activeStyle  = 'flex:1;padding:0.35rem;border-radius:6px;border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.12);color:#fbbf24;font-size:0.78rem;font-weight:600;cursor:pointer';
-      var inactiveStyle = 'flex:1;padding:0.35rem;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:transparent;color:rgba(255,255,255,0.4);font-size:0.78rem;cursor:pointer';
-      callBtn.style.cssText = t === 'CALL' ? activeStyle : inactiveStyle;
-      putBtn.style.cssText  = t === 'PUT'  ? activeStyle : inactiveStyle;
-      swFetchChain();
-    }
-
-    async function swFetchChain() {
-      _swChain = null;
-      document.getElementById('swExpiry').innerHTML = '<option>Loading…</option>';
-      document.getElementById('swStrike').innerHTML = '<option>Select expiry first</option>';
-      document.getElementById('swPreview').textContent = 'Fetching chain…';
-      try {
-        var r = await fetch('/schwab/chains?symbol=' + encodeURIComponent(_swSym) + '&type=' + _swType);
-        var d = await r.json();
-        if (d.error) throw new Error(d.error);
-        _swChain = d;
-        var exp = document.getElementById('swExpiry');
-        exp.innerHTML = d.expirations.map(function(e) { return '<option value="' + e + '">' + e + '</option>'; }).join('');
-        swLoadStrikes();
-      } catch(e) {
-        document.getElementById('swPreview').textContent = 'Chain error: ' + e.message;
-      }
-    }
-
-    function swLoadStrikes() {
-      if (!_swChain) return;
-      var expiry = document.getElementById('swExpiry').value;
-      var contracts = _swChain.byExpiry[expiry] || [];
-      var sel = document.getElementById('swStrike');
-      sel.innerHTML = contracts.map(function(c) {
-        var label = '$' + c.strike.toFixed(2) + '  mid $' + c.mid.toFixed(2) + (c.delta ? '  Δ' + c.delta.toFixed(2) : '');
-        return '<option value="' + c.symbol + '" data-mid="' + c.mid + '" data-bid="' + c.bid + '" data-ask="' + c.ask + '">' + label + '</option>';
-      }).join('');
-      swUpdatePreview();
-    }
-
-    function swUpdatePreview() {
-      var sel = document.getElementById('swStrike');
-      var opt = sel.options[sel.selectedIndex];
-      if (!opt || !opt.dataset.mid) { document.getElementById('swPreview').textContent = ''; return; }
-      var mid = parseFloat(opt.dataset.mid);
-      var bid = parseFloat(opt.dataset.bid);
-      var ask = parseFloat(opt.dataset.ask);
-      var qty = parseInt(document.getElementById('swContracts').value) || 1;
-      var credit = (mid * qty * 100).toFixed(2);
-      document.getElementById('swPreview').innerHTML =
-        '<strong style="color:#fbbf24">Limit: $' + mid.toFixed(2) + ' mid</strong>' +
-        ' &nbsp;(bid $' + bid.toFixed(2) + ' / ask $' + ask.toFixed(2) + ')' +
-        '<br>Credit: <strong style="color:#4ade80">$' + credit + '</strong> for ' + qty + ' contract' + (qty > 1 ? 's' : '');
-    }
-
-    async function submitSchwabWrite() {
-      var sel  = document.getElementById('swStrike');
-      var optsym = sel.value;
-      if (!optsym) { alert('Select a strike first'); return; }
-      var mid  = parseFloat(sel.options[sel.selectedIndex].dataset.mid);
-      var qty  = parseInt(document.getElementById('swContracts').value) || 1;
-      var btn  = document.getElementById('swSubmit');
-      btn.disabled = true; btn.textContent = 'Placing…';
-      document.getElementById('swError').style.display = 'none';
-      try {
-        var r = await fetch('/schwab/write', { method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ optionSymbol: optsym, contracts: qty, limitPrice: mid }) });
-        var d = await r.json();
-        if (d.error) throw new Error(d.error);
-        btn.textContent = '✓ Order placed';
-        btn.style.color = '#4ade80';
-        setTimeout(closeSchwabWrite, 1500);
-      } catch(e) {
-        document.getElementById('swError').textContent = e.message;
-        document.getElementById('swError').style.display = 'block';
-        btn.disabled = false; btn.textContent = 'Sell to Open';
-      }
-    }
-    </script>
 
     <div id="ppane-uni" style="display:none">
       ${uniOpen.length > 0 ? `<div class="card"><table>
@@ -1235,7 +1143,10 @@ async function portfolioPage() {
           <td><span class="${o.side === "buy" ? "pos-long" : "pos-short"}">${o.side === "buy" ? "▲ BUY" : "▼ SELL"}</span></td>
           <td>${o.size.toFixed(4)}</td>
           <td>$${o.limitPrice.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-          <td><button class="btn btn-red" onclick="cancelOrder('${o.exchange}','${o.id}','${o.asset}',this)">Cancel</button></td>
+          <td style="text-align:right">
+            <button class="btn btn-cyan" style="margin-right:0.4rem;padding:0.2rem 0.6rem;font-size:0.7rem" onclick="showEditOrderModal('${o.exchange}','${o.id}','${o.asset}','${o.side}',${o.size},${o.limitPrice},${JSON.stringify(o.duration||'')})">Edit</button>
+            <button class="btn btn-red" style="padding:0.2rem 0.6rem;font-size:0.7rem" onclick="cancelOrder('${o.exchange}','${o.id}','${o.asset}',this)">Cancel</button>
+          </td>
         </tr>`).join("")}</tbody>
       </table></div>` : `<p class="hint">No open limit orders.</p>`}
     </div>
@@ -1289,13 +1200,47 @@ async function portfolioPage() {
         };
         document.getElementById('openModal').classList.add('open');
       }
-      async function cancelOrder(exchange, orderId, asset, btn) {
-        if (!confirm('Cancel this ' + asset + ' limit order on ' + exchange + '?')) return;
-        btn.textContent = 'Cancelling…'; btn.disabled = true;
-        const res = await fetch('/api/cancel-order', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ exchange, orderId, asset }) });
-        const d = await res.json();
-        if (d.ok) { btn.textContent = 'Cancelled ✓'; setTimeout(() => location.reload(), 800); }
-        else { btn.textContent = 'Error'; btn.disabled = false; alert(d.error); }
+      function showEditOrderModal(exchange, orderId, asset, side, size, limitPrice, duration) {
+        document.getElementById('editOrderTitle').textContent = 'Edit ' + asset + ' Order (' + exchange + ')';
+        document.getElementById('editOrderExchange').value = exchange;
+        document.getElementById('editOrderOrderId').value = orderId;
+        document.getElementById('editOrderAsset').value = asset;
+        document.getElementById('editOrderSide').value = side;
+        document.getElementById('editOrderSize').value = size;
+        document.getElementById('editOrderPrice').value = limitPrice;
+        document.getElementById('editOrderDuration').value = duration || '';
+        document.getElementById('editOrderModal').style.display = 'flex';
+      }
+
+      async function submitEditOrder() {
+        const btn = document.getElementById('editOrderSubmitBtn');
+        const exchange = document.getElementById('editOrderExchange').value;
+        const orderId = document.getElementById('editOrderOrderId').value;
+        const asset = document.getElementById('editOrderAsset').value;
+        const side = document.getElementById('editOrderSide').value;
+        const size = parseFloat(document.getElementById('editOrderSize').value);
+        const limitPrice = parseFloat(document.getElementById('editOrderPrice').value);
+        const duration = document.getElementById('editOrderDuration').value || undefined;
+
+        btn.textContent = 'Updating...'; btn.disabled = true;
+        try {
+          const res = await fetch('/api/edit-order', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ exchange, orderId, asset, side, size, limitPrice, duration })
+          });
+          const d = await res.json();
+          if (d.ok) {
+            btn.textContent = 'Updated ✓';
+            setTimeout(() => location.reload(), 800);
+          } else {
+            alert(d.error || 'Update failed');
+            btn.textContent = 'Update Order'; btn.disabled = false;
+          }
+        } catch (e) {
+          alert(e.message);
+          btn.textContent = 'Update Order'; btn.disabled = false;
+        }
       }
     </script>
   `, "portfolio");
@@ -2425,15 +2370,21 @@ async function tryLocalEvalDash(strategy) {
     const def = await res.json();
     const parseJ = v => { try { return typeof v === "string" ? JSON.parse(v) : v; } catch { return v; } };
     const hasConditions = r => r?.conditions?.length > 0;
-    const entry = hasConditions(parseJ(def.long_entry)) ? parseJ(def.long_entry) : parseJ(def.entry);
-    const exit  = hasConditions(parseJ(def.long_exit))  ? parseJ(def.long_exit)  : parseJ(def.exit);
+    const entry      = hasConditions(parseJ(def.long_entry))  ? parseJ(def.long_entry)  : parseJ(def.entry);
+    const exit       = hasConditions(parseJ(def.long_exit))   ? parseJ(def.long_exit)   : parseJ(def.exit);
+    const shortEntry = hasConditions(parseJ(def.short_entry)) ? parseJ(def.short_entry) : null;
+    const shortExit  = hasConditions(parseJ(def.short_exit))  ? parseJ(def.short_exit)  : null;
 
-    const allConds = [...(entry?.conditions ?? []), ...(exit?.conditions ?? [])];
+    const allConds = [
+      ...(entry?.conditions ?? []), ...(exit?.conditions ?? []),
+      ...(shortEntry?.conditions ?? []), ...(shortExit?.conditions ?? []),
+    ];
     if (!allConds.length) return null;
 
-    const priceFlds     = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
-    const indicatorFlds = new Set(["rsi", "sma", "ema"]);
-    const knownFlds     = new Set([...priceFlds, ...indicatorFlds]);
+    const priceFlds      = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
+    const indicatorFlds  = new Set(["rsi", "sma", "ema"]);
+    const passthroughFlds = new Set(["pct_above_entry", "pct_below_entry"]);
+    const knownFlds      = new Set([...priceFlds, ...indicatorFlds, ...passthroughFlds]);
     if (!allConds.every(c => knownFlds.has((c.field ?? "close").toLowerCase()))) return null;
 
     const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
@@ -2514,9 +2465,40 @@ async function tryLocalEvalDash(strategy) {
       return rules.operator === "AND" ? results.every(Boolean) : results.some(Boolean);
     };
 
-    const signal = hasPosition
-      ? (evalRules(exit)  ? "FLAT" : "LONG")
-      : (evalRules(entry) ? "LONG" : "FLAT");
+    // Funding gate (fail-closed)
+    const risk = parseJ(def.risk) ?? {};
+    let fundingRate = null;
+    if (risk.funding_long_gate != null || risk.funding_short_gate != null) {
+      try {
+        const fRes = await fetch("https://api.hyperliquid.xyz/info", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "metaAndAssetCtxs" }),
+        });
+        const [meta, ctxs] = await fRes.json();
+        const idx = meta.universe.findIndex(a => a.name === asset);
+        if (idx !== -1) fundingRate = parseFloat(ctxs[idx].funding);
+      } catch { /* fail closed */ }
+    }
+    const longGateOk  = risk.funding_long_gate  == null || (fundingRate !== null && fundingRate <= risk.funding_long_gate);
+    const shortGateOk = risk.funding_short_gate == null || (fundingRate !== null && fundingRate >= risk.funding_short_gate);
+
+    let signal;
+    if (shortEntry) {
+      if (hasPosition) {
+        const isLong = parseFloat(position?.szi ?? "0") > 0;
+        signal = isLong
+          ? (evalRules(exit)      ? "FLAT" : "LONG")
+          : (evalRules(shortExit) ? "FLAT" : "SHORT");
+      } else {
+        if      (evalRules(entry)      && longGateOk)  signal = "LONG";
+        else if (evalRules(shortEntry) && shortGateOk) signal = "SHORT";
+        else                                            signal = "FLAT";
+      }
+    } else {
+      signal = hasPosition
+        ? (evalRules(exit)  ? "FLAT" : "LONG")
+        : (evalRules(entry) ? "LONG" : "FLAT");
+    }
 
     return { signal, price };
   } catch {
@@ -2692,7 +2674,11 @@ async function handleRun(body) {
     const account = privateKeyToAccount(PRIVATE_KEY);
     const client = new x402Client();
 
-    const url = `${getSignalUrl()}/api/strategy/${id}/signal`;
+    const defForUrl = await fetch(`${getSignalUrl()}/api/strategy/${id}`).then(r => r.ok ? r.json() : null).catch(() => null);
+    const isScalperStrategy = defForUrl?.risk?.mode === "scalp";
+    const url = isScalperStrategy
+      ? `${getSignalUrl()}/api/scalper/${id}/signal`
+      : `${getSignalUrl()}/api/strategy/${id}/signal`;
     try {
       const probe = await fetch(url);
       console.log(`[run-strategy] probe status: ${probe.status}`);
@@ -2871,19 +2857,33 @@ async function handleAddToPosition(body) {
 
 async function handleCancelOrder(body) {
   const { exchange, orderId, asset } = JSON.parse(body);
+  const exch = await getExchangeInstance(exchange);
+  await exch.cancelOrder(orderId, asset);
+  return { ok: true };
+}
+
+async function handleEditOrder(body) {
+  const { exchange, orderId, asset, side, size, limitPrice, duration } = JSON.parse(body);
+  const exch = await getExchangeInstance(exchange);
+  await exch.editOrder(orderId, asset, side, size, limitPrice, duration);
+  return { ok: true };
+}
+
+async function getExchangeInstance(exchange) {
   const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
   const { KrakenExchange } = await import("./exchanges/kraken.mjs");
   const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
   const { CoinbaseExchange } = await import("./exchanges/coinbase.mjs");
-  const exch = exchange === "Kraken"
+  const { SchwabExchange } = await import("./exchanges/schwab.mjs");
+  return exchange === "Kraken"
     ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
     : exchange === "Alpaca"
     ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
     : exchange === "Coinbase"
     ? new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE)
+    : exchange === "Schwab"
+    ? new SchwabExchange(process.env.SCHWAB_API_KEY, process.env.SCHWAB_APP_SECRET)
     : new HyperliquidExchange(PRIVATE_KEY);
-  await exch.cancelOrder(orderId, asset);
-  return { ok: true };
 }
 
 
@@ -2924,6 +2924,77 @@ async function premiumFadePage() {
     else signals = data;
   } catch (e) { fetchError = e.message; }
 
+  const schwab = getSchwabClient();
+  const schwabReady = !!schwab?.isAuthorized();
+
+  // Fetch short option positions from Schwab
+  let shortOptionPositions = [];
+  if (schwabReady) {
+    try {
+      const raw = await schwab.getAccounts(true);
+      const accounts = Array.isArray(raw) ? raw : [];
+      for (const a of accounts) {
+        for (const p of (a.securitiesAccount?.positions ?? [])) {
+          if (p.instrument?.assetType === "OPTION" && parseFloat(p.shortQuantity ?? 0) > 0) {
+            shortOptionPositions.push(p);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // Parse OCC symbol → { underlying, expiry, type, strike }
+  function parseOCC(sym) {
+    const root   = sym.slice(0, 6).trim();
+    const expiry = "20" + sym.slice(6, 8) + "-" + sym.slice(8, 10) + "-" + sym.slice(10, 12);
+    const type   = sym[12] === "C" ? "call" : "put";
+    const strike = parseInt(sym.slice(13), 10) / 1000;
+    return { underlying: root, expiry, type, strike };
+  }
+
+  // Build a lookup map: "TICKER|type|strike|expiry" → signal
+  const signalMap = {};
+  for (const s of (signals.open ?? [])) {
+    if (s.ticker && s.option_type && s.strike && s.expiration) {
+      const key = s.ticker + "|" + s.option_type + "|" + parseFloat(s.strike) + "|" + s.expiration;
+      signalMap[key] = s;
+    }
+  }
+
+  const positionRows = shortOptionPositions.map(p => {
+    const sym      = p.instrument?.symbol ?? "";
+    const occ      = parseOCC(sym);
+    const shortQty = parseFloat(p.shortQuantity ?? 0);
+    const entry    = parseFloat(p.averagePrice ?? 0);
+    const mv       = parseFloat(p.marketValue ?? 0);          // negative = liability
+    const current  = shortQty > 0 ? Math.abs(mv) / shortQty / 100 : 0;
+    const unrealPnl = (entry - current) * shortQty * 100;
+    const dayPnl   = parseFloat(p.currentDayProfitLoss ?? 0);
+    const typeColor = occ.type === "call" ? "#4ade80" : "#f87171";
+    const pnlColor  = unrealPnl >= 0 ? "#4ade80" : "#f87171";
+    const key = occ.underlying + "|" + occ.type + "|" + occ.strike + "|" + occ.expiry;
+    const sig = signalMap[key];
+    const targetCell = sig?.target_price != null
+      ? `<span style="color:#4ade80">$${parseFloat(sig.target_price).toFixed(2)}</span>`
+      : "—";
+    const stopCell = sig?.stop_price != null
+      ? `<span style="color:#f87171">$${parseFloat(sig.stop_price).toFixed(2)}</span>`
+      : "—";
+    const closeBtn = `<button onclick="openFadeModal('${occ.underlying}','${occ.type}',${occ.strike},'${occ.expiry}','BUY_TO_CLOSE',this)" style="font-size:0.68rem;padding:0.2rem 0.6rem;border-radius:5px;border:1px solid rgba(248,113,113,0.35);background:rgba(248,113,113,0.07);color:#f87171;cursor:pointer;white-space:nowrap">Close</button>`;
+    return `<tr>
+      <td style="font-weight:600">${occ.underlying} <span style="color:rgba(255,255,255,0.35);font-size:0.72rem">$${occ.strike % 1 === 0 ? occ.strike.toFixed(0) : occ.strike.toFixed(2)} ${occ.type.toUpperCase()}</span></td>
+      <td style="font-size:0.75rem;color:rgba(255,255,255,0.5)">${occ.expiry}</td>
+      <td style="text-align:right">${shortQty}</td>
+      <td style="text-align:right;color:#fbbf24">$${entry.toFixed(2)}</td>
+      <td style="text-align:right;color:rgba(255,255,255,0.6)">$${current.toFixed(2)}</td>
+      <td style="text-align:right;color:${pnlColor};font-weight:600">${unrealPnl >= 0 ? "+" : ""}$${Math.abs(unrealPnl).toFixed(2)}</td>
+      <td style="text-align:right;color:${dayPnl >= 0 ? "#4ade80" : "#f87171"}">${dayPnl >= 0 ? "+" : ""}$${Math.abs(dayPnl).toFixed(2)}</td>
+      <td style="text-align:right">${targetCell}</td>
+      <td style="text-align:right">${stopCell}</td>
+      <td>${closeBtn}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="10" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No written positions</td></tr>`;
+
   const statusColor = { open: "#A8F1F7", target_hit: "#4ade80", stopped_out: "#f87171", expired: "rgba(255,255,255,0.25)", closed: "rgba(255,255,255,0.4)" };
   const statusLabel = { open: "Open", target_hit: "Target Hit", stopped_out: "Stopped Out", expired: "Expired", closed: "Closed" };
 
@@ -2935,6 +3006,9 @@ async function premiumFadePage() {
     const vel = s.velocity_pct != null ? (s.velocity_pct > 0 ? "+" : "") + s.velocity_pct.toFixed(1) + "%" : "—";
     const iv  = s.curr_iv != null ? (s.curr_iv * 100).toFixed(1) + "%" : "—";
     const pnl = s.pnl != null ? (s.pnl >= 0 ? "+" : "") + "$" + Math.abs(s.pnl).toFixed(2) : "";
+    const writeBtn = isOpen && schwabReady && s.ticker && s.option_type && s.strike && s.expiration
+      ? `<button onclick="openFadeModal('${s.ticker}','${s.option_type}',${parseFloat(s.strike)},'${s.expiration}','SELL_TO_OPEN',this)" style="font-size:0.68rem;padding:0.2rem 0.6rem;border-radius:5px;border:1px solid rgba(251,191,36,0.35);background:rgba(251,191,36,0.07);color:#fbbf24;cursor:pointer;white-space:nowrap">Write</button>`
+      : "";
     return `<tr style="${isOpen ? "" : "opacity:0.65"}">
       <td style="font-weight:600">${s.ticker}</td>
       <td style="color:${typeColor};font-weight:600">${(s.option_type ?? "").toUpperCase()}</td>
@@ -2948,39 +3022,183 @@ async function premiumFadePage() {
       <td style="text-align:right;color:#f87171">${s.stop_price != null ? "$" + parseFloat(s.stop_price).toFixed(2) : "—"}</td>
       <td><span style="color:${color};font-size:0.72rem;font-weight:600">${label}</span></td>
       ${pnl ? `<td style="color:${s.pnl >= 0 ? "#4ade80" : "#f87171"};font-weight:600">${pnl}</td>` : "<td>—</td>"}
+      <td>${writeBtn}</td>
     </tr>`;
   }
 
-  const openRows   = (signals.open   ?? []).map(signalRow).join("") || `<tr><td colspan="12" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No open signals</td></tr>`;
-  const recentRows = (signals.recent ?? []).map(signalRow).join("") || `<tr><td colspan="12" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No recent closed signals</td></tr>`;
+  const cols = 13;
+  const openRows   = (signals.open   ?? []).map(signalRow).join("") || `<tr><td colspan="${cols}" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No open signals</td></tr>`;
+  const recentRows = (signals.recent ?? []).map(signalRow).join("") || `<tr><td colspan="${cols}" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No recent closed signals</td></tr>`;
 
   const tableHead = `<thead><tr>
     <th>Ticker</th><th>Type</th><th>Strike</th><th>Expiry</th>
     <th style="text-align:right">DTE</th><th style="text-align:right">Velocity</th>
     <th style="text-align:right">IV</th><th style="text-align:right">Entry</th>
     <th style="text-align:right">Target</th><th style="text-align:right">Stop</th>
-    <th>Status</th><th>P&L</th>
+    <th>Status</th><th>P&L</th>${schwabReady ? "<th></th>" : ""}
   </tr></thead>`;
 
   return shell("Premium Fade", `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem">
       <div>
         <h1 style="font-size:1.5rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">Premium Fade Signals</h1>
         <p style="font-size:0.78rem;color:rgba(255,255,255,0.35);margin-top:0.2rem">${user.email} · ${user.tier}</p>
       </div>
       <a href="/premium-fade" style="font-size:0.78rem;color:rgba(255,255,255,0.4);padding:0.35rem 0.75rem;border:1px solid rgba(255,255,255,0.1);border-radius:6px;text-decoration:none">↻ Refresh</a>
     </div>
+    <div style="display:flex;align-items:center;gap:1.25rem;margin-bottom:1.5rem">
+      <span style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.35)">Exchange</span>
+      <label style="display:flex;align-items:center;gap:0.45rem;cursor:pointer">
+        <input type="radio" name="fadeExchange" value="Schwab" ${schwabReady ? "checked" : "disabled"}
+          onchange="_fadeExchange=this.value"
+          style="accent-color:#A8F1F7;width:14px;height:14px;cursor:pointer" />
+        <span style="font-size:0.82rem;color:${schwabReady ? "#fafafa" : "rgba(255,255,255,0.3)"}">Schwab</span>
+        ${!schwabReady ? `<span style="font-size:0.68rem;color:rgba(255,255,255,0.25)">(not connected)</span>` : ""}
+      </label>
+      <label style="display:flex;align-items:center;gap:0.45rem;cursor:not-allowed">
+        <input type="radio" name="fadeExchange" value="Alpaca" disabled
+          style="accent-color:#A8F1F7;width:14px;height:14px;cursor:not-allowed;opacity:0.3" />
+        <span style="font-size:0.82rem;color:rgba(255,255,255,0.3)">Alpaca</span>
+        <span style="font-size:0.68rem;color:rgba(255,255,255,0.2)">coming soon</span>
+      </label>
+    </div>
     ${fetchError ? `<div style="color:#f87171;margin-bottom:1rem;font-size:0.82rem">⚠ ${fetchError}</div>` : ""}
     ${signals.tickers?.length > 0 ? `<div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:1.25rem">${signals.tickers.map(t => `<span style="padding:0.15rem 0.55rem;border-radius:999px;background:rgba(168,241,247,0.08);border:1px solid rgba(168,241,247,0.2);font-size:0.72rem;color:#A8F1F7;font-weight:600">${t}</span>`).join("")}</div>` : ""}
-    ${signals.noTickers ? `<div class="card" style="text-align:center;padding:2rem"><p style="color:rgba(255,255,255,0.4);margin-bottom:0.5rem">No tickers in your watchlist yet.</p><a href="${getSignalUrl()}/premium-fade" target="_blank" rel="noopener noreferrer" style="color:#A8F1F7;font-size:0.82rem">Add tickers at agentsignal.app/premium-fade →</a></div>` : `
-    <div class="section-label">Open Positions</div>
+    ${schwabReady ? `
+    <div class="section-label">Positions</div>
     <div class="card" style="overflow-x:auto">
-      <table>${tableHead}<tbody>${openRows}</tbody></table>
+      <table>
+        <thead><tr>
+          <th>Contract</th><th>Expiry</th><th style="text-align:right">Qty</th>
+          <th style="text-align:right">Entry</th><th style="text-align:right">Current</th>
+          <th style="text-align:right">Unrealized P&L</th><th style="text-align:right">Day P&L</th>
+          <th style="text-align:right">Target</th><th style="text-align:right">Stop</th><th></th>
+        </tr></thead>
+        <tbody>${positionRows}</tbody>
+      </table>
+    </div>` : ""}
+    ${signals.noTickers ? `<div class="card" style="text-align:center;padding:2rem"><p style="color:rgba(255,255,255,0.4);margin-bottom:0.5rem">No tickers in your watchlist yet.</p><a href="${getSignalUrl()}/premium-fade" target="_blank" rel="noopener noreferrer" style="color:#A8F1F7;font-size:0.82rem">Add tickers at agentsignal.app/premium-fade →</a></div>` : `
+    <div class="section-label">Active Signals</div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <div style="overflow:auto;max-height:800px">
+        <table style="min-width:100%">${tableHead}<tbody>${openRows}</tbody></table>
+      </div>
     </div>
-    <div class="section-label" style="margin-top:1.5rem">Recent (30 days)</div>
+    <div class="section-label" style="margin-top:1.5rem">Signal History (30 days)</div>
     <div class="card" style="overflow-x:auto">
       <table>${tableHead}<tbody>${recentRows}</tbody></table>
     </div>`}
+
+    ${schwabReady ? `
+    <!-- Fade order modal (write + close) -->
+    <div id="fadeWriteModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:100;align-items:center;justify-content:center">
+      <div style="background:#111113;border:1px solid rgba(255,255,255,0.12);border-radius:14px;padding:1.75rem;max-width:380px;width:90%">
+        <div id="fadeWriteTitle" style="font-size:1rem;font-weight:700;color:#fafafa;margin-bottom:1.25rem"></div>
+        <div id="fadeWriteDetails" style="padding:0.85rem 1rem;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:0.85rem;color:rgba(255,255,255,0.75);line-height:1.8;margin-bottom:1rem"></div>
+        <div style="margin-bottom:1rem">
+          <label style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.06em;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.35rem">Limit Price</label>
+          <input id="fadeWritePrice" type="number" step="0.01" min="0.01"
+            oninput="updateFadeCredit()"
+            style="width:100%;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:0.5rem 0.75rem;color:#fafafa;font-size:0.95rem;outline:none" />
+          <div id="fadeWriteCredit" style="margin-top:0.4rem;font-size:0.78rem;color:rgba(255,255,255,0.4)"></div>
+        </div>
+        <div id="fadeWriteError" style="color:#f87171;font-size:0.75rem;margin-bottom:0.75rem;display:none"></div>
+        <div style="display:flex;gap:0.5rem">
+          <button onclick="closeFadeWrite()" style="flex:1;padding:0.55rem;border-radius:8px;background:transparent;border:1px solid rgba(255,255,255,0.12);color:rgba(255,255,255,0.5);font-size:0.82rem;cursor:pointer">Cancel</button>
+          <button id="fadeWriteSubmit" onclick="submitFadeWrite()" style="flex:1;padding:0.55rem;border-radius:8px;font-size:0.82rem;font-weight:600;cursor:pointer"></button>
+        </div>
+      </div>
+    </div>
+    <script>
+    var _fadeData = null;
+    var _fadeExchange = 'Schwab';
+
+    async function openFadeModal(ticker, type, strike, expiry, instruction, btn) {
+      var orig = btn.textContent;
+      btn.disabled = true; btn.textContent = '…';
+      try {
+        var r = await fetch('/schwab/option-mid?ticker=' + encodeURIComponent(ticker) +
+          '&type=' + encodeURIComponent(type) + '&strike=' + strike + '&expiry=' + encodeURIComponent(expiry));
+        var d = await r.json();
+        if (d.error) throw new Error(d.error);
+        _fadeData = { ...d, instruction: instruction };
+
+        var isSTO = instruction === 'SELL_TO_OPEN';
+        var typeLabel = type[0].toUpperCase() + type.slice(1).toLowerCase();
+        var accentColor = isSTO ? '#fbbf24' : '#f87171';
+
+        document.getElementById('fadeWriteTitle').textContent = isSTO ? 'Sell to Open' : 'Buy to Close';
+        document.getElementById('fadeWriteDetails').innerHTML =
+          '<strong style="color:#fafafa">' + ticker + ' $' + strike + ' ' + typeLabel + '</strong>' +
+          ' &nbsp;<span style="color:rgba(255,255,255,0.35);font-size:0.8rem">' + expiry + '</span><br>' +
+          'Bid: <span style="color:rgba(255,255,255,0.6)">$' + d.bid.toFixed(2) + '</span>' +
+          ' &nbsp;·&nbsp; Mid: <strong style="color:' + accentColor + '">$' + d.mid.toFixed(2) + '</strong>' +
+          ' &nbsp;·&nbsp; Ask: <span style="color:rgba(255,255,255,0.6)">$' + d.ask.toFixed(2) + '</span>';
+
+        var priceInput = document.getElementById('fadeWritePrice');
+        priceInput.value = d.mid.toFixed(2);
+
+        var submitBtn = document.getElementById('fadeWriteSubmit');
+        submitBtn.textContent = isSTO ? 'Sell to Open' : 'Buy to Close';
+        submitBtn.style.cssText = isSTO
+          ? 'flex:1;padding:0.55rem;border-radius:8px;font-size:0.82rem;font-weight:600;cursor:pointer;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.35);color:#fbbf24'
+          : 'flex:1;padding:0.55rem;border-radius:8px;font-size:0.82rem;font-weight:600;cursor:pointer;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.35);color:#f87171';
+        submitBtn.disabled = false;
+
+        document.getElementById('fadeWriteError').style.display = 'none';
+        updateFadeCredit();
+        document.getElementById('fadeWriteModal').style.display = 'flex';
+      } catch(e) {
+        alert('Could not fetch price: ' + e.message);
+      } finally {
+        btn.disabled = false; btn.textContent = orig;
+      }
+    }
+
+    function updateFadeCredit() {
+      if (!_fadeData) return;
+      var price = parseFloat(document.getElementById('fadeWritePrice').value) || 0;
+      var isSTO = _fadeData.instruction === 'SELL_TO_OPEN';
+      var total = (price * 100).toFixed(2);
+      document.getElementById('fadeWriteCredit').textContent = isSTO
+        ? 'Credit: $' + total + ' per contract'
+        : 'Cost: $' + total + ' per contract';
+    }
+
+    function closeFadeWrite() {
+      document.getElementById('fadeWriteModal').style.display = 'none';
+      _fadeData = null;
+    }
+
+    async function submitFadeWrite() {
+      if (!_fadeData) return;
+      var price = parseFloat(document.getElementById('fadeWritePrice').value);
+      if (!price || price <= 0) {
+        document.getElementById('fadeWriteError').textContent = 'Enter a valid limit price.';
+        document.getElementById('fadeWriteError').style.display = 'block';
+        return;
+      }
+      var btn = document.getElementById('fadeWriteSubmit');
+      btn.disabled = true; btn.textContent = 'Placing…';
+      document.getElementById('fadeWriteError').style.display = 'none';
+      try {
+        var r = await fetch('/schwab/write', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ optionSymbol: _fadeData.symbol, contracts: 1, limitPrice: price, instruction: _fadeData.instruction })
+        });
+        var d = await r.json();
+        if (d.error) throw new Error(d.error);
+        btn.textContent = '✓ Order placed';
+        btn.style.color = '#4ade80';
+        setTimeout(closeFadeWrite, 1200);
+      } catch(e) {
+        document.getElementById('fadeWriteError').textContent = e.message;
+        document.getElementById('fadeWriteError').style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = _fadeData.instruction === 'SELL_TO_OPEN' ? 'Sell to Open' : 'Buy to Close';
+      }
+    }
+    </script>` : ""}
   `, "premium-fade");
 }
 
@@ -3573,6 +3791,11 @@ const server = createServer(async (req, res) => {
       return json(await handleCancelOrder(body).catch(e => ({ ok: false, error: e.message })));
     }
 
+    if (url === "/api/edit-order" && method === "POST") {
+      const body = await readBody();
+      return json(await handleEditOrder(body).catch(e => ({ ok: false, error: e.message })));
+    }
+
     if (url === "/api/pm2-status" && method === "GET") {
       try {
         const { exec } = await import("child_process");
@@ -3648,6 +3871,33 @@ const server = createServer(async (req, res) => {
 
     // ── Schwab option writing ─────────────────────────────────────────────────
 
+    if (url.startsWith("/schwab/option-mid") && method === "GET") {
+      try {
+        const sc = getSchwabClient();
+        if (!sc?.isAuthorized()) return json({ error: "Schwab not authorized" }, 401);
+        const qs     = new URL("http://x" + url).searchParams;
+        const ticker = qs.get("ticker");
+        const type   = (qs.get("type") || "CALL").toUpperCase();
+        const strike = parseFloat(qs.get("strike") || "0");
+        const expiry = qs.get("expiry"); // YYYY-MM-DD
+        if (!ticker || !strike || !expiry) return json({ error: "ticker, strike, expiry required" }, 400);
+        const raw = await sc.getOptionChain(ticker, { contractType: type, strikeCount: 100, fromDate: expiry, toDate: expiry });
+        const map = type === "PUT" ? raw?.putExpDateMap : raw?.callExpDateMap;
+        if (!map) return json({ error: "No chain data for " + ticker }, 404);
+        for (const strikes of Object.values(map)) {
+          for (const contracts of Object.values(strikes)) {
+            for (const c of contracts) {
+              if (Math.abs(c.strikePrice - strike) < 0.01 && !c.nonStandard) {
+                const mid = parseFloat((((c.bid ?? 0) + (c.ask ?? 0)) / 2).toFixed(2));
+                return json({ symbol: c.symbol, mid, bid: c.bid ?? 0, ask: c.ask ?? 0, dte: c.daysToExpiration ?? null });
+              }
+            }
+          }
+        }
+        return json({ error: "Contract not found for " + ticker + " $" + strike + " " + type + " " + expiry }, 404);
+      } catch (e) { return json({ error: e.message }, 500); }
+    }
+
     if (url.startsWith("/schwab/chains") && method === "GET") {
       try {
         const sc = getSchwabClient();
@@ -3693,19 +3943,21 @@ const server = createServer(async (req, res) => {
       try {
         const sc = getSchwabClient();
         if (!sc?.isAuthorized()) return json({ error: "Schwab not authorized" }, 401);
-        const { optionSymbol, contracts, limitPrice } = JSON.parse(await readBody());
+        const { optionSymbol, contracts, limitPrice, instruction = "SELL_TO_OPEN" } = JSON.parse(await readBody());
         if (!optionSymbol || !contracts || !limitPrice) return json({ error: "optionSymbol, contracts, limitPrice required" }, 400);
+        const validInstructions = ["SELL_TO_OPEN", "BUY_TO_CLOSE"];
+        if (!validInstructions.includes(instruction)) return json({ error: "invalid instruction" }, 400);
         const nums = await sc.getAccountNumbers();
         const hash = process.env.SCHWAB_ACCOUNT_HASH || nums?.[0]?.hashValue;
         if (!hash) return json({ error: "No account hash found" }, 500);
         await sc.placeOrder(hash, {
           orderType:          "LIMIT",
           session:            "NORMAL",
-          duration:           "DAY",
-          price:              parseFloat(limitPrice.toFixed(2)),
+          duration:           "GOOD_TILL_CANCEL",
+          price:              parseFloat(parseFloat(limitPrice).toFixed(2)),
           orderStrategyType:  "SINGLE",
           orderLegCollection: [{
-            instruction: "SELL_TO_OPEN",
+            instruction,
             quantity:    parseInt(contracts),
             instrument:  { symbol: optionSymbol, assetType: "OPTION" },
           }],
