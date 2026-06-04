@@ -94,7 +94,7 @@ import {
   getPriorSignal, insertTrade, isStrategyDue, touchStrategyRun,
   insertSignalEvent, setTpState, getTpState, updateTpTrailMode,
   updateTpHighWater, clearTpState, logFetch, getLastTradeTime,
-  setSubscriptionExpiry,
+  setSubscriptionExpiry, getLastStrategyEntry,
 } from "./db.mjs";
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
@@ -220,12 +220,7 @@ async function tryLocalEval(strategy, def) {
     if (!def) return null;
     const parse = v => typeof v === "string" ? JSON.parse(v) : v;
 
-    // Crypto RADAR gate — must check before any local eval attempt
     const risk = parse(def.risk) ?? {};
-    if (risk.crypto_radar_long_gate != null || risk.crypto_radar_short_gate != null) {
-      console.log(`[trader] 📡 Crypto RADAR gate configured — deferring to server`);
-      return null;
-    }
 
     const hasConditions = r => r?.conditions?.length > 0;
     const entry       = hasConditions(parse(def.long_entry))  ? parse(def.long_entry)  : parse(def.entry);
@@ -243,13 +238,11 @@ async function tryLocalEval(strategy, def) {
     const indicatorFlds = new Set(["rsi", "sma", "ema"]);
     const passthroughFlds = new Set(["pct_above_entry", "pct_below_entry"]);
     const knownFlds     = new Set([...priceFlds, ...indicatorFlds, ...passthroughFlds]);
-    if (!allConds.every(c => knownFlds.has((c.field ?? "close").toLowerCase()))) return null;
 
     const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
     const exchange = getExchange(strategy);
 
-    const needsCandles = allConds.some(c => indicatorFlds.has((c.field ?? "close").toLowerCase()));
-
+    // Fetch position first — needed to decide whether RADAR gate applies
     const [price, position] = await Promise.all([
       withRetry(() => exchange.getMidPrice(asset)),
       withRetry(() => exchange.getPosition(asset)),
@@ -257,19 +250,38 @@ async function tryLocalEval(strategy, def) {
     if (!price) return null;
 
     const hasPosition = parseFloat(position?.szi ?? "0") !== 0;
+    const isLong      = parseFloat(position?.szi ?? "0") > 0;
+
+    // Crypto RADAR gate blocks new entries only — if flat, defer entry decision to server.
+    // When already in a position, evaluate exit conditions locally; RADAR is irrelevant to exits.
+    if (!hasPosition && (risk.crypto_radar_long_gate != null || risk.crypto_radar_short_gate != null)) {
+      console.log(`[trader] 📡 Crypto RADAR gate configured — deferring entry signal to server`);
+      return null;
+    }
+
+    // When in a position, only the relevant exit conditions matter.
+    // Unknown fields in entry rules (e.g. macd_cross) shouldn't block exit evaluation.
+    const relevantConds = hasPosition
+      ? (isLong ? [...(exit?.conditions ?? [])] : [...(shortExit?.conditions ?? [])])
+      : allConds;
+
+    if (!relevantConds.length) return null;
+    if (!relevantConds.every(c => knownFlds.has((c.field ?? "close").toLowerCase()))) return null;
+
+    const needsCandles = relevantConds.some(c => indicatorFlds.has((c.field ?? "close").toLowerCase()));
 
     // Fetch candles + compute indicators if needed
     const indicatorValues = {};
     if (needsCandles) {
       if (typeof exchange.getCandles !== "function") return null; // exchange doesn't support candles
       const defaultInterval = minutesToInterval(strategy.interval_minutes ?? 60);
-      const intervals = new Set(allConds.map(c => c.interval ?? defaultInterval));
+      const intervals = new Set(relevantConds.map(c => c.interval ?? defaultInterval));
       const candlesByInterval = {};
       for (const iv of intervals) {
         const candles = await withRetry(() => exchange.getCandles(asset, iv, 100));
         candlesByInterval[iv] = candles.map(c => parseFloat(c.c));
       }
-      for (const c of allConds) {
+      for (const c of relevantConds) {
         const field = (c.field ?? "close").toLowerCase();
         if (!indicatorFlds.has(field)) continue;
         const iv     = c.interval ?? defaultInterval;
@@ -839,13 +851,17 @@ if (AGENT_API_KEY && AGENT_SIGNAL_URL) {
   try {
     const snapshot = strategies.map(s => {
       const latest = getLatestSignal(s.id);
+      const signal = latest?.signal ?? "FLAT";
+      const entry = signal !== "FLAT" ? getLastStrategyEntry(s.id) : null;
       return {
         strategy_id:   s.id,
         strategy_name: s.name,
         asset:         s.symbol,
         exchange:      s.exchange ?? "hyperliquid",
-        signal:        latest?.signal ?? "FLAT",
+        signal,
         signal_price:  latest?.price ?? null,
+        entry_price:   entry?.price ?? null,
+        leverage:      entry?.leverage ?? s.leverage ?? 1,
       };
     });
     const res = await fetch(`${AGENT_SIGNAL_URL}/api/account/positions`, {

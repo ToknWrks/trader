@@ -360,6 +360,14 @@ export function getLastEntryPrice(asset) {
   return getLastEntry(asset)?.price ?? null;
 }
 
+export function getLastStrategyEntry(strategy_id) {
+  return db.prepare(`
+    SELECT price, leverage, size FROM trades
+    WHERE strategy_id = ? AND action LIKE 'ENTERED%'
+    ORDER BY created_at DESC LIMIT 1
+  `).get(strategy_id) ?? null;
+}
+
 export function getAllRecentTrades(limit = 50) {
   return db.prepare(`
     SELECT t.*, s.name as strategy_name FROM trades t
