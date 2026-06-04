@@ -143,6 +143,7 @@ export class SchwabClient {
     });
     if (res.status === 204) return null;
     const text = await res.text();
+    if (!text && res.ok) return null;
     let json;
     try { json = JSON.parse(text); } catch { throw new Error("Schwab " + res.status + ": " + text); }
     if (!res.ok) throw new Error("Schwab " + res.status + ": " + (json?.message ?? JSON.stringify(json)));

@@ -375,6 +375,91 @@ export function getLastTradeTime(strategy_id) {
   return row?.last_at ?? null;
 }
 
+// ── Wallets ───────────────────────────────────────────────────────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS wallets (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    key               TEXT NOT NULL,
+    use_for_trading   INTEGER NOT NULL DEFAULT 1,
+    show_on_portfolio INTEGER NOT NULL DEFAULT 1,
+    show_on_uniswap   INTEGER NOT NULL DEFAULT 1,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`);
+
+export function maybeCreateDefaultWallet(key) {
+  const count = db.prepare("SELECT COUNT(*) as c FROM wallets").get().c;
+  if (count === 0 && key) {
+    db.prepare(`
+      INSERT INTO wallets (id, name, key, use_for_trading, show_on_portfolio, show_on_uniswap)
+      VALUES ('wallet-default', 'Default', ?, 1, 1, 1)
+    `).run(key);
+  }
+}
+
+export function listWallets() {
+  return db.prepare("SELECT * FROM wallets ORDER BY created_at ASC").all();
+}
+
+export function insertWallet({ id, name, key }) {
+  db.prepare(`
+    INSERT INTO wallets (id, name, key, use_for_trading, show_on_portfolio, show_on_uniswap)
+    VALUES (?, ?, ?, 0, 1, 1)
+  `).run(id, name, key);
+}
+
+export function deleteWallet(id) {
+  db.prepare("DELETE FROM wallets WHERE id = ?").run(id);
+}
+
+export function updateWalletFlags(id, flags) {
+  const fields = [];
+  const values = [];
+  if (flags.show_on_portfolio !== undefined) { fields.push("show_on_portfolio = ?"); values.push(flags.show_on_portfolio ? 1 : 0); }
+  if (flags.show_on_uniswap   !== undefined) { fields.push("show_on_uniswap = ?");   values.push(flags.show_on_uniswap   ? 1 : 0); }
+  if (flags.name              !== undefined) { fields.push("name = ?");               values.push(flags.name); }
+  if (!fields.length) return;
+  values.push(id);
+  db.prepare(`UPDATE wallets SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+}
+
+export function setTradingWallet(id) {
+  db.prepare("UPDATE wallets SET use_for_trading = 0").run();
+  db.prepare("UPDATE wallets SET use_for_trading = 1 WHERE id = ?").run(id);
+}
+
+// ── Staking contracts ─────────────────────────────────────────────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS staking_contracts (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    chain        TEXT NOT NULL DEFAULT 'arbitrum',
+    address      TEXT NOT NULL,
+    token_symbol TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`);
+
+export function listStakingContracts() {
+  return db.prepare("SELECT * FROM staking_contracts ORDER BY created_at ASC").all();
+}
+
+try { db.exec("ALTER TABLE staking_contracts ADD COLUMN token_address TEXT"); } catch {}
+
+export function insertStakingContract({ id, name, chain, address, token_symbol, token_address }) {
+  db.prepare(`
+    INSERT INTO staking_contracts (id, name, chain, address, token_symbol, token_address)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, name, chain, address, token_symbol ?? null, token_address ?? null);
+}
+
+export function deleteStakingContract(id) {
+  db.prepare("DELETE FROM staking_contracts WHERE id = ?").run(id);
+}
+
 // ── Account snapshots (equity curve) ─────────────────────────────────────────
 
 db.exec(`

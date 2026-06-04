@@ -10,7 +10,7 @@ import {
   createPublicClient, createWalletClient, http, formatUnits, getAddress,
   keccak256, encodeAbiParameters, decodeEventLog, parseAbiItem,
 } from "viem";
-import { base } from "viem/chains";
+import { base, arbitrum, mainnet } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -299,6 +299,160 @@ export async function getV3Positions(walletAddress) {
     return {
       tokenId: p.tokenId.toString(),
       version: 'v3',
+      token0: { address: token0Addr, symbol: meta0.symbol, decimals: meta0.decimals, priceUsd: p0Usd },
+      token1: { address: token1Addr, symbol: meta1.symbol, decimals: meta1.decimals, priceUsd: p1Usd },
+      fee, feeDisplay: formatFee(fee), tickLower, tickUpper,
+      priceLower: tickToPrice(tickLower, meta0.decimals, meta1.decimals).toFixed(6),
+      priceUpper: tickToPrice(tickUpper, meta0.decimals, meta1.decimals).toFixed(6),
+      liquidity: liquidity.toString(), hasLiquidity: liquidity > 0n, inRange,
+      fees0, fees1, fees0Usd, fees1Usd,
+      totalFeesUsd: fees0Usd !== null && fees1Usd !== null ? fees0Usd + fees1Usd : null,
+      amount0, amount1,
+      amount0Usd: p0Usd !== null ? amount0 * p0Usd : null,
+      amount1Usd: p1Usd !== null ? amount1 * p1Usd : null,
+      totalLiquidityUsd: p0Usd !== null && p1Usd !== null ? amount0 * p0Usd + amount1 * p1Usd : null,
+      hasFees: rawFees0 > 0n || rawFees1 > 0n,
+    };
+  });
+
+  return { positions };
+}
+
+// ── Multi-chain V3 ───────────────────────────────────────────────────────────
+
+const CHAIN_CONFIG = {
+  base: {
+    viemChain: base,
+    rpc: () => { const k = process.env.ALCHEMY_API_KEY; return k ? `https://base-mainnet.g.alchemy.com/v2/${k}` : 'https://mainnet.base.org'; },
+    weth: '0x4200000000000000000000000000000000000006',
+    npm: '0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1',
+    factory: '0x33128a8fC17869897dcE68Ed026d694621f6FDfD',
+    llamaPrefix: 'base',
+  },
+  arbitrum: {
+    viemChain: arbitrum,
+    rpc: () => { const k = process.env.ALCHEMY_API_KEY; return k ? `https://arb-mainnet.g.alchemy.com/v2/${k}` : 'https://arb1.arbitrum.io/rpc'; },
+    weth: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1',
+    npm: '0xC36442b4a4522E871399CD717aBDD847Ab11FE88',
+    factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984',
+    llamaPrefix: 'arbitrum',
+  },
+  ethereum: {
+    viemChain: mainnet,
+    rpc: () => { const k = process.env.ALCHEMY_API_KEY; return k ? `https://eth-mainnet.g.alchemy.com/v2/${k}` : 'https://eth.llamarpc.com'; },
+    weth: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+    npm: '0xC36442b4a4522E871399CD717aBDD847Ab11FE88',
+    factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984',
+    llamaPrefix: 'ethereum',
+  },
+};
+
+async function getDeFiLlamaPricesForChain(addrs, chainPrefix) {
+  const keys = [...new Set(addrs.map(a => `${chainPrefix}:${a.toLowerCase()}`))];
+  try {
+    const res = await fetch(`https://coins.llama.fi/prices/current/${keys.join(',')}`);
+    if (!res.ok) return {};
+    const data = await res.json();
+    const out = {};
+    for (const [k, v] of Object.entries(data.coins ?? {})) out[k.replace(`${chainPrefix}:`, '')] = v.price;
+    return out;
+  } catch { return {}; }
+}
+
+export async function getV3PositionsForChain(walletAddress, chainId = 'arbitrum') {
+  const cfg = CHAIN_CONFIG[chainId];
+  if (!cfg) throw new Error('Unknown chain: ' + chainId);
+  const address = getAddress(walletAddress);
+  const client = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpc()) });
+  const ZERO = '0x0000000000000000000000000000000000000000';
+
+  const balance = await client.readContract({ address: cfg.npm, abi: NPM_ABI, functionName: 'balanceOf', args: [address] });
+  if (balance === 0n) return { positions: [] };
+
+  const tokenIdResults = await client.multicall({
+    contracts: Array.from({ length: Number(balance) }, (_, i) => ({
+      address: cfg.npm, abi: NPM_ABI, functionName: 'tokenOfOwnerByIndex', args: [address, BigInt(i)],
+    })),
+  });
+  const tokenIds = tokenIdResults.map(r => r.status === 'success' ? r.result : null).filter(Boolean);
+
+  const positionResults = await client.multicall({
+    contracts: tokenIds.map(tokenId => ({ address: cfg.npm, abi: NPM_ABI, functionName: 'positions', args: [tokenId] })),
+  });
+  const rawPositions = positionResults
+    .map((r, i) => r.status === 'success' ? { tokenId: tokenIds[i], data: r.result } : null)
+    .filter(Boolean);
+
+  const uniqueTokens = [...new Set(rawPositions.flatMap(p => [p.data[2], p.data[3]]))];
+  const tokenMetaResults = await client.multicall({
+    contracts: uniqueTokens.flatMap(addr => [
+      { address: addr, abi: ERC20_ABI, functionName: 'symbol' },
+      { address: addr, abi: ERC20_ABI, functionName: 'decimals' },
+    ]),
+  });
+  const tokenMeta = {};
+  uniqueTokens.forEach((addr, i) => {
+    tokenMeta[addr.toLowerCase()] = {
+      symbol: tokenMetaResults[i * 2].status === 'success' ? tokenMetaResults[i * 2].result : '???',
+      decimals: tokenMetaResults[i * 2 + 1].status === 'success' ? tokenMetaResults[i * 2 + 1].result : 18,
+    };
+  });
+
+  const poolResults = await client.multicall({
+    contracts: rawPositions.map(p => ({ address: cfg.factory, abi: FACTORY_ABI, functionName: 'getPool', args: [p.data[2], p.data[3], p.data[4]] })),
+  });
+  const poolAddresses = poolResults.map(r => r.status === 'success' ? r.result : ZERO);
+
+  const poolDataResults = await client.multicall({
+    contracts: rawPositions.flatMap((p, i) => {
+      const poolAddr = poolAddresses[i];
+      const [,,,,,tickLower,tickUpper] = p.data;
+      return [
+        { address: poolAddr, abi: POOL_ABI, functionName: 'slot0' },
+        { address: poolAddr, abi: POOL_ABI, functionName: 'feeGrowthGlobal0X128' },
+        { address: poolAddr, abi: POOL_ABI, functionName: 'feeGrowthGlobal1X128' },
+        { address: poolAddr, abi: POOL_ABI, functionName: 'ticks', args: [tickLower] },
+        { address: poolAddr, abi: POOL_ABI, functionName: 'ticks', args: [tickUpper] },
+      ];
+    }),
+  });
+
+  const usdPrices = await getDeFiLlamaPricesForChain(uniqueTokens, cfg.llamaPrefix);
+
+  const positions = rawPositions.map((p, i) => {
+    const [,,token0Addr,token1Addr,fee,tickLower,tickUpper,liquidity,fg0Last,fg1Last,owed0,owed1] = p.data;
+    const meta0 = tokenMeta[token0Addr.toLowerCase()] ?? { symbol: '???', decimals: 18 };
+    const meta1 = tokenMeta[token1Addr.toLowerCase()] ?? { symbol: '???', decimals: 18 };
+    const b = i * 5;
+    const slot0 = poolDataResults[b].status === 'success' ? poolDataResults[b].result : null;
+    const currentTick = slot0 ? slot0[1] : null;
+    const sqrtPrice = slot0 ? slot0[0] : null;
+    const inRange = currentTick !== null ? currentTick >= tickLower && currentTick < tickUpper : null;
+    const fgg0 = poolDataResults[b+1].status === 'success' ? poolDataResults[b+1].result : 0n;
+    const fgg1 = poolDataResults[b+2].status === 'success' ? poolDataResults[b+2].result : 0n;
+    const tld = poolDataResults[b+3].status === 'success' ? poolDataResults[b+3].result : null;
+    const tud = poolDataResults[b+4].status === 'success' ? poolDataResults[b+4].result : null;
+
+    const rawFees0 = currentTick !== null && liquidity > 0n
+      ? calcAccruedFees(liquidity, fgg0, tld?.[2] ?? 0n, tud?.[2] ?? 0n, fg0Last, owed0, currentTick, tickLower, tickUpper)
+      : owed0;
+    const rawFees1 = currentTick !== null && liquidity > 0n
+      ? calcAccruedFees(liquidity, fgg1, tld?.[3] ?? 0n, tud?.[3] ?? 0n, fg1Last, owed1, currentTick, tickLower, tickUpper)
+      : owed1;
+
+    const fees0 = formatUnits(rawFees0, meta0.decimals);
+    const fees1 = formatUnits(rawFees1, meta1.decimals);
+    const p0Usd = usdPrices[token0Addr.toLowerCase()] ?? null;
+    const p1Usd = usdPrices[token1Addr.toLowerCase()] ?? null;
+    const fees0Usd = p0Usd !== null ? parseFloat(fees0) * p0Usd : null;
+    const fees1Usd = p1Usd !== null ? parseFloat(fees1) * p1Usd : null;
+    const { amount0, amount1 } = sqrtPrice !== null && liquidity > 0n
+      ? getTokenAmounts(sqrtPrice, tickLower, tickUpper, liquidity, meta0.decimals, meta1.decimals)
+      : { amount0: 0, amount1: 0 };
+
+    return {
+      tokenId: p.tokenId.toString(),
+      version: 'v3', chain: chainId,
       token0: { address: token0Addr, symbol: meta0.symbol, decimals: meta0.decimals, priceUsd: p0Usd },
       token1: { address: token1Addr, symbol: meta1.symbol, decimals: meta1.decimals, priceUsd: p1Usd },
       fee, feeDisplay: formatFee(fee), tickLower, tickUpper,

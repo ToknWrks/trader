@@ -64,7 +64,8 @@ const HL_SIZE_USD      = parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
 const isDryRun         = argv.includes("--dry-run");
 const cryptoOnly       = argv.includes("--crypto-only");
 const stocksOnly       = argv.includes("--stocks-only");
-const strategyFilter   = argv[argv.indexOf("--strategy") + 1] || null;
+const strategyIdx      = argv.indexOf("--strategy");
+const strategyFilter   = strategyIdx !== -1 ? (argv[strategyIdx + 1] || null) : null;
 const today            = new Date().toISOString().slice(0, 10);
 
 // Crypto tickers traded on 24/7 markets (Hyperliquid perps)
@@ -462,6 +463,14 @@ async function fetchSignal(strategy) {
       console.log(`[trader] 📋 Subscription valid until ${subExpiresAt} — skipping auto-renew`);
     }
 
+    // Warn if falling back to per-call — subscription missing or expired
+    const subExpired = subExpiresAt && new Date(subExpiresAt) <= new Date();
+    if (subExpired) {
+      console.warn(`[trader] ⚠️  Subscription expired ${subExpiresAt} — paying per-call. Renew from the dashboard.`);
+    } else if (!subPeriod) {
+      console.warn(`[trader] ⚠️  No subscription set for ${strategyId} — paying per-call. Set one from the dashboard.`);
+    }
+
     // Step 2: decode payment requirement — network comes FROM the server's 402 response
     // x402 v2 uses "payment-required"; v1 used "X-PAYMENT-REQUIRED" — try both
     const rawHeader = probe.headers.get("payment-required") ?? probe.headers.get("X-PAYMENT-REQUIRED");
@@ -480,7 +489,7 @@ async function fetchSignal(strategy) {
     const evmScheme = new ExactEvmScheme(signer);
     client.register(serverNetwork, evmScheme);
 
-    console.log(`[trader] 💳 Paying on ${networkCfg.label ?? serverNetwork}`);
+    console.warn(`[trader] 💳 Per-call payment on ${networkCfg.label ?? serverNetwork} ($0.01)`);
 
     // Step 4: create and sign payment payload
     const paymentPayload = await client.createPaymentPayload(paymentRequired);
@@ -696,8 +705,11 @@ async function executeTrade(strategy, signal, priorSignal) {
     return;
   }
 
-  if (isDryRun) console.log(`[trader] [DRY RUN] Would: ${action}`);
-  else console.log(`[trader] ✅ ${action}`);
+  if (isDryRun) {
+    console.log(`[trader] [DRY RUN] Would: ${action}`);
+    return;
+  }
+  console.log(`[trader] ✅ ${action}`);
 
   insertTrade({
     strategy_id: strategy.id,
@@ -773,6 +785,10 @@ for (const strategy of strategies) {
     c?.crypto_radar_score != null ? `CRYPTO:${c.crypto_radar_score}` : null,
   ].filter(Boolean).join(" | ");
 
+  // Read prior signal BEFORE upserting — includes today's earlier fetches for intraday strategies
+  const priorSignal = getLatestSignal(strategy.id);
+  const signalChanged = !priorSignal || priorSignal.signal !== signal;
+
   // Store signal
   upsertSignal({
     strategy_id: strategy.id,
@@ -781,11 +797,6 @@ for (const strategy of strategies) {
     price,
     notes: scoreNotes || null,
   });
-
-  // Get prior signal to detect flips
-  // priorSignal is the most recent signal from a previous day (not today)
-  const priorSignal = getPriorSignal(strategy.id);
-  const signalChanged = !priorSignal || priorSignal.signal !== signal;
 
   if (!signalChanged) {
     console.log(`[trader] ⚪ Signal unchanged (${signal}) — holding`);

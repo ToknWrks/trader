@@ -91,9 +91,13 @@ import {
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
   countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents, getYtdPnl,
   getSnapshots, insertSnapshot, hasSnapshots, backfillSnapshotsFromTrades, insertTrade,
+  maybeCreateDefaultWallet, listWallets, insertWallet, deleteWallet, updateWalletFlags, setTradingWallet,
+  listStakingContracts, insertStakingContract, deleteStakingContract,
 } from "./db.mjs";
 
-import { getV3Positions, getV4Positions, getPnl, collectAndSwap } from "./uniswap-api.mjs";
+if (PRIVATE_KEY) maybeCreateDefaultWallet(PRIVATE_KEY);
+
+import { getV3Positions, getV4Positions, getPnl, collectAndSwap, getV3PositionsForChain } from "./uniswap-api.mjs";
 import { SchwabClient } from "./exchanges/schwab.mjs";
 
 // ── x402 network config ───────────────────────────────────────────────────────
@@ -246,6 +250,10 @@ input:focus, select:focus { border-color: rgba(168,241,247,0.4); }
 .notif-meta { font-size: 0.72rem; color: rgba(255,255,255,0.35); margin-top: 0.2rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .notif-price { font-size: 0.82rem; color: rgba(255,255,255,0.5); flex-shrink: 0; text-align: right; }
 .notif-time { font-size: 0.68rem; color: rgba(255,255,255,0.25); }
+#toast { position:fixed; bottom:1.5rem; left:50%; transform:translateX(-50%) translateY(2rem); background:#111113; border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:0.7rem 1.25rem; font-size:0.82rem; color:#fafafa; z-index:200; box-shadow:0 8px 32px rgba(0,0,0,0.5); opacity:0; transition:opacity 0.2s, transform 0.2s; pointer-events:none; white-space:nowrap; }
+#toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+#toast.toast-ok { border-color:rgba(74,222,128,0.35); color:#4ade80; }
+#toast.toast-err { border-color:rgba(248,113,113,0.35); color:#f87171; }
 `;
 
 function shell(title, body, active = "") {
@@ -271,7 +279,7 @@ function shell(title, body, active = "") {
       <a class="nav-link ${active === "signals" ? "active" : ""}" href="/signals">Signals</a>
       <a class="nav-link ${active === "history" ? "active" : ""}" href="/history">History</a>
       ${process.env.AGENT_API_KEY ? `<a class="nav-link ${active === "premium-fade" ? "active" : ""}" href="/premium-fade">Premium Fade</a>` : ""}
-      <a class="nav-link ${active === "uniswap" ? "active" : ""}" href="/uniswap">Uniswap</a>
+      <a class="nav-link ${active === "uniswap" ? "active" : ""}" href="/uniswap">Yield</a>
       <a class="nav-link ${active === "settings" ? "active" : ""}" href="/settings">Settings</a>
       <a class="nav-link" href="${getSignalUrl()}/navigator" target="_blank">Navigator ↗</a>
       <span id="traderStatus" style="font-size:0.75rem;padding:0.25rem 0.75rem;border-radius:999px;border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.4);margin-left:0.5rem">checking…</span>
@@ -463,8 +471,19 @@ function shell(title, body, active = "") {
   <!-- Strategy info popover -->
   <div class="info-popover" id="infoPopover"></div>
 
+  <!-- Toast -->
+  <div id="toast"></div>
+
   <script>
     const SCHEDULES = ${JSON.stringify(SCHEDULES)};
+    let _toastTimer;
+    function showToast(msg, type) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'show ' + (type === 'ok' ? 'toast-ok' : 'toast-err');
+      clearTimeout(_toastTimer);
+      _toastTimer = setTimeout(() => { t.className = ''; }, 3000);
+    }
     const CRYPTO_TICKERS = new Set(["BTC","ETH","SOL","BNB","XRP","ADA","AVAX","DOT","MATIC","POL","LINK","UNI","ATOM","LTC","DOGE","SHIB","TRX","TON","SUI","APT","OP","ARB","INJ","SEI","TIA","JUP","WIF","BONK","PEPE","NEAR","FIL","ICP","HBAR","VET","ALGO","XLM","XMR","ETC","BCH","AAVE","CRV","MKR","SNX","LDO","RETH","STETH","WBTC","VVV","VULT","ZEC"]);
     function isCrypto(symbol) { return CRYPTO_TICKERS.has(symbol.toUpperCase().replace(/-USD$/, "").replace(/\\/USD$/, "")); }
 
@@ -1144,7 +1163,7 @@ async function portfolioPage() {
           <td>${o.size.toFixed(4)}</td>
           <td>$${o.limitPrice.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td>
           <td style="text-align:right">
-            <button class="btn btn-cyan" style="margin-right:0.4rem;padding:0.2rem 0.6rem;font-size:0.7rem" onclick="showEditOrderModal('${o.exchange}','${o.id}','${o.asset}','${o.side}',${o.size},${o.limitPrice},${JSON.stringify(o.duration||'')})">Edit</button>
+            <button class="btn btn-cyan" style="margin-right:0.4rem;padding:0.2rem 0.6rem;font-size:0.7rem" onclick="showEditOrderModal('${o.exchange}','${o.id}','${o.asset}','${o.side}',${o.size},${o.limitPrice},'${o.duration||''}')">Edit</button>
             <button class="btn btn-red" style="padding:0.2rem 0.6rem;font-size:0.7rem" onclick="cancelOrder('${o.exchange}','${o.id}','${o.asset}',this)">Cancel</button>
           </td>
         </tr>`).join("")}</tbody>
@@ -1212,6 +1231,33 @@ async function portfolioPage() {
         document.getElementById('editOrderModal').style.display = 'flex';
       }
 
+      function cancelOrder(exchange, orderId, asset, btn) {
+        const modal = document.getElementById('toggleModal');
+        document.getElementById('modalTitle').textContent = 'Cancel Order';
+        document.getElementById('modalBody').innerHTML = 'Cancel <strong>' + asset + '</strong> limit order on <strong>' + exchange + '</strong>?';
+        const confirmBtn = document.getElementById('modalConfirm');
+        confirmBtn.textContent = 'Cancel Order';
+        confirmBtn.className = 'modal-confirm-red';
+        confirmBtn.onclick = async () => {
+          confirmBtn.textContent = 'Cancelling…'; confirmBtn.disabled = true;
+          modal.classList.remove('open');
+          btn.textContent = 'Cancelling…'; btn.disabled = true;
+          try {
+            const res = await fetch('/api/cancel-order', {
+              method: 'POST',
+              headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ exchange, orderId, asset })
+            });
+            const d = await res.json();
+            if (d.ok) { showToast('Order cancelled', 'ok'); setTimeout(() => location.reload(), 1000); }
+            else { showToast(d.error || 'Cancel failed', 'err'); btn.textContent = 'Cancel'; btn.disabled = false; }
+          } catch (e) {
+            showToast(e.message, 'err'); btn.textContent = 'Cancel'; btn.disabled = false;
+          }
+          confirmBtn.disabled = false;
+        };
+        modal.classList.add('open');
+      }
       async function submitEditOrder() {
         const btn = document.getElementById('editOrderSubmitBtn');
         const exchange = document.getElementById('editOrderExchange').value;
@@ -1231,14 +1277,15 @@ async function portfolioPage() {
           });
           const d = await res.json();
           if (d.ok) {
-            btn.textContent = 'Updated ✓';
-            setTimeout(() => location.reload(), 800);
+            document.getElementById('editOrderModal').style.display = 'none';
+            showToast('Order updated', 'ok');
+            setTimeout(() => location.reload(), 1000);
           } else {
-            alert(d.error || 'Update failed');
+            showToast(d.error || 'Update failed', 'err');
             btn.textContent = 'Update Order'; btn.disabled = false;
           }
         } catch (e) {
-          alert(e.message);
+          showToast(e.message, 'err');
           btn.textContent = 'Update Order'; btn.disabled = false;
         }
       }
@@ -1335,7 +1382,7 @@ async function positionsPage() {
         <td class="${pnl >= 0 ? "green" : "red"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
         <td>$${parseFloat(pos.positionValue ?? "0").toFixed(2)}</td>
         <td class="red">${liqPx > 0 ? "$" + liqPx.toLocaleString(undefined, {maximumFractionDigits: 2}) : "—"}</td>
-        <td><div style="display:flex;gap:0.4rem"><button class="btn btn-${isLong ? "green" : "red"}" onclick="addToPos(this, '${pos.coin}', 'hyperliquid', '${isLong ? "buy" : "sell"}')" title="Add to position">+</button><button class="btn btn-red" onclick="closePos(this, '${pos.coin}', 'hyperliquid')">Force Exit</button></div></td>
+        <td><div style="display:flex;gap:0.4rem"><button class="btn btn-${isLong ? "green" : "red"}" onclick="addToPos(this, '${pos.coin}', 'hyperliquid', '${isLong ? "buy" : "sell"}', ${pos.leverage?.value ?? 1})" title="Add to position">+</button><button class="btn btn-red" onclick="closePos(this, '${pos.coin}', 'hyperliquid')">Force Exit</button></div></td>
       </tr>`;
     }),
     ...alpacaPositions.map(p => {
@@ -1374,27 +1421,37 @@ async function positionsPage() {
     <p class="hint">Auto-refreshes every 30s · <a href="/positions">Refresh now</a></p>
     <script>
       setTimeout(() => location.reload(), 30000);
-      function addToPos(btn, asset, exchange, side) {
+      function addToPos(btn, asset, exchange, side, leverage) {
+        leverage = leverage || 1;
         const dirLabel = side === 'buy' ? 'Long' : 'Short';
+        const levNote = leverage > 1 ? ' <span style="color:rgba(255,255,255,0.35);font-size:0.78em">(' + leverage + 'x leverage — notional = margin × ' + leverage + ')</span>' : '';
         document.getElementById('openModalTitle').textContent = 'Add to ' + dirLabel + ' — ' + asset;
         document.getElementById('openModalBody').innerHTML =
           '<p style="font-size:0.82rem;color:rgba(255,255,255,0.55);margin:0 0 1rem">Place an additional <strong>' + dirLabel + '</strong> market order on <strong>' + asset + '</strong>.</p>' +
-          '<label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.35rem;text-transform:uppercase;letter-spacing:0.05em">Amount (USD)</label>' +
-          '<input id="addPosUsd" type="number" step="any" min="1" placeholder="e.g. 50" style="width:100%;box-sizing:border-box;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:0.5rem 0.75rem;color:#fafafa;font-size:0.9rem;outline:none">';
+          '<label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.35rem;text-transform:uppercase;letter-spacing:0.05em">Margin (USD)' + levNote + '</label>' +
+          '<input id="addPosUsd" type="number" step="any" min="1" placeholder="e.g. 50" style="width:100%;box-sizing:border-box;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:0.5rem 0.75rem;color:#fafafa;font-size:0.9rem;outline:none">' +
+          (leverage > 1 ? '<div id="addPosNotional" style="font-size:0.75rem;color:rgba(255,255,255,0.35);margin-top:0.4rem"></div>' : '');
+        if (leverage > 1) {
+          document.getElementById('addPosUsd').addEventListener('input', function() {
+            const v = parseFloat(this.value);
+            const el = document.getElementById('addPosNotional');
+            if (el) el.textContent = v > 0 ? '= $' + (v * leverage).toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2}) + ' notional' : '';
+          });
+        }
         const confirmBtn = document.getElementById('openModalConfirm');
         confirmBtn.textContent = 'Add ' + dirLabel;
         confirmBtn.className = side === 'buy' ? 'modal-confirm-green' : 'modal-confirm-red';
         confirmBtn.onclick = async () => {
-          const sizeUsd = parseFloat(document.getElementById('addPosUsd').value);
-          if (!sizeUsd || sizeUsd <= 0) { alert('Enter a valid USD amount.'); return; }
+          const marginUsd = parseFloat(document.getElementById('addPosUsd').value);
+          if (!marginUsd || marginUsd <= 0) { showToast('Enter a valid margin amount.', 'err'); return; }
           confirmBtn.textContent = 'Placing…'; confirmBtn.disabled = true;
           document.getElementById('openModal').classList.remove('open');
           btn.textContent = '…'; btn.disabled = true;
           try {
-            const res = await fetch('/api/add-to-position', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ asset, exchange, side, sizeUsd }) });
+            const res = await fetch('/api/add-to-position', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ asset, exchange, side, sizeUsd: marginUsd, leverage }) });
             const d = await res.json();
             if (d.ok) { btn.textContent = '✓'; setTimeout(() => location.reload(), 1500); }
-            else { btn.disabled = false; btn.textContent = '+'; alert('Error: ' + d.error); }
+            else { btn.disabled = false; btn.textContent = '+'; showToast('Error: ' + d.error, 'err'); }
           } catch { btn.disabled = false; btn.textContent = '+'; }
           confirmBtn.disabled = false;
         };
@@ -1451,6 +1508,13 @@ function strategiesPage() {
         const size = s.position_size_usd ? "$" + s.position_size_usd : "$" + (process.env.HL_POSITION_SIZE_USD ?? 10) + " (default)";
         const tv = tvSymbol(s.symbol, s.exchange);
         const sdJson = JSON.stringify(s).replace(/"/g, '&quot;');
+        const subExpired = s.subscription_period && s.subscription_expires_at && new Date(s.subscription_expires_at) <= new Date();
+        const subValid   = s.subscription_period && s.subscription_expires_at && new Date(s.subscription_expires_at) > new Date();
+        const subBadge   = subExpired
+          ? `<span style="font-size:0.7rem;background:rgba(251,191,36,0.15);color:#fbbf24;border:1px solid rgba(251,191,36,0.35);border-radius:4px;padding:0.1rem 0.4rem">⚠ Sub expired</span>`
+          : subValid
+          ? `<span style="font-size:0.7rem;background:rgba(52,211,153,0.1);color:#34d399;border:1px solid rgba(52,211,153,0.25);border-radius:4px;padding:0.1rem 0.4rem">📋 Sub until ${new Date(s.subscription_expires_at).toLocaleDateString()}</span>`
+          : `<span style="font-size:0.7rem;background:rgba(255,255,255,0.05);color:rgba(255,255,255,0.3);border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:0.1rem 0.4rem">per-call</span>`;
         return `
         <div class="acc-item" id="acc-${s.id}">
           <div class="acc-header" onclick="toggleAcc('${s.id}', event)">
@@ -1461,6 +1525,7 @@ function strategiesPage() {
                 <span class="cyan" style="font-size:0.8rem">${s.symbol}</span>
                 ${sig !== "—" ? `<span class="${sigClass}">${sig}</span>` : ""}
                 ${s.active ? `<span class="badge-active">● AUTO</span>` : `<span class="badge-inactive">○ INACTIVE</span>`}
+                ${subBadge}
               </div>
               <div style="margin-top:0.3rem;font-size:0.72rem;color:rgba(255,255,255,0.35);display:flex;gap:1rem;flex-wrap:wrap">
                 <span>${s.leverage}x leverage · ${size} · ${{ kraken: "Kraken", alpaca: "Alpaca", coinbase: "Coinbase" }[s.exchange] ?? "Hyperliquid"} · every ${s.interval_minutes >= 1440 ? "day" : s.interval_minutes + "min"}${s.tp_pct ? ` · TP ${s.tp_pct}% → trail ${s.trail_pct ?? 0.5}%` : ""}</span>
@@ -2021,7 +2086,7 @@ function historyPage() {
   `, "history");
 }
 
-function settingsPage(saved = false, error = "", schwabAuthorized = false) {
+async function settingsPage(saved = false, error = "", schwabAuthorized = false) {
   const val = (key) => getEnvValue(key);
 
   function field(label, name, value, type = "text", hint = "") {
@@ -2041,7 +2106,6 @@ function settingsPage(saved = false, error = "", schwabAuthorized = false) {
   }
 
   function pemField(label, name, value, hint = "") {
-    // Decode stored \n back to real newlines for display in textarea
     const display = value.replace(/\\n/g, "\n");
     const id = `field_${name}`;
     return `<div>
@@ -2054,170 +2118,267 @@ function settingsPage(saved = false, error = "", schwabAuthorized = false) {
     </div>`;
   }
 
-  function section(title, icon, fields) {
-    return `<div class="card" style="margin-bottom:1rem">
-      <div style="font-size:0.8rem;font-weight:700;color:#fafafa;margin-bottom:1rem;display:flex;align-items:center;gap:0.5rem">
-        <span style="font-size:1rem">${icon}</span>${title}
+  const TABS = [
+    { key: "general",      icon: "⚙️",  label: "General" },
+    { key: "hl",           icon: "⚡",  label: "DeFi Wallet" },
+    { key: "agentsignal",  icon: `<img src="/public/logo.png" alt="" style="width:16px;height:16px;border-radius:3px;vertical-align:middle">`,  label: "AgentSignal" },
+    { key: "kraken",       icon: "🦑",  label: "Kraken" },
+    { key: "coinbase",     icon: "🔵",  label: "Coinbase" },
+    { key: "schwab",       icon: "📈",  label: "Schwab" },
+    { key: "alpaca",       icon: "🦙",  label: "Alpaca" },
+    { key: "alchemy",      icon: "🔮",  label: "Alchemy" },
+    { key: "payments",     icon: "💳",  label: "Payments" },
+  ];
+
+  // Schwab section content
+  const sc = getSchwabClient();
+  const status = sc ? sc.tokenStatus() : null;
+  const schwabStatusHtml = !sc
+    ? `<div style="font-size:0.72rem;color:rgba(255,255,255,0.3);margin-top:0.25rem">Enter API Key + App Secret above and save first.</div>`
+    : status?.authorized
+      ? `<div style="font-size:0.72rem;padding:0.5rem 0.75rem;background:rgba(74,222,128,0.06);border:1px solid rgba(74,222,128,0.2);border-radius:6px;color:#4ade80;margin-top:0.25rem">
+          ✓ Authorized · refresh token expires in ${status.refreshDaysLeft} days
+          ${parseFloat(status.refreshDaysLeft) < 2 ? ' · <strong style="color:#f87171">Re-authorize soon</strong>' : ''}
+        </div>`
+      : `<div style="font-size:0.72rem;color:rgba(255,255,255,0.35);margin-top:0.25rem">Not yet authorized — click Authorize below.</div>`;
+
+  const current = getPaymentNetwork();
+  const currentLabel = X402_NETWORKS[current]?.label ?? current;
+
+  // Build wallet manager HTML
+  const walletRows = await (async () => {
+    const { privateKeyToAccount } = await import("viem/accounts");
+    const wallets = listWallets();
+    if (!wallets.length) return `<p style="font-size:0.8rem;color:rgba(255,255,255,0.3)">No wallets configured.</p>`;
+    return wallets.map(w => {
+      let addr = "—";
+      try { addr = privateKeyToAccount(w.key).address; } catch {}
+      const short = addr !== "—" ? addr.slice(0, 6) + "…" + addr.slice(-4) : "invalid key";
+      const isTrading = !!w.use_for_trading;
+      return `
+        <div style="display:flex;align-items:center;gap:0.75rem;padding:0.7rem 0.85rem;border:1px solid rgba(255,255,255,${isTrading ? "0.15" : "0.07"});border-radius:8px;background:rgba(255,255,255,${isTrading ? "0.04" : "0.02"});margin-bottom:0.5rem">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:0.82rem;font-weight:600;color:#fafafa;display:flex;align-items:center;gap:0.5rem">
+              ${w.name}
+              ${isTrading ? `<span style="font-size:0.68rem;background:rgba(168,241,247,0.1);color:#A8F1F7;border:1px solid rgba(168,241,247,0.25);border-radius:4px;padding:0.1rem 0.45rem">Active</span>` : ""}
+            </div>
+            <div style="font-size:0.72rem;font-family:monospace;color:rgba(255,255,255,0.35);margin-top:0.15rem">${short}</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:1rem;font-size:0.75rem;color:rgba(255,255,255,0.45)">
+            <label style="display:flex;align-items:center;gap:0.35rem;cursor:pointer">
+              <input type="radio" name="tradingWallet" value="${w.id}" ${isTrading ? "checked" : ""} onchange="setTradingWallet('${w.id}')" style="accent-color:#A8F1F7" />
+              Trading
+            </label>
+            <label style="display:flex;align-items:center;gap:0.35rem;cursor:pointer">
+              <input type="checkbox" ${w.show_on_portfolio ? "checked" : ""} onchange="setWalletFlag('${w.id}','show_on_portfolio',this.checked)" style="accent-color:#A8F1F7" />
+              Portfolio
+            </label>
+            <label style="display:flex;align-items:center;gap:0.35rem;cursor:pointer">
+              <input type="checkbox" ${w.show_on_uniswap ? "checked" : ""} onchange="setWalletFlag('${w.id}','show_on_uniswap',this.checked)" style="accent-color:#A8F1F7" />
+              Uniswap
+            </label>
+          </div>
+          <button onclick="deleteWalletRow('${w.id}',${isTrading ? "true" : "false"})" ${isTrading ? "disabled title='Cannot delete active trading wallet'" : ""} style="background:none;border:1px solid rgba(248,113,113,${isTrading ? "0.1" : "0.3"});color:${isTrading ? "rgba(248,113,113,0.25)" : "#f87171"};border-radius:6px;padding:0.25rem 0.6rem;font-size:0.72rem;cursor:${isTrading ? "not-allowed" : "pointer"}">Delete</button>
+        </div>`;
+    }).join("");
+  })();
+
+  const panes = {
+    general: `
+      ${field("Default Margin to Risk (USD)", "HL_POSITION_SIZE_USD", val("HL_POSITION_SIZE_USD") || "10", "text", "Margin per trade — notional = margin × leverage. Used when a strategy has no size override.")}
+    `,
+    hl: `
+      <p style="font-size:0.78rem;color:rgba(255,255,255,0.4);margin-bottom:1.25rem">Used for Hyperliquid, Uniswap, and x402 signal payments.</p>
+      <p class="section-label" style="margin-bottom:0.75rem">Wallets</p>
+      ${walletRows}
+      <button type="button" onclick="toggleAddWallet()" style="margin-top:0.5rem;background:transparent;border:1px solid rgba(168,241,247,0.25);color:#A8F1F7;border-radius:7px;padding:0.4rem 0.9rem;font-size:0.78rem;cursor:pointer">+ Add Wallet</button>
+      <div id="addWalletForm" style="display:none;margin-top:1rem;padding:1rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;display:flex;flex-direction:column;gap:0.65rem">
+        <div>
+          <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Name</label>
+          <input id="newWalletName" type="text" placeholder="e.g. Hot Wallet" style="width:100%" />
+        </div>
+        <div>
+          <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Private Key</label>
+          <input id="newWalletKey" type="password" placeholder="0x…" style="width:100%;font-family:monospace" />
+        </div>
+        <div style="display:flex;gap:0.5rem">
+          <button type="button" onclick="addWallet()" style="background:#A8F1F7;color:#000;border:none;border-radius:7px;padding:0.45rem 1rem;font-size:0.78rem;font-weight:600;cursor:pointer">Add</button>
+          <button type="button" onclick="toggleAddWallet()" style="background:transparent;border:1px solid rgba(255,255,255,0.12);color:rgba(255,255,255,0.4);border-radius:7px;padding:0.45rem 0.9rem;font-size:0.78rem;cursor:pointer">Cancel</button>
+        </div>
       </div>
-      <div style="display:flex;flex-direction:column;gap:0.85rem">${fields}</div>
-    </div>`;
-  }
+    `,
+    kraken: `
+      ${field("API Key", "KRAKEN_API_KEY", val("KRAKEN_API_KEY"), "password")}
+      ${field("API Secret", "KRAKEN_API_SECRET", val("KRAKEN_API_SECRET"), "password")}
+    `,
+    alpaca: `
+      ${field("API Key", "ALPACA_API_KEY", val("ALPACA_API_KEY"), "password")}
+      ${field("API Secret", "ALPACA_API_SECRET", val("ALPACA_API_SECRET"), "password")}
+      <div style="display:flex;align-items:center;gap:0.6rem">
+        <input type="checkbox" name="ALPACA_PAPER" value="true" id="alpacaPaper" ${val("ALPACA_PAPER") === "true" ? "checked" : ""} style="width:auto;accent-color:#A8F1F7" />
+        <label for="alpacaPaper" style="font-size:0.78rem;color:rgba(255,255,255,0.5);cursor:pointer">Paper trading mode</label>
+      </div>
+    `,
+    coinbase: `
+      ${field("API Key", "COINBASE_API_KEY", val("COINBASE_API_KEY"), "password")}
+      ${field("API Passphrase", "COINBASE_API_PASSPHRASE", val("COINBASE_API_PASSPHRASE"), "password")}
+      ${pemField("API Secret (PEM)", "COINBASE_API_SECRET", val("COINBASE_API_SECRET"), "EC private key from Coinbase Advanced Trade — paste the full PEM block")}
+    `,
+    agentsignal: `
+      ${field("API Key", "AGENT_API_KEY", val("AGENT_API_KEY"), "password",
+        "From agentsignal.app/account — verifies your subscription tier. Alpha &amp; Trader subscribers skip x402 on signal fetches and unlock Premium Fade signals.")}
+      ${(function() {
+        const keySet = !!val("AGENT_API_KEY");
+        if (!keySet) return '<div style="font-size:0.72rem;color:rgba(255,255,255,0.3);margin-top:0.15rem">No key set — signal fetches use x402 ($0.01 each)</div>';
+        return '<div style="font-size:0.72rem;color:rgba(74,222,128,0.7);margin-top:0.15rem">Key configured — tier verified on next dashboard load</div>';
+      })()}
+    `,
+    payments: `
+      <input type="hidden" name="X402_PAYMENT_NETWORK" id="x402NetworkInput" value="${current}" />
+      <div>
+        <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Payment Network</label>
+        <button type="button" onclick="document.getElementById('networkModal').classList.add('open')"
+          style="width:100%;display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#fafafa;font-size:0.85rem;padding:0.45rem 0.75rem;cursor:pointer;text-align:left">
+          <span id="x402NetworkDisplay">${currentLabel}</span>
+          <span style="color:rgba(255,255,255,0.3);font-size:0.75rem">Change ›</span>
+        </button>
+        <div style="font-size:0.68rem;color:rgba(255,255,255,0.3);margin-top:0.25rem">Your wallet must hold USDC on this network to pay for signal fetches.</div>
+      </div>
+    `,
+    schwab: `
+      ${field("API Key (Client ID)", "SCHWAB_API_KEY", val("SCHWAB_API_KEY"), "password")}
+      ${field("App Secret", "SCHWAB_APP_SECRET", val("SCHWAB_APP_SECRET"), "password")}
+      ${field("Redirect URI", "SCHWAB_REDIRECT_URI", val("SCHWAB_REDIRECT_URI") || "https://127.0.0.1:4101/schwab/callback", "text",
+        "Register this exact URL in your Schwab Developer app settings. Must match exactly.")}
+      ${schwabStatusHtml}
+      <div style="margin-top:0.6rem;padding:0.75rem;background:rgba(251,191,36,0.04);border:1px solid rgba(251,191,36,0.15);border-radius:8px;font-size:0.75rem;color:rgba(255,255,255,0.5);line-height:1.6">
+        <strong style="color:rgba(255,255,255,0.7)">To authorize:</strong><br>
+        1. Register <code style="color:#fbbf24">https://127.0.0.1:4101/schwab/callback</code> as your Redirect URI in the Schwab developer portal<br>
+        2. Save your API Key + App Secret above<br>
+        3. In your terminal run: <code style="color:#fbbf24">node schwab-auth.mjs</code><br>
+        4. Approve in the browser that opens — tokens auto-saved
+      </div>
+    `,
+    alchemy: `
+      ${field("API Key", "ALCHEMY_API_KEY", val("ALCHEMY_API_KEY"), "password", "Required for Uniswap V4 positions and P&L history on the Uniswap tab.")}
+      <div style="font-size:0.75rem;color:rgba(255,255,255,0.4);line-height:1.6;padding:0.75rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:8px">
+        <strong style="color:rgba(255,255,255,0.7);display:block;margin-bottom:0.35rem">What this unlocks</strong>
+        <div style="display:flex;flex-direction:column;gap:0.3rem">
+          <span>✓ <strong style="color:rgba(255,255,255,0.6)">V3 positions</strong> — works without a key (uses public Base RPC)</span>
+          <span style="color:rgba(255,255,255,0.55)">↳ <strong style="color:#A8F1F7">V4 positions</strong> — requires Alchemy (NFT enumeration API)</span>
+          <span style="color:rgba(255,255,255,0.55)">↳ <strong style="color:#A8F1F7">P&L history</strong> — requires Alchemy (Transfer history API)</span>
+        </div>
+        <div style="margin-top:0.6rem;padding-top:0.6rem;border-top:1px solid rgba(255,255,255,0.06)">
+          Free tier is sufficient — get a key at
+          <a href="https://www.alchemy.com" target="_blank" rel="noopener noreferrer" style="color:#A8F1F7;text-decoration:none">alchemy.com</a>,
+          create a Base app, and paste the API key above.
+        </div>
+      </div>
+    `,
+  };
 
   return shell("Settings", `
-    <div style="display:flex;align-items:center;gap:1rem;margin-bottom:2rem">
-      <img src="/public/logo.png" alt="AgentSignal" style="width:52px;height:52px;border-radius:12px" />
-      <div>
-        <div style="font-size:1.25rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">AgentSignal Trader</div>
-        <div style="font-size:0.75rem;color:rgba(255,255,255,0.35);margin-top:0.1rem">Local trading agent — your keys never leave this machine</div>
+    <div style="display:flex;gap:2rem;align-items:flex-start">
+
+      <!-- Sidebar -->
+      <div style="width:180px;flex-shrink:0;position:sticky;top:5rem;display:flex;flex-direction:column;gap:0.15rem">
+        ${TABS.map(t => `
+          <button id="stab-btn-${t.key}" type="button" onclick="switchSTab('${t.key}')"
+            style="display:flex;align-items:center;gap:0.6rem;width:100%;text-align:left;background:transparent;border:none;border-left:2px solid transparent;border-radius:0 6px 6px 0;padding:0.65rem 0.85rem;margin:0.1rem 0;font-size:0.82rem;color:rgba(255,255,255,0.45);cursor:pointer;transition:all 0.12s">
+            <span>${t.icon}</span>${t.label}
+          </button>`).join("")}
+      </div>
+
+      <!-- Main content -->
+      <div style="flex:1;min-width:0">
+        ${saved ? `<div style="color:#4ade80;font-size:0.82rem;margin-bottom:1.25rem;padding:0.6rem 0.85rem;background:rgba(74,222,128,0.08);border:1px solid rgba(74,222,128,0.2);border-radius:8px">✓ Settings saved. Restart the trader processes for key changes to take effect.</div>` : ""}
+        ${schwabAuthorized ? `<div style="color:#fbbf24;font-size:0.82rem;margin-bottom:1.25rem;padding:0.6rem 0.85rem;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);border-radius:8px">✓ Schwab authorized successfully. Tokens stored and ready.</div>` : ""}
+        ${error ? `<div style="color:#f87171;font-size:0.82rem;margin-bottom:1.25rem">${error}</div>` : ""}
+
+        <form method="POST" action="/settings">
+          ${TABS.map(t => `
+            <div id="stab-pane-${t.key}" style="display:none">
+              <div style="font-size:0.9rem;font-weight:700;color:#fafafa;margin-bottom:1.25rem;display:flex;align-items:center;gap:0.5rem">
+                <span style="font-size:1.1rem">${t.icon}</span>${t.label}
+              </div>
+              <div style="display:flex;flex-direction:column;gap:0.85rem">
+                ${panes[t.key] || ""}
+              </div>
+            </div>`).join("")}
+
+          <div style="display:flex;gap:0.75rem;margin-top:1.75rem;padding-top:1.25rem;border-top:1px solid rgba(255,255,255,0.07)">
+            <button type="submit" style="background:#A8F1F7;color:#09090b;border:none;border-radius:8px;padding:0.6rem 1.5rem;font-weight:700;cursor:pointer;font-size:0.875rem">
+              Save Settings
+            </button>
+            <a href="/strategies" style="display:inline-flex;align-items:center;padding:0.6rem 1rem;font-size:0.82rem;color:rgba(255,255,255,0.4);border:1px solid rgba(255,255,255,0.1);border-radius:8px;text-decoration:none">Cancel</a>
+          </div>
+        </form>
       </div>
     </div>
-    ${saved ? `<div style="color:#4ade80;font-size:0.82rem;margin-bottom:1rem;padding:0.6rem 0.85rem;background:rgba(74,222,128,0.08);border:1px solid rgba(74,222,128,0.2);border-radius:8px">✓ Settings saved. Restart the trader processes for key changes to take effect.</div>` : ""}
-    ${schwabAuthorized ? `<div style="color:#fbbf24;font-size:0.82rem;margin-bottom:1rem;padding:0.6rem 0.85rem;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);border-radius:8px">✓ Schwab authorized successfully. Tokens stored and ready.</div>` : ""}
-    ${error ? `<div style="color:#f87171;font-size:0.82rem;margin-bottom:1rem">${error}</div>` : ""}
-    <form method="POST" action="/settings">
-
-      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:1rem;margin-bottom:1rem">
-
-
-        ${section("General", "⚙️", `
-          ${field("Default Margin to Risk (USD)", "HL_POSITION_SIZE_USD", val("HL_POSITION_SIZE_USD") || "10", "text", "Margin per trade — notional = margin × leverage. Used when a strategy has no size override.")}
-        `)}
-
-        ${section("Hyperliquid", "⚡", `
-          ${field("Private Key", "AGENT_PRIVATE_KEY", val("AGENT_PRIVATE_KEY"), "password", "0x-prefixed EVM key — trading + x402 payments")}
-          <div id="walletInfo" style="font-size:0.72rem;color:rgba(255,255,255,0.3);padding:0.5rem 0.75rem;background:rgba(255,255,255,0.03);border-radius:6px;display:none">
-            Wallet: <span id="walletAddr" style="font-family:monospace;color:rgba(168,241,247,0.7)"></span>
-          </div>
-        `)}
-
-        ${section("Kraken", "🦑", `
-          ${field("API Key", "KRAKEN_API_KEY", val("KRAKEN_API_KEY"), "password")}
-          ${field("API Secret", "KRAKEN_API_SECRET", val("KRAKEN_API_SECRET"), "password")}
-        `)}
-
-        ${section("Alpaca", "🦙", `
-          ${field("API Key", "ALPACA_API_KEY", val("ALPACA_API_KEY"), "password")}
-          ${field("API Secret", "ALPACA_API_SECRET", val("ALPACA_API_SECRET"), "password")}
-          <div style="display:flex;align-items:center;gap:0.6rem">
-            <input type="checkbox" name="ALPACA_PAPER" value="true" id="alpacaPaper" ${val("ALPACA_PAPER") === "true" ? "checked" : ""} style="width:auto;accent-color:#A8F1F7" />
-            <label for="alpacaPaper" style="font-size:0.78rem;color:rgba(255,255,255,0.5);cursor:pointer">Paper trading mode</label>
-          </div>
-        `)}
-
-        ${section("Coinbase", "🔵", `
-          ${field("API Key", "COINBASE_API_KEY", val("COINBASE_API_KEY"), "password")}
-          ${field("API Passphrase", "COINBASE_API_PASSPHRASE", val("COINBASE_API_PASSPHRASE"), "password")}
-          ${pemField("API Secret (PEM)", "COINBASE_API_SECRET", val("COINBASE_API_SECRET"), "EC private key from Coinbase Advanced Trade — paste the full PEM block")}
-        `)}
-
-        ${section("AgentSignal Account", "🔑", `
-          ${field("API Key", "AGENT_API_KEY", val("AGENT_API_KEY"), "password",
-            "From agentsignal.app/account — verifies your subscription tier. Alpha &amp; Trader subscribers skip x402 on signal fetches and unlock Premium Fade signals.")}
-          ${(function() {
-            const keySet = !!val("AGENT_API_KEY");
-            if (!keySet) return '<div style="font-size:0.72rem;color:rgba(255,255,255,0.3);margin-top:0.15rem">No key set — signal fetches use x402 ($0.01 each)</div>';
-            return '<div style="font-size:0.72rem;color:rgba(74,222,128,0.7);margin-top:0.15rem">Key configured — tier verified on next dashboard load</div>';
-          })()}
-        `)}
-
-        ${(function() {
-          const current = getPaymentNetwork();
-          const currentLabel = X402_NETWORKS[current]?.label ?? current;
-          return section("Signal Payments (x402)", "💳", `
-            <input type="hidden" name="X402_PAYMENT_NETWORK" id="x402NetworkInput" value="${current}" />
-            <div>
-              <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Payment Network</label>
-              <button type="button" onclick="document.getElementById('networkModal').classList.add('open')"
-                style="width:100%;display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#fafafa;font-size:0.85rem;padding:0.45rem 0.75rem;cursor:pointer;text-align:left">
-                <span id="x402NetworkDisplay">${currentLabel}</span>
-                <span style="color:rgba(255,255,255,0.3);font-size:0.75rem">Change ›</span>
-              </button>
-              <div style="font-size:0.68rem;color:rgba(255,255,255,0.3);margin-top:0.25rem">Your wallet must hold USDC on this network to pay for signal fetches.</div>
-            </div>
-          `);
-        })()}
-
-        ${(function() {
-          const sc = getSchwabClient();
-          const status = sc ? sc.tokenStatus() : null;
-          const authUrl = sc ? sc.getAuthUrl() : null;
-          const statusHtml = !sc
-            ? `<div style="font-size:0.72rem;color:rgba(255,255,255,0.3);margin-top:0.25rem">Enter API Key + App Secret above and save first.</div>`
-            : status?.authorized
-              ? `<div style="font-size:0.72rem;padding:0.5rem 0.75rem;background:rgba(74,222,128,0.06);border:1px solid rgba(74,222,128,0.2);border-radius:6px;color:#4ade80;margin-top:0.25rem">
-                  ✓ Authorized · refresh token expires in ${status.refreshDaysLeft} days
-                  ${parseFloat(status.refreshDaysLeft) < 2 ? ' · <strong style="color:#f87171">Re-authorize soon</strong>' : ''}
-                </div>`
-              : `<div style="font-size:0.72rem;color:rgba(255,255,255,0.35);margin-top:0.25rem">Not yet authorized — click Authorize below.</div>`;
-          return section("Schwab", "📈", `
-            ${field("API Key (Client ID)", "SCHWAB_API_KEY", val("SCHWAB_API_KEY"), "password")}
-            ${field("App Secret", "SCHWAB_APP_SECRET", val("SCHWAB_APP_SECRET"), "password")}
-            ${field("Redirect URI", "SCHWAB_REDIRECT_URI", val("SCHWAB_REDIRECT_URI") || "https://127.0.0.1:4101/schwab/callback", "text",
-              "Register this exact URL in your Schwab Developer app settings. Must match exactly.")}
-            ${statusHtml}
-            <div style="margin-top:0.6rem;padding:0.75rem;background:rgba(251,191,36,0.04);border:1px solid rgba(251,191,36,0.15);border-radius:8px;font-size:0.75rem;color:rgba(255,255,255,0.5);line-height:1.6">
-              <strong style="color:rgba(255,255,255,0.7)">To authorize:</strong><br>
-              1. Register <code style="color:#fbbf24">https://127.0.0.1:4101/schwab/callback</code> as your Redirect URI in the Schwab developer portal<br>
-              2. Save your API Key + App Secret above<br>
-              3. In your terminal run: <code style="color:#fbbf24">node schwab-auth.mjs</code><br>
-              4. Approve in the browser that opens — tokens auto-saved
-            </div>
-          `);
-        })()}
-
-        ${section("Alchemy (Optional)", "🔮", `
-          ${field("API Key", "ALCHEMY_API_KEY", val("ALCHEMY_API_KEY"), "password", "Required for Uniswap V4 positions and P&L history on the Uniswap tab.")}
-          <div style="font-size:0.75rem;color:rgba(255,255,255,0.4);line-height:1.6;padding:0.75rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:8px">
-            <strong style="color:rgba(255,255,255,0.7);display:block;margin-bottom:0.35rem">What this unlocks</strong>
-            <div style="display:flex;flex-direction:column;gap:0.3rem">
-              <span>✓ <strong style="color:rgba(255,255,255,0.6)">V3 positions</strong> — works without a key (uses public Base RPC)</span>
-              <span style="color:rgba(255,255,255,0.55)">↳ <strong style="color:#A8F1F7">V4 positions</strong> — requires Alchemy (NFT enumeration API)</span>
-              <span style="color:rgba(255,255,255,0.55)">↳ <strong style="color:#A8F1F7">P&L history</strong> — requires Alchemy (Transfer history API)</span>
-            </div>
-            <div style="margin-top:0.6rem;padding-top:0.6rem;border-top:1px solid rgba(255,255,255,0.06)">
-              Free tier is sufficient — get a key at
-              <a href="https://www.alchemy.com" target="_blank" rel="noopener noreferrer" style="color:#A8F1F7;text-decoration:none">alchemy.com</a>,
-              create a Base app, and paste the API key above.
-            </div>
-          </div>
-        `)}
-
-      </div>
-
-      <div style="display:flex;gap:0.75rem;margin-top:0.5rem">
-        <button type="submit" style="background:#A8F1F7;color:#09090b;border:none;border-radius:8px;padding:0.6rem 1.5rem;font-weight:700;cursor:pointer;font-size:0.875rem">
-          Save Settings
-        </button>
-        <a href="/strategies" style="display:inline-flex;align-items:center;padding:0.6rem 1rem;font-size:0.82rem;color:rgba(255,255,255,0.4);border:1px solid rgba(255,255,255,0.1);border-radius:8px;text-decoration:none">Cancel</a>
-      </div>
-    </form>
 
     <script>
+    const S_TABS = ${JSON.stringify(TABS.map(t => t.key))};
+    function switchSTab(key) {
+      S_TABS.forEach(k => {
+        const pane = document.getElementById('stab-pane-' + k);
+        const btn  = document.getElementById('stab-btn-' + k);
+        if (pane) pane.style.display = k === key ? '' : 'none';
+        if (btn) {
+          btn.style.color      = k === key ? '#A8F1F7' : 'rgba(255,255,255,0.45)';
+          btn.style.background = k === key ? 'rgba(168,241,247,0.06)' : 'transparent';
+          btn.style.borderLeftColor = k === key ? '#A8F1F7' : 'transparent';
+        }
+      });
+    }
+    switchSTab('general');
     function toggleSecret(id) {
       const el = document.getElementById(id);
       const btn = el.nextElementSibling;
       if (el.type === 'password') { el.type = 'text'; btn.textContent = 'Hide'; }
       else { el.type = 'password'; btn.textContent = 'Show'; }
     }
-    // Derive wallet address from private key if ethers is available
-    const pkField = document.getElementById('field_AGENT_PRIVATE_KEY');
-    async function updateWalletInfo() {
-      const pk = pkField.value.trim();
-      if (!pk.startsWith('0x') || pk.length !== 66) {
-        document.getElementById('walletInfo').style.display = 'none';
-        return;
-      }
-      try {
-        const res = await fetch('/api/wallet-address', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ pk }) });
-        const d = await res.json();
-        if (d.address) {
-          document.getElementById('walletAddr').textContent = d.address;
-          document.getElementById('walletInfo').style.display = 'block';
-        }
-      } catch {}
+    function toggleAddWallet() {
+      const f = document.getElementById('addWalletForm');
+      f.style.display = f.style.display === 'none' ? 'flex' : 'none';
+      f.style.flexDirection = 'column';
     }
-    pkField?.addEventListener('change', updateWalletInfo);
-    updateWalletInfo();
+    async function addWallet() {
+      const name = document.getElementById('newWalletName').value.trim();
+      const key  = document.getElementById('newWalletKey').value.trim();
+      if (!name) { showToast('Name required', 'err'); return; }
+      if (!key.startsWith('0x') || key.length !== 66) { showToast('Invalid key — must be 0x + 64 hex chars', 'err'); return; }
+      const res = await fetch('/api/wallets', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name, key }) });
+      const d = await res.json();
+      if (d.ok) { showToast('Wallet added', 'ok'); setTimeout(() => location.reload(), 800); }
+      else showToast(d.error || 'Failed', 'err');
+    }
+    async function setTradingWallet(id) {
+      const res = await fetch('/api/wallets/' + id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ use_for_trading: true }) });
+      const d = await res.json();
+      if (d.ok) { showToast('Trading wallet updated', 'ok'); setTimeout(() => location.reload(), 800); }
+      else showToast(d.error || 'Failed', 'err');
+    }
+    async function setWalletFlag(id, flag, value) {
+      const res = await fetch('/api/wallets/' + id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ [flag]: value }) });
+      const d = await res.json();
+      if (d.ok) showToast('Saved', 'ok');
+      else showToast(d.error || 'Failed', 'err');
+    }
+    async function deleteWalletRow(id, isActive) {
+      if (isActive) { showToast('Cannot delete the active trading wallet', 'err'); return; }
+      document.getElementById('modalTitle').textContent = 'Delete Wallet';
+      document.getElementById('modalBody').innerHTML = 'Remove this wallet? This cannot be undone.';
+      const confirmBtn = document.getElementById('modalConfirm');
+      confirmBtn.textContent = 'Delete'; confirmBtn.className = 'modal-confirm-red';
+      confirmBtn.onclick = async () => {
+        document.getElementById('toggleModal').classList.remove('open');
+        const res = await fetch('/api/wallets/' + id, { method: 'DELETE' });
+        const d = await res.json();
+        if (d.ok) { showToast('Wallet deleted', 'ok'); setTimeout(() => location.reload(), 800); }
+        else showToast(d.error || 'Failed', 'err');
+      };
+      document.getElementById('toggleModal').classList.add('open');
+    }
     </script>
   `, "settings");
 }
@@ -2831,7 +2992,7 @@ async function handleOpen(body) {
 }
 
 async function handleAddToPosition(body) {
-  const { asset, exchange, side, sizeUsd } = JSON.parse(body);
+  const { asset, exchange, side, sizeUsd, leverage = 1 } = JSON.parse(body);
   if (!asset || !side || !sizeUsd || sizeUsd <= 0) return { ok: false, error: "asset, side, sizeUsd required" };
 
   const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
@@ -2847,7 +3008,8 @@ async function handleAddToPosition(body) {
     : new HyperliquidExchange(PRIVATE_KEY);
 
   const midPrice = await exch.getMidPrice(asset);
-  const size = parseFloat((sizeUsd / midPrice).toFixed(5));
+  const notional = sizeUsd * (leverage ?? 1);
+  const size = parseFloat((notional / midPrice).toFixed(5));
   await exch.placeMarketOrder(asset, side, size);
   const action = `ADD ${side === "buy" ? "LONG" : "SHORT"} +${size} ${asset} @ ~$${midPrice.toLocaleString()} ($${sizeUsd})`;
   const { insertTrade } = await import("./db.mjs");
@@ -3205,7 +3367,7 @@ async function premiumFadePage() {
 // ── Uniswap Page ─────────────────────────────────────────────────────────────
 
 function renderUniswapPage() {
-  return shell("Uniswap Positions", `
+  return shell("Yield", `
 <style>
 .uni-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; margin-bottom: 1.5rem; }
 @media (max-width: 640px) { .uni-summary { grid-template-columns: repeat(2, 1fr); } }
@@ -3251,7 +3413,7 @@ function renderUniswapPage() {
 
 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem">
   <div>
-    <h1 style="font-size:1.5rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">Uniswap Positions</h1>
+    <h1 style="font-size:1.5rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">Yield</h1>
     <p id="uniWalletLine" style="font-size:0.78rem;color:rgba(255,255,255,0.4);margin-top:0.25rem">V3 + V4 · Base</p>
   </div>
   <button onclick="loadPositions()" id="uniRefreshBtn"
@@ -3267,6 +3429,8 @@ function renderUniswapPage() {
   <div class="uni-stat"><div class="label">In Range</div><div class="value" id="sumInRange" style="color:#4ade80">—</div></div>
   <div class="uni-stat"><div class="label">Total Liquidity</div><div class="value" id="sumLiquidity" style="color:#a78bfa">—</div></div>
   <div class="uni-stat"><div class="label">Uncollected Fees</div><div class="value" id="sumFees" style="color:#A8F1F7">—</div></div>
+  <div class="uni-stat" id="sumStakedWrap" style="display:none"><div class="label">Total Staked</div><div class="value" id="sumStaked" style="color:#4ade80">—</div></div>
+  <div class="uni-stat" id="sumClaimableWrap" style="display:none"><div class="label">Claimable Rewards</div><div class="value" id="sumClaimable" style="color:#A8F1F7">—</div></div>
 </div>
 
 <div id="uniError" style="display:none;align-items:center;gap:0.75rem;padding:0.85rem 1rem;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.25);border-radius:8px;color:#f87171;font-size:0.82rem;margin-bottom:1rem">
@@ -3340,13 +3504,13 @@ async function loadPositions() {
     _uniPositions.length = 0;
     allPositions.forEach(p => _uniPositions.push(p));
 
-    // Get wallet address for display
+    // Get wallet addresses for display
     try {
-      const addrRes = await fetch('/uniswap/wallet');
-      const addrData = await addrRes.json();
-      _uniAddress = addrData.address || '';
-      const short = _uniAddress ? _uniAddress.slice(0,6) + '…' + _uniAddress.slice(-4) : '';
-      document.getElementById('uniWalletLine').textContent = 'V3 + V4 · Base' + (short ? ' · ' + short : '');
+      const addrData = await fetch('/uniswap/wallet').then(r => r.json());
+      const addrs = addrData.addresses || (addrData.address ? [addrData.address] : []);
+      _uniAddress = addrs[0] || '';
+      const walletLabel = addrs.length > 1 ? addrs.length + ' wallets' : addrs[0] ? addrs[0].slice(0,6) + '…' + addrs[0].slice(-4) : '';
+      document.getElementById('uniWalletLine').textContent = 'V3 + V4 · Base' + (walletLabel ? ' · ' + walletLabel : '');
     } catch {}
 
     if (allPositions.length === 0) {
@@ -3485,7 +3649,7 @@ async function loadPnl(pos) {
       version: pos.version, tokenId: pos.tokenId,
       token0: pos.token0.address, token1: pos.token1.address,
       decimals0: pos.token0.decimals, decimals1: pos.token1.decimals,
-      walletAddress: _uniAddress, fee: pos.fee,
+      walletAddress: pos.walletAddress || _uniAddress, fee: pos.fee,
     });
     if (pos.version === 'v4') {
       params.set('tickLower', pos.tickLower); params.set('tickUpper', pos.tickUpper);
@@ -3582,6 +3746,7 @@ async function doCollect(e, tokenId) {
     const pos = _uniPositions.find(p => p.tokenId === tokenId);
     const body = {
       tokenId,
+      walletAddress: pos?.walletAddress || _uniAddress || undefined,
       token0: pos ? { address: pos.token0.address, symbol: pos.token0.symbol, decimals: pos.token0.decimals } : null,
       token1: pos ? { address: pos.token1.address, symbol: pos.token1.symbol, decimals: pos.token1.decimals } : null,
     };
@@ -3610,6 +3775,221 @@ _uniStyle.textContent = '@keyframes spin { from{transform:rotate(0deg)} to{trans
 document.head.appendChild(_uniStyle);
 
 loadPositions();
+</script>
+
+<!-- ── Arbitrum + Ethereum V3 ─────────────────────────────────────────────── -->
+<div style="margin-top:2.5rem">
+  ${["arbitrum","ethereum"].map(chain => `
+    <details id="chain-section-${chain}" style="margin-bottom:1.5rem">
+      <summary style="list-style:none;display:flex;align-items:center;gap:0.65rem;cursor:pointer;padding:0.6rem 0.9rem;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:8px;font-size:0.82rem;font-weight:600;color:rgba(255,255,255,0.7);user-select:none">
+        <span style="font-size:0.75rem;background:${chain==="arbitrum"?"rgba(100,160,250,0.15)":"rgba(150,120,250,0.15)"};color:${chain==="arbitrum"?"#64a0fa":"#967cfa"};border:1px solid ${chain==="arbitrum"?"rgba(100,160,250,0.3)":"rgba(150,120,250,0.3)"};border-radius:4px;padding:0.1rem 0.45rem">${chain==="arbitrum"?"Arbitrum":"Ethereum"}</span>
+        Uniswap V3 Positions
+        <span id="${chain}-count" style="font-size:0.72rem;color:rgba(255,255,255,0.35);font-weight:400;margin-left:auto"></span>
+      </summary>
+      <div style="margin-top:0.75rem;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:8px;overflow:hidden">
+        <table class="uni-table">
+          <thead><tr>
+            <th style="text-align:left">Pair</th>
+            <th style="text-align:left">Status</th>
+            <th>Liquidity</th>
+            <th>Fees</th>
+            <th></th>
+          </tr></thead>
+          <tbody id="${chain}-tbody"><tr class="uni-loading-row"><td colspan="5">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </details>
+  `).join("")}
+</div>
+
+<!-- ── Staking Contracts ──────────────────────────────────────────────────── -->
+<div style="margin-top:2.5rem">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem">
+    <p class="section-label">Staking Contracts</p>
+    <button onclick="openAddStakingModal()" style="font-size:0.75rem;padding:0.3rem 0.75rem;border-radius:6px;border:1px solid rgba(168,241,247,0.25);background:transparent;color:#A8F1F7;cursor:pointer">+ Add</button>
+  </div>
+  <div id="stakingList">
+    ${(() => {
+      const contracts = listStakingContracts();
+      if (!contracts.length) return `<p class="hint">No staking contracts. Add one above.</p>`;
+      const CHAIN_LABELS = { base: 'Base', arbitrum: 'Arbitrum', ethereum: 'Ethereum' };
+      const CHAIN_COLORS = { base: '#A8F1F7', arbitrum: '#64a0fa', ethereum: '#967cfa' };
+      return contracts.map(c => `
+        <div id="staking-row-${c.id}" style="display:flex;align-items:center;gap:0.75rem;padding:0.7rem 0.9rem;border:1px solid rgba(255,255,255,0.08);border-radius:8px;margin-bottom:0.5rem;background:rgba(255,255,255,0.02)">
+          <span style="font-size:0.7rem;background:rgba(255,255,255,0.06);color:${CHAIN_COLORS[c.chain]||'#A8F1F7'};border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:0.1rem 0.45rem;flex-shrink:0">${CHAIN_LABELS[c.chain]||c.chain}</span>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:0.82rem;font-weight:600;color:#fafafa">${c.name}${c.token_symbol ? ` <span style="color:rgba(255,255,255,0.4);font-weight:400">(${c.token_symbol})</span>` : ''}</div>
+            <div style="font-size:0.7rem;font-family:monospace;color:rgba(255,255,255,0.3)">${c.address.slice(0,6)}…${c.address.slice(-4)}</div>
+          </div>
+          <div id="staking-balance-${c.id}" style="font-size:0.8rem;color:#A8F1F7;text-align:right;min-width:80px">—</div>
+          <div id="staking-earned-${c.id}" style="font-size:0.75rem;color:rgba(168,241,247,0.5);text-align:right;min-width:70px"></div>
+          <button onclick="deleteStakingRow('${c.id}')" style="background:none;border:1px solid rgba(248,113,113,0.3);color:#f87171;border-radius:6px;padding:0.2rem 0.55rem;font-size:0.7rem;cursor:pointer;flex-shrink:0">Delete</button>
+        </div>`).join("");
+    })()}
+  </div>
+</div>
+
+<script>
+// ── Arbitrum + Ethereum position loader ──────────────────────────────────────
+async function loadChainPositions(chain) {
+  const tbody = document.getElementById(chain + '-tbody');
+  const countEl = document.getElementById(chain + '-count');
+  try {
+    const walletData = await fetch('/uniswap/wallet').then(r => r.json());
+    const addresses = walletData.addresses || (walletData.address ? [walletData.address] : []);
+    if (!addresses.length) { tbody.innerHTML = '<tr class="uni-loading-row"><td colspan="5">No wallet configured.</td></tr>'; return; }
+    const res = await fetch('/uniswap/' + chain + '/positions');
+    const data = await res.json();
+    const positions = data.positions ?? [];
+    countEl.textContent = positions.length ? positions.length + ' position' + (positions.length > 1 ? 's' : '') : 'none';
+    if (!positions.length) {
+      tbody.innerHTML = '<tr class="uni-loading-row"><td colspan="5">No V3 positions on ' + (chain === 'arbitrum' ? 'Arbitrum' : 'Ethereum') + '.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = positions.map(p => {
+      const pair = p.token0.symbol + '/' + p.token1.symbol + ' · ' + p.feeDisplay;
+      const liq = p.totalLiquidityUsd !== null ? '$' + p.totalLiquidityUsd.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '—';
+      const fees = p.totalFeesUsd !== null ? '$' + p.totalFeesUsd.toFixed(2) : '—';
+      const status = !p.hasLiquidity ? '<span class="uni-badge-closed">Closed</span>' : p.inRange ? '<span class="uni-badge-inrange">In Range</span>' : '<span class="uni-badge-outrange">Out of Range</span>';
+      const chainLabel = chain === 'arbitrum' ? 'arbitrum' : 'ethereum';
+      const manageUrl = 'https://app.uniswap.org/positions/v3/' + chainLabel + '/' + p.tokenId;
+      return '<tr><td>' + pair + '</td><td>' + status + '</td><td style="text-align:right">' + liq + '</td><td style="text-align:right;color:#A8F1F7">' + fees + '</td><td style="text-align:right"><a href="' + manageUrl + '" target="_blank" rel="noopener" style="font-size:0.7rem;color:rgba(168,241,247,0.6)">Manage ↗</a></td></tr>';
+    }).join('');
+  } catch(e) {
+    tbody.innerHTML = '<tr class="uni-loading-row"><td colspan="5" style="color:#f87171">Error: ' + e.message + '</td></tr>';
+  }
+}
+
+// Auto-load when section is opened
+['arbitrum','ethereum'].forEach(chain => {
+  let loaded = false;
+  document.getElementById('chain-section-' + chain).addEventListener('toggle', function() {
+    if (this.open && !loaded) { loaded = true; loadChainPositions(chain); }
+  });
+});
+
+// ── Staking balance loader ────────────────────────────────────────────────────
+async function loadStakingBalances() {
+  // Use ALL wallets, not just uniswap-enabled ones
+  const allWallets = await fetch('/api/wallets').then(r => r.json()).catch(() => []);
+  const walletAddresses = allWallets.map(w => w.address).filter(Boolean);
+  if (!walletAddresses.length) return;
+
+  for (const sc of (_stakingContracts || [])) {
+    const balEl = document.getElementById('staking-balance-' + sc.id);
+    const earnEl = document.getElementById('staking-earned-' + sc.id);
+    if (!balEl) continue;
+    balEl.textContent = '…';
+
+    // Try every wallet, sum non-zero results
+    let totalStaked = 0, totalEarned = 0, totalStakedUsd = null, totalEarnedUsd = null, gotResult = false, lastError = null;
+    for (const wallet of walletAddresses) {
+      try {
+        const params = new URLSearchParams({ chain: sc.chain, address: sc.address, wallet });
+        if (sc.token_symbol) params.set('tokenSymbol', sc.token_symbol);
+        if (sc.token_address) params.set('tokenAddress', sc.token_address);
+        const res = await fetch('/api/staking-balance?' + params.toString());
+        const d = await res.json();
+        if (d.error) { lastError = d.error; continue; }
+        totalStaked += parseFloat(d.staked) || 0;
+        totalEarned += parseFloat(d.earned) || 0;
+        if (d.stakedUsd !== null && d.stakedUsd !== undefined) { totalStakedUsd = (totalStakedUsd || 0) + d.stakedUsd; }
+        if (d.earnedUsd !== null && d.earnedUsd !== undefined) { totalEarnedUsd = (totalEarnedUsd || 0) + d.earnedUsd; }
+        gotResult = true;
+      } catch (e) { lastError = e.message; }
+    }
+    _stakingTotals[sc.id] = { stakedUsd: totalStakedUsd, earnedUsd: totalEarnedUsd };
+
+    const sym = sc.token_symbol ? ' ' + sc.token_symbol : '';
+    if (!gotResult) {
+      balEl.textContent = '—'; balEl.title = lastError || 'No response';
+      if (earnEl) { earnEl.textContent = lastError?.slice(0, 60) || ''; earnEl.style.color = '#f87171'; }
+    } else {
+      const usdSuffix = (n) => n !== null && n !== undefined ? ' <span style="color:rgba(255,255,255,0.4);font-size:0.7em">($' + n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) + ')</span>' : '';
+      balEl.innerHTML = totalStaked.toLocaleString('en-US', {maximumFractionDigits: 4}) + sym + usdSuffix(totalStakedUsd);
+      if (earnEl) {
+        earnEl.style.color = '';
+        earnEl.innerHTML = totalEarned > 0
+          ? '+' + totalEarned.toLocaleString('en-US', {maximumFractionDigits: 4}) + sym + usdSuffix(totalEarnedUsd) + ' claimable'
+          : '';
+      }
+    }
+  }
+
+  // Update top summary cards
+  const grandStaked = Object.values(_stakingTotals).reduce((s, v) => s + (v.stakedUsd ?? 0), 0);
+  const grandEarned = Object.values(_stakingTotals).reduce((s, v) => s + (v.earnedUsd ?? 0), 0);
+  const hasAnyUsd = Object.values(_stakingTotals).some(v => v.stakedUsd !== null);
+  if (hasAnyUsd) {
+    const fmt = (n) => '$' + n.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    const stakedWrap = document.getElementById('sumStakedWrap');
+    const claimWrap = document.getElementById('sumClaimableWrap');
+    document.getElementById('sumStaked').textContent = fmt(grandStaked);
+    document.getElementById('sumClaimable').textContent = fmt(grandEarned);
+    if (stakedWrap) stakedWrap.style.display = '';
+    if (claimWrap) claimWrap.style.display = '';
+    document.getElementById('uniSummary').style.display = 'grid';
+  }
+}
+
+// Preload staking contracts for balance lookups
+let _stakingContracts = [], _stakingTotals = {};
+fetch('/api/staking-contracts').then(r => r.json()).then(d => { _stakingContracts = d; loadStakingBalances(); }).catch(() => {});
+
+// ── Add staking modal ─────────────────────────────────────────────────────────
+function openAddStakingModal() {
+  document.getElementById('modalTitle').textContent = 'Add Staking Contract';
+  document.getElementById('modalBody').innerHTML = \`
+    <div style="display:flex;flex-direction:column;gap:0.75rem;margin-top:0.5rem">
+      <div><label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Name</label>
+        <input id="sc_name" type="text" placeholder="e.g. VVV Staking" style="width:100%" /></div>
+      <div><label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Chain</label>
+        <select id="sc_chain" style="width:100%">
+          <option value="ethereum">Ethereum Mainnet</option>
+          <option value="arbitrum" selected>Arbitrum</option>
+          <option value="base">Base</option>
+        </select></div>
+      <div><label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Contract Address</label>
+        <input id="sc_address" type="text" placeholder="0x…" style="width:100%;font-family:monospace" /></div>
+      <div><label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Token Symbol (optional)</label>
+        <input id="sc_symbol" type="text" placeholder="e.g. VVV" style="width:100%" /></div>
+      <div><label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Token Contract Address (for USD price)</label>
+        <input id="sc_token_address" type="text" placeholder="0x… (optional — enables USD pricing)" style="width:100%;font-family:monospace" /></div>
+    </div>
+  \`;
+  const confirmBtn = document.getElementById('modalConfirm');
+  confirmBtn.textContent = 'Add Contract'; confirmBtn.className = 'modal-confirm-green';
+  confirmBtn.onclick = async () => {
+    const name = document.getElementById('sc_name').value.trim();
+    const chain = document.getElementById('sc_chain').value;
+    const address = document.getElementById('sc_address').value.trim();
+    const token_symbol = document.getElementById('sc_symbol').value.trim() || undefined;
+    const token_address = document.getElementById('sc_token_address')?.value.trim() || undefined;
+    if (!name || !address) { showToast('Name and address required', 'err'); return; }
+    if (!address.startsWith('0x') || address.length !== 42) { showToast('Invalid address', 'err'); return; }
+    document.getElementById('toggleModal').classList.remove('open');
+    const res = await fetch('/api/staking-contracts', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name, chain, address, token_symbol, token_address }) });
+    const d = await res.json();
+    if (d.ok) { showToast('Staking contract added', 'ok'); setTimeout(() => location.reload(), 800); }
+    else showToast(d.error || 'Failed', 'err');
+  };
+  document.getElementById('toggleModal').classList.add('open');
+}
+
+async function deleteStakingRow(id) {
+  document.getElementById('modalTitle').textContent = 'Remove Staking Contract';
+  document.getElementById('modalBody').innerHTML = 'Remove this staking contract from the dashboard?';
+  const confirmBtn = document.getElementById('modalConfirm');
+  confirmBtn.textContent = 'Remove'; confirmBtn.className = 'modal-confirm-red';
+  confirmBtn.onclick = async () => {
+    document.getElementById('toggleModal').classList.remove('open');
+    const res = await fetch('/api/staking-contracts/' + id, { method: 'DELETE' });
+    const d = await res.json();
+    if (d.ok) { showToast('Removed', 'ok'); setTimeout(() => location.reload(), 800); }
+    else showToast(d.error || 'Failed', 'err');
+  };
+  document.getElementById('toggleModal').classList.add('open');
+}
 </script>
 `, "uniswap");
 }
@@ -3647,7 +4027,7 @@ const server = createServer(async (req, res) => {
     if (url === "/history") return send(historyPage());
     if (url.startsWith("/settings") && method === "GET") {
       const schwabOk = new URL("http://x" + url).searchParams.get("schwab") === "authorized";
-      return send(settingsPage(false, "", schwabOk));
+      return send(await settingsPage(false, "", schwabOk));
     }
     if (url === "/settings" && method === "POST") {
       const body = await readBody();
@@ -3662,19 +4042,15 @@ const server = createServer(async (req, res) => {
                           "AGENT_API_KEY"]) {
         let v = params.get(key)?.trim();
         if (!v) continue;
-        // PEM keys contain real newlines from the textarea — encode to \n for single-line .env storage
-        if (key === "COINBASE_API_SECRET" && v.includes("\n")) {
-          v = v.replace(/\r?\n/g, "\\n");
-        }
+        if (key === "COINBASE_API_SECRET" && v.includes("\n")) v = v.replace(/\r?\n/g, "\\n");
         updates[key] = v;
       }
-      // Checkbox — present = true, absent = false
       updates["ALPACA_PAPER"] = params.get("ALPACA_PAPER") === "true" ? "true" : "false";
       try {
         writeEnvValues(updates);
-        return send(settingsPage(true));
+        return send(await settingsPage(true));
       } catch (e) {
-        return send(settingsPage(false, e.message));
+        return send(await settingsPage(false, e.message));
       }
     }
 
@@ -3870,6 +4246,200 @@ const server = createServer(async (req, res) => {
       } catch { return json({ error: "Invalid key" }, 400); }
     }
 
+    // ── Wallet management ─────────────────────────────────────────────────────
+
+    if (url === "/api/wallets" && method === "GET") {
+      const { privateKeyToAccount } = await import("viem/accounts");
+      const activeKey = process.env.AGENT_PRIVATE_KEY;
+      const wallets = listWallets().map(w => {
+        let address = null;
+        try { address = privateKeyToAccount(w.key).address; } catch {}
+        return { id: w.id, name: w.name, address, use_for_trading: w.use_for_trading,
+                 show_on_portfolio: w.show_on_portfolio, show_on_uniswap: w.show_on_uniswap,
+                 isActive: w.key === activeKey };
+      });
+      return json(wallets);
+    }
+
+    if (url === "/api/wallets" && method === "POST") {
+      const { name, key } = JSON.parse(await readBody());
+      if (!name?.trim()) return json({ ok: false, error: "Name required" }, 400);
+      if (!key?.startsWith("0x") || key.length !== 66) return json({ ok: false, error: "Invalid key — must be 0x + 64 hex chars" }, 400);
+      const { privateKeyToAccount } = await import("viem/accounts");
+      let address;
+      try { address = privateKeyToAccount(key).address; } catch (e) { return json({ ok: false, error: "Invalid key: " + e.message }, 400); }
+      const id = "wallet-" + Date.now();
+      insertWallet({ id, name: name.trim(), key });
+      return json({ ok: true, id, address });
+    }
+
+    if (url.startsWith("/api/wallets/") && method === "DELETE") {
+      const id = decodeURIComponent(url.replace("/api/wallets/", ""));
+      const wallet = listWallets().find(w => w.id === id);
+      if (!wallet) return json({ ok: false, error: "Wallet not found" }, 404);
+      if (wallet.use_for_trading) return json({ ok: false, error: "Cannot delete the active trading wallet" }, 400);
+      deleteWallet(id);
+      return json({ ok: true });
+    }
+
+    if (url.startsWith("/api/wallets/") && method === "PATCH") {
+      const id = decodeURIComponent(url.replace("/api/wallets/", ""));
+      const updates = JSON.parse(await readBody());
+      const wallet = listWallets().find(w => w.id === id);
+      if (!wallet) return json({ ok: false, error: "Wallet not found" }, 404);
+      if (updates.use_for_trading) {
+        setTradingWallet(id);
+        writeEnvValues({ AGENT_PRIVATE_KEY: wallet.key });
+        process.env.AGENT_PRIVATE_KEY = wallet.key;
+      } else {
+        updateWalletFlags(id, updates);
+      }
+      return json({ ok: true });
+    }
+
+    // ── Staking contracts ─────────────────────────────────────────────────────
+
+    if (url === "/api/staking-contracts" && method === "GET") {
+      return json(listStakingContracts());
+    }
+
+    if (url === "/api/staking-contracts" && method === "POST") {
+      const { name, chain, address, token_symbol, token_address } = JSON.parse(await readBody());
+      if (!name?.trim()) return json({ ok: false, error: "Name required" }, 400);
+      if (!address?.startsWith("0x") || address.length !== 42) return json({ ok: false, error: "Invalid address" }, 400);
+      const validChains = ["base", "arbitrum", "ethereum"];
+      if (!validChains.includes(chain)) return json({ ok: false, error: "Invalid chain" }, 400);
+      insertStakingContract({ id: "sc-" + Date.now(), name: name.trim(), chain, address,
+        token_symbol: token_symbol?.trim() || null,
+        token_address: token_address?.trim() || null });
+      return json({ ok: true });
+    }
+
+    if (url.startsWith("/api/staking-contracts/") && method === "DELETE") {
+      const id = decodeURIComponent(url.replace("/api/staking-contracts/", ""));
+      deleteStakingContract(id);
+      return json({ ok: true });
+    }
+
+    if (url.startsWith("/api/staking-balance") && method === "GET") {
+      const qp = new URL("http://x" + url).searchParams;
+      const preferredChain = qp.get("chain") || "base";
+      const contractAddress = qp.get("address");
+      const walletAddress = qp.get("wallet");
+      if (!contractAddress || !walletAddress) return json({ ok: false, error: "address and wallet required" }, 400);
+      try {
+        const { createPublicClient, http, formatUnits } = await import("viem");
+        const { base, arbitrum, mainnet } = await import("viem/chains");
+        const k = process.env.ALCHEMY_API_KEY;
+        const CHAINS = {
+          base:     { viemChain: base,     rpc: k ? `https://base-mainnet.g.alchemy.com/v2/${k}` : "https://mainnet.base.org" },
+          arbitrum: { viemChain: arbitrum, rpc: k ? `https://arb-mainnet.g.alchemy.com/v2/${k}` : "https://arb1.arbitrum.io/rpc" },
+          ethereum: { viemChain: mainnet,  rpc: k ? `https://eth-mainnet.g.alchemy.com/v2/${k}` : "https://eth.llamarpc.com" },
+        };
+
+        // Single uint256 return
+        const viewU = (name) => ({ name, type: "function", inputs: [{ type: "address" }], outputs: [{ type: "uint256" }], stateMutability: "view" });
+        // Struct return — take first uint256 field (staked amount)
+        const viewStruct = (name) => ({ name, type: "function", inputs: [{ type: "address" }],
+          outputs: [{ type: "tuple", components: [{ name: "amountStaked", type: "uint256" }, { name: "misc", type: "uint256" }] }], stateMutability: "view" });
+
+        const STAKED_FNS = [
+          { fn: "stakeOf",          abi: viewU("stakeOf") },
+          { fn: "stakedOf",         abi: viewU("stakedOf") },
+          { fn: "balanceOf",        abi: viewU("balanceOf") },
+          { fn: "getUserStake",     abi: viewU("getUserStake") },
+          { fn: "stakedBalanceOf",  abi: viewU("stakedBalanceOf") },
+          { fn: "stakes",           abi: viewStruct("stakes"),  struct: true },
+          { fn: "userInfo",         abi: viewStruct("userInfo"), struct: true },
+        ];
+        const EARNED_FNS = ["earned", "pendingRewards", "rewardOf", "pendingReward", "claimable", "getPendingReward", "rewards"];
+
+        // Try preferred chain first, then others
+        const chainOrder = [preferredChain, ...Object.keys(CHAINS).filter(c => c !== preferredChain)];
+        let client, usedChain;
+        for (const c of chainOrder) {
+          const cfg = CHAINS[c];
+          const cl = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpc) });
+          const code = await cl.getBytecode({ address: contractAddress }).catch(() => null);
+          if (code && code !== "0x") { client = cl; usedChain = c; break; }
+        }
+        if (!client) return json({ ok: false, error: "Contract not found on base, arbitrum, or ethereum" }, 400);
+
+        let decimals = 18;
+        try { decimals = Number(await client.readContract({ address: contractAddress, abi: [{ name: "decimals", type: "function", inputs: [], outputs: [{ type: "uint8" }], stateMutability: "view" }], functionName: "decimals" })); } catch {}
+
+        let rawStaked = null, stakedFn = null;
+        for (const { fn, abi, struct } of STAKED_FNS) {
+          try {
+            const result = await client.readContract({ address: contractAddress, abi: [abi], functionName: fn, args: [walletAddress] });
+            rawStaked = struct ? result.amountStaked : result;
+            stakedFn = fn;
+            break;
+          } catch {}
+        }
+        if (rawStaked === null) return json({ ok: false, error: `No staked balance function found on ${usedChain}` }, 400);
+
+        let rawEarned = null;
+        for (const fn of EARNED_FNS) {
+          try {
+            rawEarned = await client.readContract({ address: contractAddress, abi: [viewU(fn)], functionName: fn, args: [walletAddress] });
+            break;
+          } catch {}
+        }
+
+        // Get token USD price — prioritize: explicit token_address param → contract lookup → HL mid-price by symbol
+        const explicitTokenAddr = qp.get("tokenAddress");
+        const tokenSymbol = qp.get("tokenSymbol");
+        let tokenPriceUsd = null;
+
+        // 1. Try DeFiLlama with explicit token address
+        if (explicitTokenAddr) {
+          try {
+            const pr = await fetch(`https://coins.llama.fi/prices/current/${usedChain}:${explicitTokenAddr.toLowerCase()}`);
+            const entry = Object.values((await pr.json()).coins ?? {})[0];
+            if (entry?.price) tokenPriceUsd = entry.price;
+          } catch {}
+        }
+
+        // 2. Try resolving token address from contract, then DeFiLlama
+        if (tokenPriceUsd === null) {
+          for (const fn of ["stakingToken", "token", "rewardToken"]) {
+            try {
+              const ta = await client.readContract({ address: contractAddress,
+                abi: [{ name: fn, type: "function", inputs: [], outputs: [{ type: "address" }], stateMutability: "view" }],
+                functionName: fn });
+              const pr = await fetch(`https://coins.llama.fi/prices/current/${usedChain}:${ta.toLowerCase()}`);
+              const entry = Object.values((await pr.json()).coins ?? {})[0];
+              if (entry?.price) { tokenPriceUsd = entry.price; break; }
+            } catch {}
+          }
+        }
+
+        // 3. Fall back to Hyperliquid mid-price by token symbol
+        if (tokenPriceUsd === null && tokenSymbol) {
+          try {
+            const hlRes = await fetch("https://api.hyperliquid.xyz/info", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ type: "allMids" }),
+            });
+            const mids = await hlRes.json();
+            const midKey = Object.keys(mids).find(k => k.toUpperCase() === tokenSymbol.toUpperCase());
+            if (midKey) tokenPriceUsd = parseFloat(mids[midKey]);
+          } catch {}
+        }
+
+        const stakedNum = parseFloat(formatUnits(rawStaked, decimals));
+        const earnedNum = rawEarned !== null ? parseFloat(formatUnits(rawEarned, decimals)) : null;
+        return json({
+          staked: formatUnits(rawStaked, decimals),
+          earned: earnedNum !== null ? String(earnedNum) : null,
+          stakedUsd: tokenPriceUsd !== null ? stakedNum * tokenPriceUsd : null,
+          earnedUsd: tokenPriceUsd !== null && earnedNum !== null ? earnedNum * tokenPriceUsd : null,
+          tokenPriceUsd, chain: usedChain, stakedFn,
+        });
+      } catch (e) { return json({ ok: false, error: e.message }, 500); }
+    }
+
     // ── Schwab option writing ─────────────────────────────────────────────────
 
     if (url.startsWith("/schwab/option-mid") && method === "GET") {
@@ -3969,58 +4539,84 @@ const server = createServer(async (req, res) => {
 
     // ── Uniswap ────────────────────────────────────────────────────────────────
 
+    async function getUniswapAddresses() {
+      const { privateKeyToAccount } = await import("viem/accounts");
+      const uniWallets = listWallets().filter(w => w.show_on_uniswap);
+      if (uniWallets.length) {
+        return uniWallets.map(w => { try { return { address: privateKeyToAccount(w.key).address, key: w.key }; } catch { return null; } }).filter(Boolean);
+      }
+      if (PRIVATE_KEY) return [{ address: privateKeyToAccount(PRIVATE_KEY).address, key: PRIVATE_KEY }];
+      return [];
+    }
+
     if (url === "/premium-fade" && method === "GET") return send(await premiumFadePage());
     if (url === "/uniswap" && method === "GET") return send(renderUniswapPage());
 
     if (url === "/uniswap/wallet" && method === "GET") {
       try {
-        if (!PRIVATE_KEY) return json({ address: null });
         const { privateKeyToAccount } = await import("viem/accounts");
-        const acct = privateKeyToAccount(PRIVATE_KEY);
-        return json({ address: acct.address });
-      } catch { return json({ address: null }); }
+        const uniWallets = listWallets().filter(w => w.show_on_uniswap);
+        const addresses = uniWallets.length
+          ? uniWallets.map(w => { try { return privateKeyToAccount(w.key).address; } catch { return null; } }).filter(Boolean)
+          : PRIVATE_KEY ? [privateKeyToAccount(PRIVATE_KEY).address] : [];
+        return json({ address: addresses[0] ?? null, addresses });
+      } catch { return json({ address: null, addresses: [] }); }
     }
 
     if (url === "/uniswap/positions" && method === "GET") {
       try {
-        if (!PRIVATE_KEY) return json({ error: "AGENT_PRIVATE_KEY not set" }, 400);
-        const { privateKeyToAccount } = await import("viem/accounts");
-        const { address } = privateKeyToAccount(PRIVATE_KEY);
-        return json(await getV3Positions(address));
+        const addresses = await getUniswapAddresses();
+        if (!addresses.length) return json({ error: "No wallets configured" }, 400);
+        const all = await Promise.all(addresses.map(({ address }) => getV3Positions(address).then(r => r.positions.map(p => ({ ...p, walletAddress: address })))));
+        return json({ positions: all.flat() });
+      } catch (e) { return json({ error: e.message }, 500); }
+    }
+
+    if ((url === "/uniswap/arbitrum/positions" || url === "/uniswap/ethereum/positions") && method === "GET") {
+      try {
+        const addresses = await getUniswapAddresses();
+        if (!addresses.length) return json({ error: "No wallets configured" }, 400);
+        const chain = url.includes("/arbitrum/") ? "arbitrum" : "ethereum";
+        const all = await Promise.all(addresses.map(({ address }) => getV3PositionsForChain(address, chain).then(r => r.positions.map(p => ({ ...p, walletAddress: address })))));
+        return json({ positions: all.flat() });
       } catch (e) { return json({ error: e.message }, 500); }
     }
 
     if (url === "/uniswap/v4/positions" && method === "GET") {
       try {
-        if (!PRIVATE_KEY) return json({ error: "AGENT_PRIVATE_KEY not set" }, 400);
-        const { privateKeyToAccount } = await import("viem/accounts");
-        const { address } = privateKeyToAccount(PRIVATE_KEY);
-        return json(await getV4Positions(address));
+        const addresses = await getUniswapAddresses();
+        if (!addresses.length) return json({ error: "No wallets configured" }, 400);
+        const all = await Promise.all(addresses.map(({ address }) => getV4Positions(address).then(r => r.positions.map(p => ({ ...p, walletAddress: address })))));
+        return json({ positions: all.flat() });
       } catch (e) { return json({ error: e.message }, 500); }
     }
 
     if (url.startsWith("/uniswap/pnl") && method === "GET") {
       try {
-        if (!PRIVATE_KEY) return json({ error: "AGENT_PRIVATE_KEY not set" }, 400);
-        const { privateKeyToAccount } = await import("viem/accounts");
-        const { address } = privateKeyToAccount(PRIVATE_KEY);
         const qp = Object.fromEntries(new URL("http://x" + url).searchParams.entries());
-        // Map client param names → getPnl param names; wallet comes from server
-        qp.token0Raw = qp.token0;
-        qp.token1Raw = qp.token1;
-        qp.walletRaw = address;
+        // walletAddress passed by client per-position; fall back to active key
+        const walletAddr = qp.walletAddress || (PRIVATE_KEY ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY).address : null);
+        if (!walletAddr) return json({ error: "No wallet" }, 400);
+        qp.token0Raw = qp.token0; qp.token1Raw = qp.token1; qp.walletRaw = walletAddr;
         return json(await getPnl(qp));
       } catch (e) { return json({ error: e.message }, 500); }
     }
 
     if (url === "/uniswap/collect" && method === "POST") {
       try {
-        if (!PRIVATE_KEY) return json({ error: "AGENT_PRIVATE_KEY not set" }, 400);
-        const { tokenId, token0, token1 } = JSON.parse(await readBody());
+        const { tokenId, token0, token1, walletAddress } = JSON.parse(await readBody());
         if (!tokenId) return json({ error: "tokenId required" }, 400);
+        // Find the key for the wallet that owns this position
         const { privateKeyToAccount } = await import("viem/accounts");
-        const { address } = privateKeyToAccount(PRIVATE_KEY);
-        const result = await collectAndSwap(tokenId, address, PRIVATE_KEY, token0, token1);
+        const wallets = listWallets().filter(w => w.show_on_uniswap);
+        let useKey = PRIVATE_KEY;
+        if (walletAddress && wallets.length) {
+          const match = wallets.find(w => { try { return privateKeyToAccount(w.key).address.toLowerCase() === walletAddress.toLowerCase(); } catch { return false; } });
+          if (match) useKey = match.key;
+        }
+        if (!useKey) return json({ error: "No wallet key found" }, 400);
+        const { address } = privateKeyToAccount(useKey);
+        const result = await collectAndSwap(tokenId, address, useKey, token0, token1);
         // Record in trade history
         insertTrade({
           strategy_id: 'uniswap',
