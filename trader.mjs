@@ -834,3 +834,31 @@ for (const strategy of strategies) {
 
 console.log(`\n[trader] Done.`);
 
+// Sync position snapshot to AgentSignal account
+if (AGENT_API_KEY && AGENT_SIGNAL_URL) {
+  try {
+    const snapshot = strategies.map(s => {
+      const latest = getLatestSignal(s.id);
+      return {
+        strategy_id:   s.id,
+        strategy_name: s.name,
+        asset:         s.symbol,
+        exchange:      s.exchange ?? "hyperliquid",
+        signal:        latest?.signal ?? "FLAT",
+        signal_price:  latest?.price ?? null,
+      };
+    });
+    const res = await fetch(`${AGENT_SIGNAL_URL}/api/account/positions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${AGENT_API_KEY}` },
+      body: JSON.stringify({ positions: snapshot }),
+    });
+    if (res.ok) {
+      const { synced } = await res.json();
+      console.log(`[trader] 📡 Synced ${synced} position(s) to AgentSignal`);
+    }
+  } catch (e) {
+    console.warn(`[trader] ⚠️  Position sync failed: ${e.message}`);
+  }
+}
+
