@@ -135,6 +135,11 @@ try { db.exec("ALTER TABLE strategies ADD COLUMN tp_pct REAL"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN trail_pct REAL"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN max_size_usd REAL"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN cooldown_minutes INTEGER"); } catch {}
+try { db.exec("ALTER TABLE strategies ADD COLUMN risk_mode TEXT"); } catch {}
+
+export function setStrategyRiskMode(id, mode) {
+  db.prepare("UPDATE strategies SET risk_mode = ? WHERE id = ?").run(mode ?? null, id);
+}
 
 // ── TP / Trail state (one row per open position) ──────────────────────────────
 

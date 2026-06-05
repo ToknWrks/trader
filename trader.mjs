@@ -94,7 +94,7 @@ import {
   getPriorSignal, insertTrade, isStrategyDue, touchStrategyRun,
   insertSignalEvent, setTpState, getTpState, updateTpTrailMode,
   updateTpHighWater, clearTpState, logFetch, getLastTradeTime,
-  setSubscriptionExpiry, getLastStrategyEntry,
+  setSubscriptionExpiry, getLastStrategyEntry, setStrategyRiskMode,
 } from "./db.mjs";
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
@@ -312,7 +312,21 @@ async function tryLocalEval(strategy, def) {
         } else {
           actual = price;
         }
-        if (passthroughFlds.has(field)) return true; // no entry price context in live — pass through, tp_pct/sl_pct governs
+        if (passthroughFlds.has(field)) {
+          const entryPx = parseFloat(position?.entryPx ?? "0");
+          if (!entryPx || !hasPosition) return true;
+          if (field === "pct_above_entry") {
+            actual = isLong
+              ? (price - entryPx) / entryPx * 100
+              : (entryPx - price) / entryPx * 100;
+          } else if (field === "pct_below_entry") {
+            actual = isLong
+              ? (entryPx - price) / entryPx * 100
+              : (price - entryPx) / entryPx * 100;
+          } else {
+            return true;
+          }
+        }
         if (actual == null) return false;
         const op = c.op;
         if (op === "<="  || op === "lte") return actual <= v;
@@ -770,6 +784,7 @@ for (const strategy of strategies) {
   const def  = await fetchStrategyDef(strategy.id);
   const parseJson = v => { try { return typeof v === "string" ? JSON.parse(v) : (v ?? {}); } catch { return {}; } };
   const risk = parseJson(def?.risk);
+  if (risk?.mode) setStrategyRiskMode(strategy.id, risk.mode);
   const effectiveStrategy = {
     ...strategy,
     risk,  // expose parsed risk so fetchSignal can detect scalper mode + gate checks
@@ -812,7 +827,7 @@ for (const strategy of strategies) {
 
   const isScalper = effectiveStrategy.risk?.mode === "scalp";
 
-  if (!signalChanged && !isScalper) {
+  if (!signalChanged && (!isScalper || signal === "FLAT")) {
     console.log(`[trader] ⚪ Signal unchanged (${signal}) — holding`);
     insertSignalEvent({
       strategy_id: strategy.id,

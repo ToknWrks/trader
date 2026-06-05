@@ -1508,7 +1508,7 @@ function strategiesPage() {
         const sigClass = sig === "LONG" ? "badge-long" : sig === "SHORT" ? "badge-short" : "badge-flat";
 
         // Position status: infer from last trade + signal flip detection
-        const isScalper = (() => { try { return (typeof s.risk === "string" ? JSON.parse(s.risk) : s.risk)?.mode === "scalp"; } catch { return false; } })();
+        const isScalper = s.risk_mode === "scalp";
         const sigHistory = getSignalHistory(s.id, 2);
         const prevSig = sigHistory[1]?.signal ?? null;
         const flipped = prevSig !== null && prevSig !== sig;
@@ -1528,8 +1528,12 @@ function strategiesPage() {
           else if (!posOpen && willEnter)nextBadge = `<span style="font-size:0.68rem;background:rgba(248,113,113,0.08);color:#fca5a5;border:1px solid rgba(248,113,113,0.2);border-radius:4px;padding:0.1rem 0.45rem">↓ entering</span>`;
           else if (!posOpen)             nextBadge = `<span style="font-size:0.68rem;background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.3);border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:0.1rem 0.45rem">short / no pos</span>`;
         } else if (sig === "FLAT") {
-          if (posOpen)                   nextBadge = `<span style="font-size:0.68rem;background:rgba(251,191,36,0.1);color:#fbbf24;border:1px solid rgba(251,191,36,0.25);border-radius:4px;padding:0.1rem 0.45rem">↙ closing</span>`;
-          else                           nextBadge = `<span style="font-size:0.68rem;background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.3);border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:0.1rem 0.45rem">○ flat</span>`;
+          // Scalpers: stored FLAT may mean "entry criteria not met" not "exit criteria met"
+          // Exit is re-evaluated live at runtime — show holding if position open
+          if (posOpen && isScalper && posLong)  nextBadge = `<span style="font-size:0.68rem;background:rgba(74,222,128,0.12);color:#4ade80;border:1px solid rgba(74,222,128,0.3);border-radius:4px;padding:0.1rem 0.45rem">● long</span>`;
+          else if (posOpen && isScalper)        nextBadge = `<span style="font-size:0.68rem;background:rgba(248,113,113,0.12);color:#f87171;border:1px solid rgba(248,113,113,0.3);border-radius:4px;padding:0.1rem 0.45rem">● short</span>`;
+          else if (posOpen)                     nextBadge = `<span style="font-size:0.68rem;background:rgba(251,191,36,0.1);color:#fbbf24;border:1px solid rgba(251,191,36,0.25);border-radius:4px;padding:0.1rem 0.45rem">↙ closing</span>`;
+          else                                  nextBadge = `<span style="font-size:0.68rem;background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.3);border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:0.1rem 0.45rem">○ flat</span>`;
         }
 
         const size = s.position_size_usd ? "$" + s.position_size_usd : "$" + (process.env.HL_POSITION_SIZE_USD ?? 10) + " (default)";
@@ -2871,6 +2875,11 @@ async function handleRun(body) {
   const strategy = getStrategy(id);
   if (!strategy) return { ok: false, error: "Strategy not found" };
 
+  // Fetch strategy def once — used for scalper detection and URL routing
+  const stratDef = await fetch(`${getSignalUrl()}/api/strategy/${id}`).then(r => r.ok ? r.json() : null).catch(() => null);
+  const stratRisk = (() => { try { return typeof stratDef?.risk === "string" ? JSON.parse(stratDef.risk) : (stratDef?.risk ?? {}); } catch { return {}; } })();
+  const isScalperRun = stratRisk?.mode === "scalp";
+
   // Try local price evaluation first (free, no x402 cost)
   let signalData = await tryLocalEvalDash(strategy);
 
@@ -2886,8 +2895,7 @@ async function handleRun(body) {
     const account = privateKeyToAccount(PRIVATE_KEY);
     const client = new x402Client();
 
-    const defForUrl = await fetch(`${getSignalUrl()}/api/strategy/${id}`).then(r => r.ok ? r.json() : null).catch(() => null);
-    const isScalperStrategy = defForUrl?.risk?.mode === "scalp";
+    const isScalperStrategy = isScalperRun;
     const url = isScalperStrategy
       ? `${getSignalUrl()}/api/scalper/${id}/signal`
       : `${getSignalUrl()}/api/strategy/${id}/signal`;
@@ -2945,10 +2953,12 @@ async function handleRun(body) {
   const { upsertSignal } = await import("./db.mjs");
   upsertSignal({ strategy_id: id, signal, price, date: signalData.date ?? new Date().toISOString().slice(0,10), notes: scoreNotes || null });
 
-  // Only execute on flip (or first ever signal that's actionable)
+  // Scalpers act whenever signal is directional + no open position (no flip required)
   const prev = priorSignal?.signal ?? null;
   const isFlip = signal !== prev;
-  const shouldAct = isFlip && (signal === "LONG" || signal === "SHORT" || (signal === "FLAT" && prev !== null));
+  const shouldAct = isScalperRun
+    ? (signal === "LONG" || signal === "SHORT" || (signal === "FLAT" && prev !== null))
+    : isFlip && (signal === "LONG" || signal === "SHORT" || (signal === "FLAT" && prev !== null));
   if (!shouldAct) return { ok: true, action: `Signal is ${signal} (no change from ${prev ?? "none"}) — no trade executed` };
 
   // Execute trade via exchange abstraction
