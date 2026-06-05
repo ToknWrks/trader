@@ -91,6 +91,7 @@ import {
   deleteStrategy, getSignalHistory, getAllRecentTrades, getLatestSignal,
   countSignals, countFetchesToday, countFetchesTotal, getRecentSignalEvents, getYtdPnl,
   getSnapshots, insertSnapshot, hasSnapshots, backfillSnapshotsFromTrades, insertTrade,
+  insertLiquidationTrade, getTradeHistory,
   maybeCreateDefaultWallet, listWallets, insertWallet, deleteWallet, updateWalletFlags, setTradingWallet,
   listStakingContracts, insertStakingContract, deleteStakingContract,
 } from "./db.mjs";
@@ -1505,6 +1506,32 @@ function strategiesPage() {
         const latest = getLatestSignal(s.id);
         const sig = latest?.signal ?? "—";
         const sigClass = sig === "LONG" ? "badge-long" : sig === "SHORT" ? "badge-short" : "badge-flat";
+
+        // Position status: infer from last trade + signal flip detection
+        const isScalper = (() => { try { return (typeof s.risk === "string" ? JSON.parse(s.risk) : s.risk)?.mode === "scalp"; } catch { return false; } })();
+        const sigHistory = getSignalHistory(s.id, 2);
+        const prevSig = sigHistory[1]?.signal ?? null;
+        const flipped = prevSig !== null && prevSig !== sig;
+        const lastTrades = getTradeHistory(s.id, 1);
+        const lastAction = lastTrades[0]?.action ?? null;
+        const posOpen = lastAction && (lastAction.startsWith("ENTERED") || lastAction.startsWith("SHORTED"));
+        const posLong = posOpen && lastAction.startsWith("ENTERED");
+        // scalpers enter whenever signal is directional + no position (no flip required)
+        const willEnter = flipped || isScalper;
+        let nextBadge = "";
+        if (sig === "LONG") {
+          if (posOpen && posLong)        nextBadge = `<span style="font-size:0.68rem;background:rgba(74,222,128,0.12);color:#4ade80;border:1px solid rgba(74,222,128,0.3);border-radius:4px;padding:0.1rem 0.45rem">● long</span>`;
+          else if (!posOpen && willEnter)nextBadge = `<span style="font-size:0.68rem;background:rgba(74,222,128,0.08);color:#86efac;border:1px solid rgba(74,222,128,0.2);border-radius:4px;padding:0.1rem 0.45rem">↑ entering</span>`;
+          else if (!posOpen)             nextBadge = `<span style="font-size:0.68rem;background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.3);border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:0.1rem 0.45rem">long / no pos</span>`;
+        } else if (sig === "SHORT") {
+          if (posOpen && !posLong)       nextBadge = `<span style="font-size:0.68rem;background:rgba(248,113,113,0.12);color:#f87171;border:1px solid rgba(248,113,113,0.3);border-radius:4px;padding:0.1rem 0.45rem">● short</span>`;
+          else if (!posOpen && willEnter)nextBadge = `<span style="font-size:0.68rem;background:rgba(248,113,113,0.08);color:#fca5a5;border:1px solid rgba(248,113,113,0.2);border-radius:4px;padding:0.1rem 0.45rem">↓ entering</span>`;
+          else if (!posOpen)             nextBadge = `<span style="font-size:0.68rem;background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.3);border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:0.1rem 0.45rem">short / no pos</span>`;
+        } else if (sig === "FLAT") {
+          if (posOpen)                   nextBadge = `<span style="font-size:0.68rem;background:rgba(251,191,36,0.1);color:#fbbf24;border:1px solid rgba(251,191,36,0.25);border-radius:4px;padding:0.1rem 0.45rem">↙ closing</span>`;
+          else                           nextBadge = `<span style="font-size:0.68rem;background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.3);border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:0.1rem 0.45rem">○ flat</span>`;
+        }
+
         const size = s.position_size_usd ? "$" + s.position_size_usd : "$" + (process.env.HL_POSITION_SIZE_USD ?? 10) + " (default)";
         const tv = tvSymbol(s.symbol, s.exchange);
         const sdJson = JSON.stringify(s).replace(/"/g, '&quot;');
@@ -1524,6 +1551,7 @@ function strategiesPage() {
                 <strong style="font-size:0.95rem">${s.name}</strong>
                 <span class="cyan" style="font-size:0.8rem">${s.symbol}</span>
                 ${sig !== "—" ? `<span class="${sigClass}">${sig}</span>` : ""}
+                ${nextBadge}
                 ${s.active ? `<span class="badge-active">● AUTO</span>` : `<span class="badge-inactive">○ INACTIVE</span>`}
                 ${subBadge}
               </div>
@@ -1952,7 +1980,29 @@ function signalsPage() {
   `, "signals");
 }
 
-function historyPage() {
+async function historyPage() {
+  // Sync liquidations from Hyperliquid before rendering
+  if (PRIVATE_KEY) {
+    try {
+      const { privateKeyToAccount } = await import("viem/accounts");
+      const { getLiquidationFills } = await import("./hyperliquid.mjs");
+      const address = privateKeyToAccount(PRIVATE_KEY).address;
+      const sinceMs = Date.now() - 90 * 24 * 60 * 60 * 1000; // 90 days
+      const fills = await getLiquidationFills(address, sinceMs);
+      const strategies = getStrategies();
+      for (const fill of fills) {
+        // Match to a strategy by symbol (strip -USD / /USD suffix)
+        const coin = fill.coin.toUpperCase();
+        const matched = strategies.find(s =>
+          s.symbol.replace(/-USD$|\/USD$/i, "").toUpperCase() === coin
+        );
+        insertLiquidationTrade(fill, matched?.id ?? null);
+      }
+    } catch (e) {
+      console.warn("[dashboard] Liquidation sync failed:", e.message);
+    }
+  }
+
   const trades = getAllRecentTrades(100);
   const strategies = getStrategies();
 
@@ -2000,11 +2050,12 @@ function historyPage() {
       ? tList.map(t => {
           const isEntry = t.action.startsWith("ENTERED") || t.action.startsWith("SHORTED");
           const isCollect = t.action === 'COLLECT FEES';
+          const isLiquidated = t.action === 'LIQUIDATED';
           const pnl = t.pnl != null ? parseFloat(t.pnl) : null;
           const pnlStr = pnl != null
             ? `<span style="color:${pnl >= 0 ? "#4ade80" : "#f87171"}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</span>`
             : "—";
-          const actionColor = isCollect ? "#A8F1F7" : isEntry ? "#4ade80" : "#f87171";
+          const actionColor = isCollect ? "#A8F1F7" : isLiquidated ? "#f97316" : isEntry ? "#4ade80" : "#f87171";
           const strategyLabel = isCollect ? "Uniswap" : (t.strategy_name ?? (t.strategy_id === 'manual' ? 'Manual' : t.strategy_id ? t.strategy_id.slice(0,8) : '—'));
           return `<tr${isCollect ? ' style="background:rgba(168,241,247,0.03)"' : ''}>
             <td>${t.created_at.slice(0, 16)}</td>
@@ -4024,7 +4075,7 @@ const server = createServer(async (req, res) => {
     if (url === "/positions") return send(await positionsPage());
     if (url === "/strategies") return send(strategiesPage());
     if (url === "/signals") return send(signalsPage());
-    if (url === "/history") return send(historyPage());
+    if (url === "/history") return send(await historyPage());
     if (url.startsWith("/settings") && method === "GET") {
       const schwabOk = new URL("http://x" + url).searchParams.get("schwab") === "authorized";
       return send(await settingsPage(false, "", schwabOk));

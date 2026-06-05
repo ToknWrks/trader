@@ -250,6 +250,19 @@ export async function getCandleSnapshots(asset, interval, count = 100) {
 }
 
 /**
+ * Fetch fills where the given address was liquidated (not where they liquidated others).
+ * @param {string} address  0x-prefixed wallet address
+ * @param {number} sinceMs  epoch ms — only fills after this time
+ */
+export async function getLiquidationFills(address, sinceMs) {
+  const info = new InfoClient({ transport });
+  const fills = await info.userFillsByTime({ user: address, startTime: sinceMs });
+  return fills.filter(f =>
+    f.liquidation && f.liquidation.liquidatedUser.toLowerCase() === address.toLowerCase()
+  );
+}
+
+/**
  * Close all positions for an asset (reduce-only IOC).
  */
 export async function closePosition(privateKey, asset) {

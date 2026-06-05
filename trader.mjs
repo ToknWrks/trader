@@ -810,7 +810,9 @@ for (const strategy of strategies) {
     notes: scoreNotes || null,
   });
 
-  if (!signalChanged) {
+  const isScalper = effectiveStrategy.risk?.mode === "scalp";
+
+  if (!signalChanged && !isScalper) {
     console.log(`[trader] ⚪ Signal unchanged (${signal}) — holding`);
     insertSignalEvent({
       strategy_id: strategy.id,

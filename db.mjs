@@ -103,7 +103,7 @@ export function upsertStrategy({ id, name, symbol, leverage, position_size_usd, 
       sl_pct = excluded.sl_pct,
       max_size_usd = excluded.max_size_usd,
       cooldown_minutes = excluded.cooldown_minutes,
-      subscription_period = excluded.subscription_period
+      subscription_period = COALESCE(excluded.subscription_period, strategies.subscription_period)
   `).run(id, name, symbol, leverage ?? 1, position_size_usd ?? null, exchange ?? "hyperliquid", interval_minutes ?? 60, tp_pct ?? null, trail_pct ?? null, sl_pct ?? null, max_size_usd ?? null, cooldown_minutes ?? null, subscription_period ?? null);
 }
 
@@ -338,6 +338,33 @@ export function insertTrade({ strategy_id, action, asset, size, price, leverage,
 
 // Migrate existing DB: add pnl column if it doesn't exist yet
 try { db.exec("ALTER TABLE trades ADD COLUMN pnl REAL"); } catch {}
+// Migrate: add fill_hash for dedup of exchange-sourced events (liquidations)
+try { db.exec("ALTER TABLE trades ADD COLUMN fill_hash TEXT"); } catch {}
+try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS trades_fill_hash ON trades(fill_hash) WHERE fill_hash IS NOT NULL"); } catch {}
+
+/**
+ * Insert a liquidation fill sourced from the exchange (not triggered by the trader).
+ * No-ops if this fill_hash already exists.
+ * @param {{ coin: string, px: string, sz: string, closedPnl: string, time: number, hash: string }} fill
+ * @param {number|null} strategyId
+ */
+export function insertLiquidationTrade(fill, strategyId) {
+  const existing = db.prepare("SELECT id FROM trades WHERE fill_hash = ?").get(fill.hash);
+  if (existing) return;
+  const ts = new Date(fill.time).toISOString().replace("T", " ").slice(0, 19);
+  db.prepare(`
+    INSERT INTO trades (strategy_id, action, asset, size, price, pnl, fill_hash, created_at)
+    VALUES (?, 'LIQUIDATED', ?, ?, ?, ?, ?, ?)
+  `).run(
+    strategyId ?? null,
+    fill.coin,
+    parseFloat(fill.sz),
+    parseFloat(fill.px),
+    parseFloat(fill.closedPnl),
+    fill.hash,
+    ts,
+  );
+}
 
 
 export function getTradeHistory(strategy_id, limit = 30) {
