@@ -1544,7 +1544,9 @@ async function strategiesPage() {
         const sdJson = JSON.stringify(s).replace(/"/g, '&quot;');
         const subExpired = s.subscription_period && s.subscription_expires_at && new Date(s.subscription_expires_at) <= new Date();
         const subValid   = s.subscription_period && s.subscription_expires_at && new Date(s.subscription_expires_at) > new Date();
-        const subBadge   = subExpired
+        const subBadge   = isAlpha
+          ? `<span style="font-size:0.7rem;background:rgba(251,191,36,0.1);color:#fbbf24;border:1px solid rgba(251,191,36,0.25);border-radius:4px;padding:0.1rem 0.4rem">✦ Alpha</span>`
+          : subExpired
           ? `<span style="font-size:0.7rem;background:rgba(251,191,36,0.15);color:#fbbf24;border:1px solid rgba(251,191,36,0.35);border-radius:4px;padding:0.1rem 0.4rem">⚠ Sub expired</span>`
           : subValid
           ? `<span style="font-size:0.7rem;background:rgba(52,211,153,0.1);color:#34d399;border:1px solid rgba(52,211,153,0.25);border-radius:4px;padding:0.1rem 0.4rem">📋 Sub until ${new Date(s.subscription_expires_at).toLocaleDateString()}</span>`
