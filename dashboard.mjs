@@ -537,7 +537,9 @@ function shell(title, body, active = "") {
           <div class="flow-step"><span class="num">4</span><span>If the signal hasn't changed, it holds — no order is placed.</span></div>
         </div>
         <div class="modal-schedule">⏱ Runs: \${sched.label}<br><span style="opacity:0.6;font-size:0.7rem">\${sched.detail}</span></div>
-        <div style="margin-top:1rem;padding:0.85rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px">
+        \${IS_ALPHA
+          ? \`<div style="margin-top:1rem;padding:0.6rem 0.85rem;background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.2);border-radius:8px;font-size:0.78rem;color:rgba(251,191,36,0.85)">✦ Alpha — signals included in your subscription</div>\`
+          : \`<div style="margin-top:1rem;padding:0.85rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px">
           <div style="font-size:0.78rem;font-weight:600;color:#fafafa;margin-bottom:0.6rem">Signal subscription</div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.35rem">
             \${['day','week','month','year'].map((p, i) => \`
@@ -546,13 +548,13 @@ function shell(title, body, active = "") {
                 1 \${p.charAt(0).toUpperCase()+p.slice(1)} — <strong style="color:#A8F1F7">$\${subPrice(iv, p)}</strong>
               </label>\`).join('')}
           </div>
-        </div>
+        </div>\`}
       \` : \`
         <p>The trader will <strong>stop executing trades</strong> for this strategy. Any open positions on Hyperliquid will remain open until you close them manually.</p>
       \`;
       const confirmBtn = document.getElementById('modalConfirm');
       confirmBtn.className = confirmClass;
-      confirmBtn.textContent = active ? 'Subscribe & Activate' : 'Deactivate';
+      confirmBtn.textContent = active ? (IS_ALPHA ? 'Activate' : 'Subscribe & Activate') : 'Deactivate';
       _pendingToggle = { btn, id, active, intervalMinutes: iv };
 
       document.getElementById('toggleModal').classList.add('open');
@@ -566,9 +568,9 @@ function shell(title, body, active = "") {
         : '';
       closeModal();
       btn.disabled = true;
-      btn.textContent = active ? 'Subscribing...' : 'Saving...';
+      btn.textContent = active ? (IS_ALPHA ? 'Activating...' : 'Subscribing...') : 'Saving...';
 
-      if (active) {
+      if (active && !IS_ALPHA) {
         const subRes = await fetch('/api/subscribe-strategy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -581,7 +583,6 @@ function shell(title, body, active = "") {
           return;
         }
         console.log('[subscribe] ✅ Subscribed until', subData.expires_at);
-        // Save period + expiry locally so auto-renew doesn't fire until actually expired
         await fetch('/api/set-subscription-period', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1493,12 +1494,14 @@ function tvSymbol(symbol, exchange = "hyperliquid") {
   }
   if (exchange === "coinbase") return `COINBASE:${base}USD`;
   // Hyperliquid / Alpaca crypto: Binance USDT pairs; Alpaca stocks: exchange-specific
-  const crypto = { BTC:"BINANCE:BTCUSDT",ETH:"BINANCE:ETHUSDT",SOL:"BINANCE:SOLUSDT",BNB:"BINANCE:BNBUSDT",XRP:"BINANCE:XRPUSDT",ADA:"BINANCE:ADAUSDT",AVAX:"BINANCE:AVAXUSDT",DOGE:"BINANCE:DOGEUSDT",LINK:"BINANCE:LINKUSDT",DOT:"BINANCE:DOTUSDT",MATIC:"BINANCE:MATICUSDT",POL:"BINANCE:POLUSDT",UNI:"BINANCE:UNIUSDT",ATOM:"BINANCE:ATOMUSDT",LTC:"BINANCE:LTCUSDT",SHIB:"BINANCE:SHIBUSDT",TRX:"BINANCE:TRXUSDT",SUI:"BINANCE:SUIUSDT",APT:"BINANCE:APTUSDT",INJ:"BINANCE:INJUSDT",NEAR:"BINANCE:NEARUSDT",ARB:"BINANCE:ARBUSDT",OP:"BINANCE:OPUSDT",WIF:"BINANCE:WIFUSDT",PEPE:"BINANCE:PEPEUSDT",BONK:"BINANCE:BONKUSDT",AKT:"BINANCE:AKTUSDT",ZEC:"BINANCE:ZECUSDT" };
+  const crypto = { BTC:"BINANCE:BTCUSDT",ETH:"BINANCE:ETHUSDT",SOL:"BINANCE:SOLUSDT",BNB:"BINANCE:BNBUSDT",XRP:"BINANCE:XRPUSDT",ADA:"BINANCE:ADAUSDT",AVAX:"BINANCE:AVAXUSDT",DOGE:"BINANCE:DOGEUSDT",LINK:"BINANCE:LINKUSDT",DOT:"BINANCE:DOTUSDT",MATIC:"BINANCE:MATICUSDT",POL:"BINANCE:POLUSDT",UNI:"BINANCE:UNIUSDT",ATOM:"BINANCE:ATOMUSDT",LTC:"BINANCE:LTCUSDT",SHIB:"BINANCE:SHIBUSDT",TRX:"BINANCE:TRXUSDT",SUI:"BINANCE:SUIUSDT",APT:"BINANCE:APTUSDT",INJ:"BINANCE:INJUSDT",NEAR:"BINANCE:NEARUSDT",ARB:"BINANCE:ARBUSDT",OP:"BINANCE:OPUSDT",WIF:"BINANCE:WIFUSDT",PEPE:"BINANCE:PEPEUSDT",BONK:"BINANCE:BONKUSDT",AKT:"BINANCE:AKTUSDT",ZEC:"BINANCE:ZECUSDT",TON:"BINANCE:TONUSDT",SEI:"BINANCE:SEIUSDT",TIA:"BINANCE:TIAUSDT",JUP:"BINANCE:JUPUSDT",FIL:"BINANCE:FILUSDT",ICP:"BINANCE:ICPUSDT",HBAR:"BINANCE:HBARUSDT",VET:"BINANCE:VETUSDT",ALGO:"BINANCE:ALGOUSDT",XLM:"BINANCE:XLMUSDT",XMR:"BINANCE:XMRUSDT",ETC:"BINANCE:ETCUSDT",BCH:"BINANCE:BCHUSDT",AAVE:"BINANCE:AAVEUSDT",CRV:"BINANCE:CRVUSDT",MKR:"BINANCE:MKRUSDT",SNX:"BINANCE:SNXUSDT",LDO:"BINANCE:LDOUSDT",WBTC:"BINANCE:WBTCUSDT",RETH:"RETHUSD",STETH:"STETHUSD",VVV:"VVVUSD",VULT:"VULTUSD" };
   const stocks = { SPY:"AMEX:SPY",QQQ:"NASDAQ:QQQ",IWM:"AMEX:IWM",GLD:"AMEX:GLD",AAPL:"NASDAQ:AAPL",TSLA:"NASDAQ:TSLA",NVDA:"NASDAQ:NVDA",MSFT:"NASDAQ:MSFT",AMZN:"NASDAQ:AMZN",GOOGL:"NASDAQ:GOOGL" };
   return crypto[base] || stocks[base] || base;
 }
 
-function strategiesPage() {
+async function strategiesPage() {
+  const user = await getAgentSignalUser();
+  const isAlpha = user?.valid && user.tier === "alpha";
   const strategies = getStrategies();
 
   const cards = strategies.length
@@ -1595,6 +1598,7 @@ function strategiesPage() {
     <script>
     const TV_SYMBOLS = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, tvSymbol(s.symbol, s.exchange)])))};
     const STRAT_INFO  = ${JSON.stringify(Object.fromEntries(strategies.map(s => [s.id, { exchange: s.exchange ?? "hyperliquid", symbol: s.symbol.replace(/-USD$|\/USD$/i, "") }])))};
+    const IS_ALPHA = ${isAlpha};
 
     const FIELD_TO_STUDY = {
       rsi:        'RSI@tv-basicstudies',
@@ -4083,7 +4087,7 @@ const server = createServer(async (req, res) => {
 
     if (url === "/portfolio") return send(await portfolioPage());
     if (url === "/positions") return send(await positionsPage());
-    if (url === "/strategies") return send(strategiesPage());
+    if (url === "/strategies") return send(await strategiesPage());
     if (url === "/signals") return send(signalsPage());
     if (url === "/history") return send(await historyPage());
     if (url.startsWith("/settings") && method === "GET") {
