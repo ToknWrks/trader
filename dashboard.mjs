@@ -187,6 +187,7 @@ strong { color: #fafafa; }
 .badge-active { background: rgba(74,222,128,0.1); color: #4ade80; border: 1px solid rgba(74,222,128,0.25); padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; }
 .badge-inactive { background: rgba(255,255,255,0.03); color: rgba(255,255,255,0.3); border: 1px solid rgba(255,255,255,0.08); padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.7rem; }
 .btn { font-size: 0.7rem; padding: 0.25rem 0.65rem; border-radius: 6px; cursor: pointer; background: transparent; transition: all 0.15s; }
+.btn-icon { padding: 0.33rem; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; }
 .btn-green { border: 1px solid rgba(74,222,128,0.4); color: #4ade80; }
 .btn-green:hover { background: rgba(74,222,128,0.1); }
 .btn-red { border: 1px solid rgba(248,113,113,0.4); color: #f87171; }
@@ -370,6 +371,18 @@ function shell(title, body, active = "") {
       <div class="modal-actions">
         <button class="modal-cancel" onclick="document.getElementById('openModal').classList.remove('open')">Cancel</button>
         <button id="openModalConfirm" class="modal-confirm-green">Place Order</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete strategy modal -->
+  <div class="modal-overlay" id="deleteModal">
+    <div class="modal">
+      <div class="modal-title" id="deleteModalTitle">Remove Strategy</div>
+      <div class="modal-body" id="deleteModalBody"></div>
+      <div class="modal-actions">
+        <button class="modal-cancel" onclick="document.getElementById('deleteModal').classList.remove('open')">Cancel</button>
+        <button id="deleteModalConfirm" class="modal-confirm-red">Remove</button>
       </div>
     </div>
   </div>
@@ -1575,14 +1588,13 @@ async function strategiesPage() {
             </div>
             <div style="display:flex;gap:0.4rem;align-items:center;flex-shrink:0" onclick="event.stopPropagation()">
               ${s.active
-                ? `<button class="btn btn-red" onclick="showToggleModal(this, '${s.id}', false, '${s.symbol}', ${s.interval_minutes ?? 60})">Deactivate</button>`
-                : `<button class="btn btn-green" onclick="showToggleModal(this, '${s.id}', true, '${s.symbol}', ${s.interval_minutes ?? 60})">Activate</button>`}
-              <button class="btn btn-cyan" onclick="runNow(this, '${s.id}', '${s.name.replace(/'/g, "\\'")}')">▶ Run Now</button>
-              <button class="btn btn-green" onclick="openPosition(this, '${s.id}', 'buy', '${s.symbol}')">Open Long</button>
-              <button class="btn btn-red" onclick="openPosition(this, '${s.id}', 'sell', '${s.symbol}')">Open Short</button>
-
-              <button class="btn btn-cyan" onclick="openEditModal(${JSON.stringify(s).replace(/"/g, '&quot;')})">Edit</button>
-              <button class="btn btn-red" onclick="deleteStrat('${s.id}')">✕</button>
+                ? `<button class="btn btn-icon btn-red" title="Deactivate" onclick="showToggleModal(this, '${s.id}', false, '${s.symbol}', ${s.interval_minutes ?? 60})"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></button>`
+                : `<button class="btn btn-icon btn-green" title="Activate" onclick="showToggleModal(this, '${s.id}', true, '${s.symbol}', ${s.interval_minutes ?? 60})"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></button>`}
+              <button class="btn btn-icon btn-cyan" title="Run Now" onclick="runNow(this, '${s.id}', '${s.name.replace(/'/g, "\\'")}')"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg></button>
+              <button class="btn btn-icon btn-green" title="Open Long" onclick="openPosition(this, '${s.id}', 'buy', '${s.symbol}')"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+              <button class="btn btn-icon btn-red" title="Open Short" onclick="openPosition(this, '${s.id}', 'sell', '${s.symbol}')"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+              <button class="btn btn-icon btn-cyan" title="Edit" onclick="openEditModal(${JSON.stringify(s).replace(/"/g, '&quot;')})"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg></button>
+              <button class="btn btn-icon btn-red" title="Remove" onclick="deleteStrat('${s.id}', '${s.name.replace(/'/g, "\\'")}')"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></button>
             </div>
           </div>
           <div class="acc-body" id="acc-body-${s.id}"></div>
@@ -1822,10 +1834,17 @@ async function strategiesPage() {
       document.getElementById('openModal').classList.add('open');
     }
 
-    async function deleteStrat(id) {
-      if (!confirm('Remove this strategy from the trader?\\n\\nThis does not close any open positions.')) return;
-      await fetch('/api/strategy/' + id, { method: 'DELETE' });
-      location.reload();
+    function deleteStrat(id, name) {
+      const modal = document.getElementById('deleteModal');
+      document.getElementById('deleteModalBody').textContent = 'Remove "' + name + '" from the trader? This does not close any open positions.';
+      const btn = document.getElementById('deleteModalConfirm');
+      btn.onclick = async () => {
+        btn.disabled = true; btn.textContent = 'Removing…';
+        await fetch('/api/strategy/' + id, { method: 'DELETE' });
+        modal.classList.remove('open');
+        location.reload();
+      };
+      modal.classList.add('open');
     }
 
     const CANDLE_TO_MIN = { "1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60,"2h":120,"4h":240,"8h":480,"12h":720,"1d":1440 };
