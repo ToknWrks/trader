@@ -1150,19 +1150,20 @@ async function portfolioPage() {
         <div style="display:flex;gap:1.5rem;margin-bottom:0.9rem;flex-wrap:wrap">
           <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">Arbitrum USDC</div>
             <div id="fundArbUsdc" style="font-size:0.95rem;font-weight:600;color:#64a0fa">—</div></div>
-          <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">Free Margin</div>
-            <div id="fundWithdrawable" style="font-size:0.95rem;font-weight:600;color:rgba(255,255,255,0.6)">—</div></div>
-          <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">Spot USDC</div>
-            <div id="fundSpot" style="font-size:0.95rem;font-weight:600;color:rgba(255,255,255,0.6)">—</div></div>
+          <div><div id="fundLbl1" style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">HL Balance</div>
+            <div id="fundBalance" style="font-size:0.95rem;font-weight:600;color:rgba(255,255,255,0.6)">—</div></div>
+          <div><div id="fundLbl2" style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">In Positions</div>
+            <div id="fundLocked" style="font-size:0.95rem;font-weight:600;color:rgba(255,255,255,0.6)">—</div></div>
           <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">Available</div>
-            <div id="fundAvailable" style="font-size:0.95rem;font-weight:600;color:#A8F1F7" title="Free margin + spot USDC (spot auto-swept on withdraw)">—</div></div>
+            <div id="fundAvailable" style="font-size:0.95rem;font-weight:600;color:#A8F1F7" title="Balance minus margin locked in open positions">—</div></div>
         </div>
         <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
           <input id="fundAmount" type="number" min="0" step="1" placeholder="Amount (USDC)" style="width:160px" />
           <button class="btn btn-cyan" onclick="openFund('deposit')">Deposit →</button>
           <button class="btn" onclick="openFund('withdraw')" style="border:1px solid rgba(255,255,255,0.25);color:rgba(255,255,255,0.75)">← Withdraw</button>
-          <button class="btn btn-green" onclick="moveToPerp()" title="Move spot USDC into the perp account so the bot can trade with it">Spot → Perp</button>
+          <button id="fundSweepBtn" class="btn btn-green" onclick="moveToPerp()" title="Move spot USDC into the perp account so the bot can trade with it">Spot → Perp</button>
         </div>
+        <div id="fundUnifiedNote" style="display:none;font-size:0.66rem;color:#4ade80;margin-top:0.5rem">Unified account — spot USDC already trades as perp margin and withdraws directly. No transfer needed.</div>
         <div style="font-size:0.66rem;color:rgba(255,255,255,0.32);margin-top:0.6rem">Deposit: Arbitrum USDC → HL (you pay Arbitrum gas). Withdraw: HL → this wallet on Arbitrum (flat $1 HL fee, ~5 min).</div>
       </div>
     </div>
@@ -1323,9 +1324,23 @@ async function portfolioPage() {
           const short = d.address.slice(0,6) + '…' + d.address.slice(-4);
           document.getElementById('fundWallet').textContent = d.label + ' · ' + short + (d.isVault ? ' (vault)' : '');
           document.getElementById('fundArbUsdc').textContent = fmtUsd(d.arbUsdc);
-          document.getElementById('fundWithdrawable').textContent = fmtUsd(d.withdrawable);
-          document.getElementById('fundSpot').textContent = fmtUsd(d.spotUsdc);
+          document.getElementById('fundBalance').textContent = fmtUsd(d.hlBalance);
           document.getElementById('fundAvailable').textContent = fmtUsd(d.available);
+          if (d.unified) {
+            // One unified balance; available = balance − margin locked in positions.
+            document.getElementById('fundLbl1').textContent = 'HL Balance';
+            document.getElementById('fundLbl2').textContent = 'In Positions';
+            document.getElementById('fundLocked').textContent = fmtUsd(d.marginUsed);
+          } else {
+            // Separate ledgers: perp free margin + spot USDC.
+            document.getElementById('fundLbl1').textContent = 'Free Margin';
+            document.getElementById('fundBalance').textContent = fmtUsd(d.withdrawable);
+            document.getElementById('fundLbl2').textContent = 'Spot USDC';
+            document.getElementById('fundLocked').textContent = fmtUsd(d.spotUsdc);
+          }
+          // Unified account: spot already usable + withdraws directly — no sweep button.
+          document.getElementById('fundSweepBtn').style.display = d.unified ? 'none' : '';
+          document.getElementById('fundUnifiedNote').style.display = d.unified ? '' : 'none';
         } catch (e) { document.getElementById('fundWallet').textContent = 'error'; }
       }
       function openFund(dir) {
@@ -1339,7 +1354,7 @@ async function portfolioPage() {
         document.getElementById('fundModalTitle').textContent = isDep ? 'Confirm deposit' : 'Confirm withdrawal';
         const short = _fundInfo.address.slice(0,6) + '…' + _fundInfo.address.slice(-4);
         const free = _fundInfo.withdrawable ?? 0;
-        const sweepNote = (!isDep && amt > free)
+        const sweepNote = (!isDep && !_fundInfo.unified && amt > free)
           ? '<br><br><span style="color:#fbbf24">Note: ' + fmtUsd(Math.min(_fundInfo.spotUsdc ?? 0, amt - free)) + ' will be swept spot→perp first (extra signature).</span>'
           : '';
         document.getElementById('fundModalBody').innerHTML = isDep
@@ -3164,17 +3179,31 @@ async function handleHlFundingInfo() {
   const tw = getTradingWallet();
   const label = t.isVault ? "Vultisig vault" : (tw?.name ?? "Trading wallet");
   const hl = await import("./hyperliquid.mjs");
-  const [arbUsdc, withdrawable, spotUsdc] = await Promise.all([
+  const [arbUsdc, perpState, spotUsdc, abstraction] = await Promise.all([
     getArbUsdcBalance(t.address),
-    hl.getWithdrawable(t.address).catch(() => null),
+    hl.getAccountState(t.address).catch(() => null),
     hl.getSpotUsdc(t.address).catch(() => null),
+    hl.getAbstraction(t.address).catch(() => "default"),
   ]);
-  // Total reachable for withdrawal = free perp margin + spot USDC (spot is
-  // swept to perp automatically on withdraw).
-  const available = (withdrawable ?? 0) + (spotUsdc ?? 0);
+  const unified = abstraction === "unifiedAccount";
+  const marginUsed = parseFloat(perpState?.marginSummary?.totalMarginUsed ?? "0");
+  const perpWithdrawable = parseFloat(perpState?.withdrawable ?? "0");
+
+  // unifiedAccount: spot + perp are ONE balance. The total is the spot USDC
+  // figure; the perp `withdrawable` field reads 0 and is meaningless here.
+  // Real available = total balance − margin locked in open positions.
+  // Otherwise: perp and spot are separate ledgers; available = free perp
+  // margin + spot (spot is swept to perp on withdraw).
+  const hlBalance = unified ? (spotUsdc ?? 0) : (perpWithdrawable + (spotUsdc ?? 0));
+  const available = unified
+    ? Math.max(0, (spotUsdc ?? 0) - marginUsed)
+    : perpWithdrawable + (spotUsdc ?? 0);
+
   return {
     ok: true, address: t.address, label, isVault: t.isVault,
-    arbUsdc, withdrawable, spotUsdc, available,
+    arbUsdc, abstraction, unified,
+    hlBalance, marginUsed, available,
+    withdrawable: perpWithdrawable, spotUsdc,
     minDeposit: HL_MIN_DEPOSIT_USD, withdrawFee: 1,
   };
 }
@@ -3242,24 +3271,34 @@ async function handleHlWithdraw(body) {
   const t = await resolveTradingSigner();
   if (!t.address) return { ok: false, error: "No trading wallet configured" };
 
-  const { getWithdrawable, getSpotUsdc, transferSpotPerp, withdrawFunds } = await import("./hyperliquid.mjs");
-  const [free, spot] = await Promise.all([
-    getWithdrawable(t.address).catch(() => 0),
+  const { getAccountState, getWithdrawable, getSpotUsdc, getAbstraction, transferSpotPerp, withdrawFunds } = await import("./hyperliquid.mjs");
+  const [perpState, spot, abstraction] = await Promise.all([
+    getAccountState(t.address).catch(() => null),
     getSpotUsdc(t.address).catch(() => 0),
+    getAbstraction(t.address).catch(() => "default"),
   ]);
-  if (amt > free + spot + 1e-6) {
-    return { ok: false, error: `Insufficient funds: ${free.toFixed(2)} free margin + ${spot.toFixed(2)} spot = ${(free + spot).toFixed(2)} available, requested ${amt.toFixed(2)}` };
+  const unified = abstraction === "unifiedAccount";
+  const free = parseFloat(perpState?.withdrawable ?? "0");
+  const marginUsed = parseFloat(perpState?.marginSummary?.totalMarginUsed ?? "0");
+  // Unified: one balance, withdrawable = total − margin locked in positions.
+  // Otherwise: free perp margin + spot (spot swept to perp before withdraw3).
+  const available = unified ? Math.max(0, spot - marginUsed) : free + spot;
+  if (amt > available + 1e-6) {
+    const detail = unified
+      ? `${spot.toFixed(2)} balance − ${marginUsed.toFixed(2)} locked in positions = ${available.toFixed(2)} withdrawable`
+      : `${free.toFixed(2)} free margin + ${spot.toFixed(2)} spot = ${available.toFixed(2)} available`;
+    return { ok: false, error: `Insufficient funds: ${detail}, requested ${amt.toFixed(2)}` };
   }
 
   const signer = await loadTradingHlSigner();
 
-  // withdraw3 only pulls from perp free margin — sweep the shortfall from spot.
+  // unifiedAccount: withdraw3 pulls from the merged balance directly — no sweep.
+  // Otherwise withdraw3 only sees perp free margin, so sweep the shortfall from spot.
   let swept = 0;
-  if (amt > free) {
+  if (!unified && amt > free) {
     swept = Math.min(spot, amt - free);
     await transferSpotPerp(signer, swept, true); // spot → perp
-    // give the perp balance a moment to settle before withdrawing
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 1500)); // let the perp balance settle
   }
 
   const result = await withdrawFunds(signer, amt, t.address);
@@ -3276,7 +3315,10 @@ async function handleHlSweep(body) {
   const t = await resolveTradingSigner();
   if (!t.address) return { ok: false, error: "No trading wallet configured" };
 
-  const { getSpotUsdc, getWithdrawable, transferSpotPerp } = await import("./hyperliquid.mjs");
+  const { getSpotUsdc, getWithdrawable, getAbstraction, transferSpotPerp } = await import("./hyperliquid.mjs");
+  if ((await getAbstraction(t.address).catch(() => "default")) === "unifiedAccount") {
+    return { ok: false, error: "Account is unified — spot USDC already trades as perp margin; no transfer needed" };
+  }
   const src = toPerp
     ? await getSpotUsdc(t.address).catch(() => 0)
     : await getWithdrawable(t.address).catch(() => 0);

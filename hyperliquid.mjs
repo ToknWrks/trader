@@ -345,6 +345,18 @@ export async function getWithdrawable(address) {
   return parseFloat(st?.withdrawable ?? "0");
 }
 
+/**
+ * Account abstraction mode. "unifiedAccount" merges spot + perp USDC into one
+ * balance (spot is usable as perp margin directly, no usdClassTransfer needed,
+ * withdraw3 pulls from the unified balance). Other modes keep them separate.
+ * Returns one of: unifiedAccount | portfolioMargin | dexAbstraction | disabled | default.
+ */
+export async function getAbstraction(address) {
+  const info = new InfoClient({ transport });
+  try { return await info.userAbstraction({ user: address }); }
+  catch { return "default"; }
+}
+
 /** USDC sitting in the spot account (not usable as perp margin until swept). */
 export async function getSpotUsdc(address) {
   const info = new InfoClient({ transport });
