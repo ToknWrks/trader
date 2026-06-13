@@ -339,8 +339,27 @@ export async function withdrawFunds(signer, amount, destination) {
   return exchange.withdraw3({ destination: dest, amount: amt });
 }
 
-/** Withdrawable USDC (free margin) for an address. */
+/** Withdrawable USDC (free perp margin) for an address. */
 export async function getWithdrawable(address) {
   const st = await getAccountState(address);
   return parseFloat(st?.withdrawable ?? "0");
+}
+
+/** USDC sitting in the spot account (not usable as perp margin until swept). */
+export async function getSpotUsdc(address) {
+  const info = new InfoClient({ transport });
+  const st = await info.spotClearinghouseState({ user: address });
+  return parseFloat(st?.balances?.find(b => b.coin === "USDC")?.total ?? "0");
+}
+
+/**
+ * Move USDC between the spot and perp accounts. `toPerp=true` sweeps spot→perp
+ * (needed before withdrawing or trading spot funds); `false` does perp→spot.
+ * `signer` is a raw key string or a viem-style MPC account (vault).
+ */
+export async function transferSpotPerp(signer, amount, toPerp = true) {
+  const { exchange } = makeClients(signer);
+  const amt = new Decimal(String(amount)).toFixed(2);
+  console.log(`[hyperliquid] usdClassTransfer ${amt} USDC ${toPerp ? "spot→perp" : "perp→spot"}`);
+  return exchange.usdClassTransfer({ amount: amt, toPerp });
 }

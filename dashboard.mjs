@@ -1147,16 +1147,21 @@ async function portfolioPage() {
           <div style="font-weight:600">Fund Hyperliquid</div>
           <div id="fundWallet" style="font-size:0.7rem;color:rgba(255,255,255,0.4)">Loading…</div>
         </div>
-        <div style="display:flex;gap:1.5rem;margin-bottom:0.9rem">
+        <div style="display:flex;gap:1.5rem;margin-bottom:0.9rem;flex-wrap:wrap">
           <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">Arbitrum USDC</div>
             <div id="fundArbUsdc" style="font-size:0.95rem;font-weight:600;color:#64a0fa">—</div></div>
-          <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">HL Withdrawable</div>
-            <div id="fundWithdrawable" style="font-size:0.95rem;font-weight:600;color:#A8F1F7">—</div></div>
+          <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">Free Margin</div>
+            <div id="fundWithdrawable" style="font-size:0.95rem;font-weight:600;color:rgba(255,255,255,0.6)">—</div></div>
+          <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">Spot USDC</div>
+            <div id="fundSpot" style="font-size:0.95rem;font-weight:600;color:rgba(255,255,255,0.6)">—</div></div>
+          <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">Available</div>
+            <div id="fundAvailable" style="font-size:0.95rem;font-weight:600;color:#A8F1F7" title="Free margin + spot USDC (spot auto-swept on withdraw)">—</div></div>
         </div>
         <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
           <input id="fundAmount" type="number" min="0" step="1" placeholder="Amount (USDC)" style="width:160px" />
           <button class="btn btn-cyan" onclick="openFund('deposit')">Deposit →</button>
-          <button class="btn" onclick="openFund('withdraw')" style="border:1px solid rgba(255,255,255,0.2)">← Withdraw</button>
+          <button class="btn" onclick="openFund('withdraw')" style="border:1px solid rgba(255,255,255,0.25);color:rgba(255,255,255,0.75)">← Withdraw</button>
+          <button class="btn btn-green" onclick="moveToPerp()" title="Move spot USDC into the perp account so the bot can trade with it">Spot → Perp</button>
         </div>
         <div style="font-size:0.66rem;color:rgba(255,255,255,0.32);margin-top:0.6rem">Deposit: Arbitrum USDC → HL (you pay Arbitrum gas). Withdraw: HL → this wallet on Arbitrum (flat $1 HL fee, ~5 min).</div>
       </div>
@@ -1319,6 +1324,8 @@ async function portfolioPage() {
           document.getElementById('fundWallet').textContent = d.label + ' · ' + short + (d.isVault ? ' (vault)' : '');
           document.getElementById('fundArbUsdc').textContent = fmtUsd(d.arbUsdc);
           document.getElementById('fundWithdrawable').textContent = fmtUsd(d.withdrawable);
+          document.getElementById('fundSpot').textContent = fmtUsd(d.spotUsdc);
+          document.getElementById('fundAvailable').textContent = fmtUsd(d.available);
         } catch (e) { document.getElementById('fundWallet').textContent = 'error'; }
       }
       function openFund(dir) {
@@ -1328,15 +1335,51 @@ async function portfolioPage() {
         const isDep = dir === 'deposit';
         if (isDep && amt < _fundInfo.minDeposit) { showToast('Minimum deposit $' + _fundInfo.minDeposit, 'err'); return; }
         if (!isDep && amt <= _fundInfo.withdrawFee) { showToast('Must exceed $' + _fundInfo.withdrawFee + ' fee', 'err'); return; }
+        if (!isDep && amt > (_fundInfo.available ?? 0) + 1e-6) { showToast('Only ' + fmtUsd(_fundInfo.available) + ' available', 'err'); return; }
         document.getElementById('fundModalTitle').textContent = isDep ? 'Confirm deposit' : 'Confirm withdrawal';
         const short = _fundInfo.address.slice(0,6) + '…' + _fundInfo.address.slice(-4);
+        const free = _fundInfo.withdrawable ?? 0;
+        const sweepNote = (!isDep && amt > free)
+          ? '<br><br><span style="color:#fbbf24">Note: ' + fmtUsd(Math.min(_fundInfo.spotUsdc ?? 0, amt - free)) + ' will be swept spot→perp first (extra signature).</span>'
+          : '';
         document.getElementById('fundModalBody').innerHTML = isDep
           ? 'Transfer <strong>' + fmtUsd(amt) + ' USDC</strong> from ' + short + ' on Arbitrum to the Hyperliquid bridge.<br><br>This signs a real on-chain transaction and is irreversible. You pay Arbitrum gas.'
-          : 'Withdraw <strong>' + fmtUsd(amt) + ' USDC</strong> from Hyperliquid to ' + short + ' on Arbitrum.<br><br>HL deducts a flat $1 fee — you receive <strong>' + fmtUsd(amt - _fundInfo.withdrawFee) + '</strong>. Irreversible, ~5 min to arrive.';
+          : 'Withdraw <strong>' + fmtUsd(amt) + ' USDC</strong> from Hyperliquid to ' + short + ' on Arbitrum.<br><br>HL deducts a flat $1 fee — you receive <strong>' + fmtUsd(amt - _fundInfo.withdrawFee) + '</strong>. Irreversible, ~5 min to arrive.' + sweepNote;
         const btn = document.getElementById('fundModalConfirm');
         btn.textContent = isDep ? 'Deposit' : 'Withdraw';
         btn.onclick = () => confirmFund(dir, amt);
         document.getElementById('fundModal').classList.add('open');
+      }
+      function moveToPerp() {
+        if (!_fundInfo) { showToast('Funding info not loaded', 'err'); return; }
+        const spot = _fundInfo.spotUsdc ?? 0;
+        let amt = parseFloat(document.getElementById('fundAmount').value);
+        if (!Number.isFinite(amt) || amt <= 0) amt = spot; // blank = move all spot
+        if (spot <= 0) { showToast('No spot USDC to move', 'err'); return; }
+        if (amt > spot + 1e-6) { showToast('Only ' + fmtUsd(spot) + ' in spot', 'err'); return; }
+        document.getElementById('fundModalTitle').textContent = 'Move spot → perp';
+        document.getElementById('fundModalBody').innerHTML =
+          'Move <strong>' + fmtUsd(amt) + ' USDC</strong> from spot into the perp account.<br><br>This makes it usable as trading margin for the bot. Stays on Hyperliquid (not a withdrawal).';
+        const btn = document.getElementById('fundModalConfirm');
+        btn.textContent = 'Move to Perp';
+        btn.onclick = () => confirmSweep(amt);
+        document.getElementById('fundModal').classList.add('open');
+      }
+      async function confirmSweep(amt) {
+        const btn = document.getElementById('fundModalConfirm');
+        btn.disabled = true; btn.textContent = 'Moving…';
+        try {
+          const d = await fetch('/api/hl/sweep', {
+            method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ amount: amt, toPerp: true }),
+          }).then(r => r.json());
+          if (d.ok) {
+            showToast('Moved ' + fmtUsd(amt) + ' to perp', 'ok');
+            document.getElementById('fundModal').classList.remove('open');
+            document.getElementById('fundAmount').value = '';
+            setTimeout(loadFundingInfo, 1500);
+          } else { showToast(d.error || 'Failed', 'err'); }
+        } catch (e) { showToast(e.message || 'Failed', 'err'); }
+        btn.disabled = false; btn.textContent = 'Move to Perp';
       }
       async function confirmFund(dir, amt) {
         const btn = document.getElementById('fundModalConfirm');
@@ -3120,13 +3163,19 @@ async function handleHlFundingInfo() {
   if (!t.address) return { ok: false, error: "No trading wallet configured" };
   const tw = getTradingWallet();
   const label = t.isVault ? "Vultisig vault" : (tw?.name ?? "Trading wallet");
-  const [arbUsdc, withdrawable] = await Promise.all([
+  const hl = await import("./hyperliquid.mjs");
+  const [arbUsdc, withdrawable, spotUsdc] = await Promise.all([
     getArbUsdcBalance(t.address),
-    (async () => { try { const { getWithdrawable } = await import("./hyperliquid.mjs"); return await getWithdrawable(t.address); } catch { return null; } })(),
+    hl.getWithdrawable(t.address).catch(() => null),
+    hl.getSpotUsdc(t.address).catch(() => null),
   ]);
+  // Total reachable for withdrawal = free perp margin + spot USDC (spot is
+  // swept to perp automatically on withdraw).
+  const available = (withdrawable ?? 0) + (spotUsdc ?? 0);
   return {
     ok: true, address: t.address, label, isVault: t.isVault,
-    arbUsdc, withdrawable, minDeposit: HL_MIN_DEPOSIT_USD, withdrawFee: 1,
+    arbUsdc, withdrawable, spotUsdc, available,
+    minDeposit: HL_MIN_DEPOSIT_USD, withdrawFee: 1,
   };
 }
 
@@ -3193,13 +3242,51 @@ async function handleHlWithdraw(body) {
   const t = await resolveTradingSigner();
   if (!t.address) return { ok: false, error: "No trading wallet configured" };
 
-  const { getWithdrawable, withdrawFunds } = await import("./hyperliquid.mjs");
-  const free = await getWithdrawable(t.address).catch(() => null);
-  if (free != null && amt > free) return { ok: false, error: `Insufficient withdrawable: have ${free.toFixed(2)}, requested ${amt.toFixed(2)}` };
+  const { getWithdrawable, getSpotUsdc, transferSpotPerp, withdrawFunds } = await import("./hyperliquid.mjs");
+  const [free, spot] = await Promise.all([
+    getWithdrawable(t.address).catch(() => 0),
+    getSpotUsdc(t.address).catch(() => 0),
+  ]);
+  if (amt > free + spot + 1e-6) {
+    return { ok: false, error: `Insufficient funds: ${free.toFixed(2)} free margin + ${spot.toFixed(2)} spot = ${(free + spot).toFixed(2)} available, requested ${amt.toFixed(2)}` };
+  }
 
   const signer = await loadTradingHlSigner();
+
+  // withdraw3 only pulls from perp free margin — sweep the shortfall from spot.
+  let swept = 0;
+  if (amt > free) {
+    swept = Math.min(spot, amt - free);
+    await transferSpotPerp(signer, swept, true); // spot → perp
+    // give the perp balance a moment to settle before withdrawing
+    await new Promise(r => setTimeout(r, 1500));
+  }
+
   const result = await withdrawFunds(signer, amt, t.address);
-  return { ok: true, result, amount: amt, received: +(amt - 1).toFixed(2) };
+  return { ok: true, result, amount: amt, swept: +swept.toFixed(2), received: +(amt - 1).toFixed(2) };
+}
+
+// Move USDC between spot and perp without withdrawing. toPerp=true makes spot
+// USDC usable as perp trading margin; false parks free margin back in spot.
+async function handleHlSweep(body) {
+  const { amount, toPerp = true } = JSON.parse(body);
+  const amt = parseFloat(amount);
+  if (!Number.isFinite(amt) || amt <= 0) return { ok: false, error: "Enter an amount" };
+
+  const t = await resolveTradingSigner();
+  if (!t.address) return { ok: false, error: "No trading wallet configured" };
+
+  const { getSpotUsdc, getWithdrawable, transferSpotPerp } = await import("./hyperliquid.mjs");
+  const src = toPerp
+    ? await getSpotUsdc(t.address).catch(() => 0)
+    : await getWithdrawable(t.address).catch(() => 0);
+  if (amt > src + 1e-6) {
+    return { ok: false, error: `Insufficient ${toPerp ? "spot USDC" : "free margin"}: have ${src.toFixed(2)}, requested ${amt.toFixed(2)}` };
+  }
+
+  const signer = await loadTradingHlSigner();
+  const result = await transferSpotPerp(signer, amt, toPerp);
+  return { ok: true, result, amount: amt, toPerp };
 }
 
 async function handleSubscribeStrategy(body) {
@@ -4583,6 +4670,10 @@ const server = createServer(async (req, res) => {
     if (url === "/api/hl/withdraw" && method === "POST") {
       const body = await readBody();
       return json(await handleHlWithdraw(body).catch(e => ({ ok: false, error: e.message })));
+    }
+    if (url === "/api/hl/sweep" && method === "POST") {
+      const body = await readBody();
+      return json(await handleHlSweep(body).catch(e => ({ ok: false, error: e.message })));
     }
     if (url === "/api/subscribe-strategy" && method === "POST") {
       const body = await readBody();
