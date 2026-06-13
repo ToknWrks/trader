@@ -24,7 +24,9 @@ function loadEnv() {
 }
 loadEnv();
 
-const PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY;
+// Live binding (not a startup snapshot): reassigned whenever the trading wallet
+// switches, so every signing path follows the selector without a restart.
+let PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY;
 function getSignalUrl() { return process.env.AGENT_SIGNAL_URL ?? "https://agentsignal.app"; }
 
 async function getAgentSignalUser() {
@@ -93,10 +95,22 @@ import {
   getSnapshots, insertSnapshot, hasSnapshots, backfillSnapshotsFromTrades, insertTrade,
   insertLiquidationTrade, getTradeHistory,
   maybeCreateDefaultWallet, listWallets, insertWallet, deleteWallet, updateWalletFlags, setTradingWallet,
+  getTradingWallet, clearTradingWallet,
   listStakingContracts, insertStakingContract, deleteStakingContract,
 } from "./db.mjs";
 
 if (PRIVATE_KEY) maybeCreateDefaultWallet(PRIVATE_KEY);
+
+// db trading wallet is the source of truth — reconcile env/binding to it at boot
+// so the dashboard signs as whatever wallet is flagged use_for_trading, even if
+// .env drifted. (Vault active = no db wallet flagged, so this is skipped.)
+{
+  const _tw = getTradingWallet();
+  if (_tw?.key && _tw.key !== PRIVATE_KEY) {
+    PRIVATE_KEY = _tw.key;
+    process.env.AGENT_PRIVATE_KEY = _tw.key;
+  }
+}
 
 import { getV3Positions, getV4Positions, getPnl, collectAndSwap, getV3PositionsForChain } from "./uniswap-api.mjs";
 import { SchwabClient } from "./exchanges/schwab.mjs";
@@ -145,6 +159,34 @@ async function getNetworkUsdcBalance(address) {
   } catch {
     return null;
   }
+}
+
+// ── Hyperliquid funding (Arbitrum) ────────────────────────────────────────────
+
+const ARB_CHAIN_ID  = 42161;
+const ARB_USDC      = USDC_ADDRESSES["eip155:42161"];
+const HL_BRIDGE     = "0x2Df1c51E09aECF9cacB7bc98cB1742757f163dF7"; // HL bridge2 (mainnet)
+const HL_MIN_DEPOSIT_USD = 5;
+
+function arbRpc() {
+  // Public Arbitrum RPC by default — reliable for reads + broadcasts, no key
+  // needed. Alchemy is NOT assumed (many apps don't enable ARB_MAINNET). Set
+  // ARBITRUM_RPC_URL to override with a private endpoint.
+  return getEnvValue("ARBITRUM_RPC_URL") || process.env.ARBITRUM_RPC_URL || "https://arb1.arbitrum.io/rpc";
+}
+
+// USDC balance on Arbitrum (where the trading wallet must hold funds to deposit).
+async function getArbUsdcBalance(address) {
+  try {
+    const padded = address.toLowerCase().replace("0x", "").padStart(64, "0");
+    const res = await fetch(arbRpc(), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call",
+        params: [{ to: ARB_USDC, data: "0x70a08231" + padded }, "latest"] }),
+    });
+    const { result } = await res.json();
+    return parseInt(result, 16) / 1e6;
+  } catch { return null; }
 }
 
 // ── CSS ───────────────────────────────────────────────────────────────────────
@@ -482,6 +524,18 @@ function shell(title, body, active = "") {
     </div>
   </div>
 
+  <!-- Hyperliquid funding confirm modal -->
+  <div class="modal-overlay" id="fundModal" onclick="if(event.target===this)document.getElementById('fundModal').classList.remove('open')">
+    <div class="modal" style="max-width:420px">
+      <div class="modal-title" id="fundModalTitle">Confirm</div>
+      <div class="modal-body" id="fundModalBody"></div>
+      <div class="modal-actions">
+        <button class="modal-cancel" onclick="document.getElementById('fundModal').classList.remove('open')">Cancel</button>
+        <button id="fundModalConfirm" class="modal-confirm-green">Confirm</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Strategy info popover -->
   <div class="info-popover" id="infoPopover"></div>
 
@@ -728,6 +782,34 @@ function readEnv() {
   try { return readFileSync(ENV_PATH, "utf8"); } catch { return ""; }
 }
 
+// Resolve the active trading wallet at REQUEST time (not the PRIVATE_KEY const
+// captured at startup — that goes stale after a wallet switch). Precedence:
+// Vultisig vault (VAULT_ACTIVE) → db wallet flagged use_for_trading=1 → env
+// AGENT_PRIVATE_KEY (legacy fallback). Returns { isVault, key, address }.
+// For a vault, key is null and signing must route through the MPC account.
+async function resolveTradingSigner() {
+  if (getEnvValue("VAULT_ACTIVE") === "true") {
+    const addr = getEnvValue("VAULT_ADDRESS");
+    return { isVault: true, key: null, address: addr ? addr.toLowerCase() : null };
+  }
+  const key = getTradingWallet()?.key || getEnvValue("AGENT_PRIVATE_KEY") || process.env.AGENT_PRIVATE_KEY || null;
+  if (!key) return { isVault: false, key: null, address: null };
+  const { privateKeyToAccount } = await import("viem/accounts");
+  return { isVault: false, key, address: privateKeyToAccount(key).address.toLowerCase() };
+}
+
+// Load a signer usable by hyperliquid.mjs / @nktkas (raw key string or a
+// viem-style MPC account). Throws if no wallet is configured.
+async function loadTradingHlSigner() {
+  const t = await resolveTradingSigner();
+  if (t.isVault) {
+    const { loadVultisigAccount } = await import("./vultisig-account.mjs");
+    return await loadVultisigAccount({ vultPath: getEnvValue("VULT_FILE_PATH"), password: getEnvValue("VULTISIG_PASS") });
+  }
+  if (!t.key) throw new Error("No trading wallet set — pick one in Settings");
+  return t.key;
+}
+
 function getEnvValue(key) {
   const m = readEnv().match(new RegExp(`^${key}=(.*)$`, "m"));
   return m ? m[1].trim().replace(/^["']|["']$/g, "") : "";
@@ -829,26 +911,30 @@ function renderEquityCurve(snapshots, positionValue, spotUsdc = 0) {
 
 async function portfolioPage() {
   let hlData = null, spotData = null, coinbaseAccounts = [], coinbaseUsdValues = {}, krakenBalances = {}, krakenUsdValues = {}, openOrders = [];
+  let hlAddress = null;
 
   try {
-    const wallet = PRIVATE_KEY
-      ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
-      : null;
-    if (wallet) {
+    // Prefer the Vultisig vault address when it's the active signer or toggled on.
+    const _vaultAddr = getEnvValue("VAULT_ADDRESS");
+    const _useVault  = _vaultAddr && (getEnvValue("VAULT_ACTIVE") === "true" || getEnvValue("VAULT_SHOW_ON_PORTFOLIO") === "true");
+    hlAddress = _useVault
+      ? _vaultAddr
+      : (PRIVATE_KEY ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY).address : null);
+    if (hlAddress) {
       [hlData, spotData] = await Promise.all([
         fetch("https://api.hyperliquid.xyz/info", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type: "clearinghouseState", user: wallet.address }),
+          body: JSON.stringify({ type: "clearinghouseState", user: hlAddress }),
         }).then(r => r.json()).catch(() => null),
         fetch("https://api.hyperliquid.xyz/info", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type: "spotClearinghouseState", user: wallet.address }),
+          body: JSON.stringify({ type: "spotClearinghouseState", user: hlAddress }),
         }).then(r => r.json()).catch(() => null),
       ]);
       // HL open orders
       try {
         const { getOpenOrders: hlGetOO } = await import("./hyperliquid.mjs");
-        const hlOrders = await hlGetOO(wallet.address);
+        const hlOrders = await hlGetOO(hlAddress);
         openOrders.push(...hlOrders.map(o => ({ ...o, exchange: "Hyperliquid" })));
       } catch (e) { console.error("[dashboard] HL open orders:", e.message); }
     }
@@ -929,10 +1015,7 @@ async function portfolioPage() {
 
   const fetchesToday = countFetchesToday();
   const fetchesTotal = countFetchesTotal();
-  const wallet = PRIVATE_KEY
-    ? (await import("viem/accounts")).privateKeyToAccount(PRIVATE_KEY)
-    : null;
-  const networkUsdc = wallet ? await getNetworkUsdcBalance(wallet.address) : null;
+  const networkUsdc = hlAddress ? await getNetworkUsdcBalance(hlAddress) : null;
   const payNetwork = getPaymentNetwork();
   const payNetworkLabel = X402_NETWORKS[payNetwork]?.label ?? payNetwork;
 
@@ -975,7 +1058,7 @@ async function portfolioPage() {
   }
 
   // ── Uniswap positions ───────────────────────────────────────────────────────
-  const uniData = wallet ? (await getV3Positions(wallet.address).catch(() => ({ positions: [] }))) : { positions: [] };
+  const uniData = hlAddress ? (await getV3Positions(hlAddress).catch(() => ({ positions: [] }))) : { positions: [] };
   const uniOpen = uniData.positions.filter(p => p.hasLiquidity);
   const uniswapLiqUsd  = uniOpen.reduce((s, p) => s + (p.totalLiquidityUsd ?? 0), 0);
   const uniswapFeesUsd = uniOpen.reduce((s, p) => s + (p.totalFeesUsd ?? 0), 0);
@@ -1057,6 +1140,26 @@ async function portfolioPage() {
           ${usdcSpot > 0.001   ? `<tr><td style="font-weight:600">Spot USDC</td><td>$${usdcSpot.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2})}</td></tr>` : ""}
         </tbody>
       </table></div>` : `<p class="hint">No Hyperliquid balance.</p>`}
+
+      <!-- Fund / withdraw card -->
+      <div class="card" id="fundCard" style="margin-top:1.25rem">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:0.75rem">
+          <div style="font-weight:600">Fund Hyperliquid</div>
+          <div id="fundWallet" style="font-size:0.7rem;color:rgba(255,255,255,0.4)">Loading…</div>
+        </div>
+        <div style="display:flex;gap:1.5rem;margin-bottom:0.9rem">
+          <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">Arbitrum USDC</div>
+            <div id="fundArbUsdc" style="font-size:0.95rem;font-weight:600;color:#64a0fa">—</div></div>
+          <div><div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.4)">HL Withdrawable</div>
+            <div id="fundWithdrawable" style="font-size:0.95rem;font-weight:600;color:#A8F1F7">—</div></div>
+        </div>
+        <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+          <input id="fundAmount" type="number" min="0" step="1" placeholder="Amount (USDC)" style="width:160px" />
+          <button class="btn btn-cyan" onclick="openFund('deposit')">Deposit →</button>
+          <button class="btn" onclick="openFund('withdraw')" style="border:1px solid rgba(255,255,255,0.2)">← Withdraw</button>
+        </div>
+        <div style="font-size:0.66rem;color:rgba(255,255,255,0.32);margin-top:0.6rem">Deposit: Arbitrum USDC → HL (you pay Arbitrum gas). Withdraw: HL → this wallet on Arbitrum (flat $1 HL fee, ~5 min).</div>
+      </div>
     </div>
 
     <div id="ppane-cb" style="display:none">
@@ -1203,6 +1306,57 @@ async function portfolioPage() {
           if (btn)  { btn.style.background = t === tab ? '#A8F1F7' : 'transparent'; btn.style.color = t === tab ? '#000' : 'rgba(255,255,255,0.5)'; }
         });
       }
+
+      // ── Hyperliquid funding ──────────────────────────────────────────────────
+      let _fundInfo = null;
+      function fmtUsd(n) { return n == null ? '—' : '$' + Number(n).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}); }
+      async function loadFundingInfo() {
+        try {
+          const d = await fetch('/api/hl/funding-info').then(r => r.json());
+          if (!d.ok) { document.getElementById('fundWallet').textContent = d.error || 'unavailable'; return; }
+          _fundInfo = d;
+          const short = d.address.slice(0,6) + '…' + d.address.slice(-4);
+          document.getElementById('fundWallet').textContent = d.label + ' · ' + short + (d.isVault ? ' (vault)' : '');
+          document.getElementById('fundArbUsdc').textContent = fmtUsd(d.arbUsdc);
+          document.getElementById('fundWithdrawable').textContent = fmtUsd(d.withdrawable);
+        } catch (e) { document.getElementById('fundWallet').textContent = 'error'; }
+      }
+      function openFund(dir) {
+        const amt = parseFloat(document.getElementById('fundAmount').value);
+        if (!_fundInfo) { showToast('Funding info not loaded', 'err'); return; }
+        if (!Number.isFinite(amt) || amt <= 0) { showToast('Enter an amount', 'err'); return; }
+        const isDep = dir === 'deposit';
+        if (isDep && amt < _fundInfo.minDeposit) { showToast('Minimum deposit $' + _fundInfo.minDeposit, 'err'); return; }
+        if (!isDep && amt <= _fundInfo.withdrawFee) { showToast('Must exceed $' + _fundInfo.withdrawFee + ' fee', 'err'); return; }
+        document.getElementById('fundModalTitle').textContent = isDep ? 'Confirm deposit' : 'Confirm withdrawal';
+        const short = _fundInfo.address.slice(0,6) + '…' + _fundInfo.address.slice(-4);
+        document.getElementById('fundModalBody').innerHTML = isDep
+          ? 'Transfer <strong>' + fmtUsd(amt) + ' USDC</strong> from ' + short + ' on Arbitrum to the Hyperliquid bridge.<br><br>This signs a real on-chain transaction and is irreversible. You pay Arbitrum gas.'
+          : 'Withdraw <strong>' + fmtUsd(amt) + ' USDC</strong> from Hyperliquid to ' + short + ' on Arbitrum.<br><br>HL deducts a flat $1 fee — you receive <strong>' + fmtUsd(amt - _fundInfo.withdrawFee) + '</strong>. Irreversible, ~5 min to arrive.';
+        const btn = document.getElementById('fundModalConfirm');
+        btn.textContent = isDep ? 'Deposit' : 'Withdraw';
+        btn.onclick = () => confirmFund(dir, amt);
+        document.getElementById('fundModal').classList.add('open');
+      }
+      async function confirmFund(dir, amt) {
+        const btn = document.getElementById('fundModalConfirm');
+        btn.disabled = true; btn.textContent = 'Submitting…';
+        try {
+          const d = await fetch('/api/hl/' + dir, {
+            method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ amount: amt }),
+          }).then(r => r.json());
+          if (d.ok) {
+            showToast((dir === 'deposit' ? 'Deposit' : 'Withdrawal') + ' submitted' + (d.txHash ? ' · ' + d.txHash.slice(0,10) + '…' : ''), 'ok');
+            document.getElementById('fundModal').classList.remove('open');
+            document.getElementById('fundAmount').value = '';
+            setTimeout(loadFundingInfo, 1500);
+          } else {
+            showToast(d.error || 'Failed', 'err');
+          }
+        } catch (e) { showToast(e.message || 'Failed', 'err'); }
+        btn.disabled = false; btn.textContent = dir === 'deposit' ? 'Deposit' : 'Withdraw';
+      }
+      loadFundingInfo();
       function sellForUsdc(exchange, asset, maxAmount, btn) {
         const exchLabel = exchange === 'kraken' ? 'Kraken' : 'Coinbase';
         document.getElementById('openModalTitle').textContent = 'Sell ' + asset + ' → USDC';
@@ -2168,6 +2322,7 @@ async function historyPage() {
 
 async function settingsPage(saved = false, error = "", schwabAuthorized = false) {
   const val = (key) => getEnvValue(key);
+  const vaultActive = val("VAULT_ACTIVE") === "true";
 
   function field(label, name, value, type = "text", hint = "") {
     const isSecret = type === "password";
@@ -2201,6 +2356,7 @@ async function settingsPage(saved = false, error = "", schwabAuthorized = false)
   const TABS = [
     { key: "general",      icon: "⚙️",  label: "General" },
     { key: "hl",           icon: "⚡",  label: "DeFi Wallet" },
+    { key: "vultisig",     icon: "🔐",  label: "Vultisig MPC" },
     { key: "agentsignal",  icon: `<img src="/public/logo.png" alt="" style="width:16px;height:16px;border-radius:3px;vertical-align:middle">`,  label: "AgentSignal" },
     { key: "kraken",       icon: "🦑",  label: "Kraken" },
     { key: "coinbase",     icon: "🔵",  label: "Coinbase" },
@@ -2234,7 +2390,7 @@ async function settingsPage(saved = false, error = "", schwabAuthorized = false)
       let addr = "—";
       try { addr = privateKeyToAccount(w.key).address; } catch {}
       const short = addr !== "—" ? addr.slice(0, 6) + "…" + addr.slice(-4) : "invalid key";
-      const isTrading = !!w.use_for_trading;
+      const isTrading = !!w.use_for_trading && !vaultActive;
       return `
         <div style="display:flex;align-items:center;gap:0.75rem;padding:0.7rem 0.85rem;border:1px solid rgba(255,255,255,${isTrading ? "0.15" : "0.07"});border-radius:8px;background:rgba(255,255,255,${isTrading ? "0.04" : "0.02"});margin-bottom:0.5rem">
           <div style="flex:1;min-width:0">
@@ -2263,6 +2419,57 @@ async function settingsPage(saved = false, error = "", schwabAuthorized = false)
     }).join("");
   })();
 
+  // Vultisig MPC vault status
+  const vstatus = await (async () => {
+    try {
+      const { vaultStatus } = await import("./vultisig-vault.mjs");
+      return await vaultStatus(val("VULTISIG_PASS"));
+    } catch (e) { return { exists: false, error: e.message }; }
+  })();
+
+  const vaultStatusHtml = (() => {
+    if (vstatus.error && !vstatus.exists) {
+      return `<div style="font-size:0.72rem;padding:0.6rem 0.8rem;background:rgba(248,113,113,0.06);border:1px solid rgba(248,113,113,0.2);border-radius:8px;color:#f87171">Vultisig SDK error: ${vstatus.error}</div>`;
+    }
+    if (!vstatus.exists) {
+      return `<div style="font-size:0.78rem;color:rgba(255,255,255,0.4);padding:0.6rem 0.8rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:8px">No MPC vault yet. Create one below — the key is split 2-of-2 between this machine and VultiServer; no full private key is ever stored.</div>`;
+    }
+    if (vstatus.error) {
+      return `<div style="font-size:0.72rem;padding:0.6rem 0.8rem;background:rgba(248,113,113,0.06);border:1px solid rgba(248,113,113,0.2);border-radius:8px;color:#f87171">Vault file present but failed to load: ${vstatus.error}<br>Check VULTISIG_PASS.</div>`;
+    }
+    const ok = vstatus.isDeviceShare;
+    return `<div style="font-size:0.78rem;padding:0.7rem 0.85rem;background:rgba(${ok ? "74,222,128" : "248,113,113"},0.06);border:1px solid rgba(${ok ? "74,222,128" : "248,113,113"},0.2);border-radius:8px;color:${ok ? "#4ade80" : "#f87171"}">
+      ${ok ? "✓ Device-share vault ready" : "⚠ Wrong share — this is the SERVER party and will not co-sign"}
+      <div style="font-family:monospace;font-size:0.7rem;color:rgba(255,255,255,0.45);margin-top:0.35rem">addr ${vstatus.address}<br>party ${vstatus.localPartyId}</div>
+    </div>`;
+  })();
+
+  // Vultisig vault as a selectable trading wallet in the DeFi Wallet list.
+  const vaultWalletRow = (vstatus.exists && vstatus.isDeviceShare && !vstatus.error) ? `
+    <div style="display:flex;align-items:center;gap:0.75rem;padding:0.7rem 0.85rem;border:1px solid rgba(255,255,255,${vaultActive ? "0.15" : "0.07"});border-radius:8px;background:rgba(255,255,255,${vaultActive ? "0.04" : "0.02"});margin-bottom:0.5rem">
+      <div style="flex:1;min-width:0">
+        <div style="font-size:0.82rem;font-weight:600;color:#fafafa;display:flex;align-items:center;gap:0.5rem">
+          🔐 Vultisig MPC Vault
+          ${vaultActive ? `<span style="font-size:0.68rem;background:rgba(168,241,247,0.1);color:#A8F1F7;border:1px solid rgba(168,241,247,0.25);border-radius:4px;padding:0.1rem 0.45rem">Active</span>` : ""}
+        </div>
+        <div style="font-size:0.72rem;font-family:monospace;color:rgba(255,255,255,0.35);margin-top:0.15rem">${vstatus.address.slice(0,6)}…${vstatus.address.slice(-4)} · ${vstatus.localPartyId}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:1rem;font-size:0.75rem;color:rgba(255,255,255,0.45)">
+        <label style="display:flex;align-items:center;gap:0.35rem;cursor:pointer">
+          <input type="radio" name="tradingWallet" value="vultisig" ${vaultActive ? "checked" : ""} onchange="setTradingWallet('vultisig')" style="accent-color:#A8F1F7" />
+          Trading
+        </label>
+        <label style="display:flex;align-items:center;gap:0.35rem;cursor:pointer">
+          <input type="checkbox" ${val("VAULT_SHOW_ON_PORTFOLIO") === "true" ? "checked" : ""} onchange="setVaultFlag('portfolio',this.checked)" style="accent-color:#A8F1F7" />
+          Portfolio
+        </label>
+        <label style="display:flex;align-items:center;gap:0.35rem;cursor:pointer">
+          <input type="checkbox" ${val("VAULT_SHOW_ON_UNISWAP") === "true" ? "checked" : ""} onchange="setVaultFlag('uniswap',this.checked)" style="accent-color:#A8F1F7" />
+          Uniswap
+        </label>
+      </div>
+    </div>` : "";
+
   const panes = {
     general: `
       ${field("Default Margin to Risk (USD)", "HL_POSITION_SIZE_USD", val("HL_POSITION_SIZE_USD") || "10", "text", "Margin per trade — notional = margin × leverage. Used when a strategy has no size override.")}
@@ -2270,6 +2477,7 @@ async function settingsPage(saved = false, error = "", schwabAuthorized = false)
     hl: `
       <p style="font-size:0.78rem;color:rgba(255,255,255,0.4);margin-bottom:1.25rem">Used for Hyperliquid, Uniswap, and x402 signal payments.</p>
       <p class="section-label" style="margin-bottom:0.75rem">Wallets</p>
+      ${vaultWalletRow}
       ${walletRows}
       <button type="button" onclick="toggleAddWallet()" style="margin-top:0.5rem;background:transparent;border:1px solid rgba(168,241,247,0.25);color:#A8F1F7;border-radius:7px;padding:0.4rem 0.9rem;font-size:0.78rem;cursor:pointer">+ Add Wallet</button>
       <div id="addWalletForm" style="display:none;margin-top:1rem;padding:1rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;display:flex;flex-direction:column;gap:0.65rem">
@@ -2284,6 +2492,51 @@ async function settingsPage(saved = false, error = "", schwabAuthorized = false)
         <div style="display:flex;gap:0.5rem">
           <button type="button" onclick="addWallet()" style="background:#A8F1F7;color:#000;border:none;border-radius:7px;padding:0.45rem 1rem;font-size:0.78rem;font-weight:600;cursor:pointer">Add</button>
           <button type="button" onclick="toggleAddWallet()" style="background:transparent;border:1px solid rgba(255,255,255,0.12);color:rgba(255,255,255,0.4);border-radius:7px;padding:0.45rem 0.9rem;font-size:0.78rem;cursor:pointer">Cancel</button>
+        </div>
+      </div>
+    `,
+    vultisig: `
+      <p style="font-size:0.78rem;color:rgba(255,255,255,0.4);margin-bottom:0.5rem">2-of-2 MPC Fast Vault. This machine holds one key share, VultiServer the other — neither alone can sign. Replaces a raw private key for Hyperliquid + x402.</p>
+      ${vaultStatusHtml}
+
+      <div style="margin-top:1rem;padding:1rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;display:flex;flex-direction:column;gap:0.65rem">
+        <div style="font-size:0.8rem;font-weight:600;color:#fafafa">Import an existing device share</div>
+        <div style="font-size:0.66rem;color:rgba(255,255,255,0.3)">Use the <code style="color:#A8F1F7">share1of2</code> / device-share .vult (party <code>sdk-XXXX</code>). A <code>Server-XXXX</code> share is rejected — it can't co-sign.</div>
+        <div>
+          <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Vault file (.vult)</label>
+          <input id="vvFile" type="file" accept=".vult" style="width:100%;font-size:0.78rem" />
+        </div>
+        <div>
+          <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Vault password</label>
+          <input id="vvImportPass" type="password" placeholder="••••••••" style="width:100%;font-family:monospace" />
+        </div>
+        <button type="button" onclick="vaultImport(this)" style="align-self:flex-start;background:transparent;border:1px solid rgba(168,241,247,0.3);color:#A8F1F7;border-radius:7px;padding:0.45rem 1rem;font-size:0.78rem;font-weight:600;cursor:pointer">Import Vault</button>
+      </div>
+
+      <div style="margin-top:1rem;padding:1rem;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;display:flex;flex-direction:column;gap:0.65rem">
+        <div style="font-size:0.8rem;font-weight:600;color:#fafafa">Create a new Fast Vault</div>
+        <div>
+          <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Vault name</label>
+          <input id="vvName" type="text" placeholder="AgentSignal Trader" style="width:100%" />
+        </div>
+        <div>
+          <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Email (receives verification code)</label>
+          <input id="vvEmail" type="email" placeholder="you@example.com" style="width:100%" />
+        </div>
+        <div>
+          <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Vault password</label>
+          <input id="vvPass" type="password" placeholder="••••••••" style="width:100%;font-family:monospace" />
+          <div style="font-size:0.66rem;color:rgba(255,255,255,0.3);margin-top:0.2rem">Encrypts the share on disk and authorizes server co-signing. Saved to .env as VULTISIG_PASS so the trader can sign unattended.</div>
+        </div>
+        <button type="button" onclick="vaultCreate(this)" style="align-self:flex-start;background:#A8F1F7;color:#000;border:none;border-radius:7px;padding:0.45rem 1rem;font-size:0.78rem;font-weight:600;cursor:pointer">Create Vault →</button>
+
+        <div id="vvVerifyBox" style="display:none;border-top:1px solid rgba(255,255,255,0.08);padding-top:0.75rem;margin-top:0.25rem;flex-direction:column;gap:0.5rem">
+          <div style="font-size:0.74rem;color:#fbbf24">Vault created. Enter the code emailed to you to finish — stay on this page.</div>
+          <div>
+            <label style="font-size:0.72rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.25rem">Verification code</label>
+            <input id="vvCode" type="text" inputmode="numeric" placeholder="123456" style="width:100%;font-family:monospace;letter-spacing:0.2em" />
+          </div>
+          <button type="button" onclick="vaultVerify(this)" style="align-self:flex-start;background:#4ade80;color:#000;border:none;border-radius:7px;padding:0.45rem 1rem;font-size:0.78rem;font-weight:600;cursor:pointer">Verify & Save</button>
         </div>
       </div>
     `,
@@ -2432,10 +2685,64 @@ async function settingsPage(saved = false, error = "", schwabAuthorized = false)
       if (d.ok) { showToast('Wallet added', 'ok'); setTimeout(() => location.reload(), 800); }
       else showToast(d.error || 'Failed', 'err');
     }
-    async function setTradingWallet(id) {
-      const res = await fetch('/api/wallets/' + id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ use_for_trading: true }) });
+    async function setVaultFlag(flag, value) {
+      const res = await fetch('/api/vault/flags', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ flag, value }) });
       const d = await res.json();
-      if (d.ok) { showToast('Trading wallet updated', 'ok'); setTimeout(() => location.reload(), 800); }
+      if (d.ok) showToast('Saved', 'ok');
+      else showToast(d.error || 'Failed', 'err');
+    }
+    async function vaultImport(btn) {
+      const fileEl = document.getElementById('vvFile');
+      const password = document.getElementById('vvImportPass').value;
+      const f = fileEl.files && fileEl.files[0];
+      if (!f) { showToast('Choose a .vult file', 'err'); return; }
+      btn.disabled = true; btn.textContent = 'Importing…';
+      try {
+        const content = await f.text();
+        const res = await fetch('/api/vault/import', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ content, password }) });
+        const d = await res.json();
+        if (d.ok) { showToast('Imported — device share ' + d.localPartyId, 'ok'); setTimeout(() => location.reload(), 1200); }
+        else { showToast(d.error || 'Failed', 'err'); btn.disabled = false; btn.textContent = 'Import Vault'; }
+      } catch (e) { showToast(e.message, 'err'); btn.disabled = false; btn.textContent = 'Import Vault'; }
+    }
+    async function vaultCreate(btn) {
+      const name  = document.getElementById('vvName').value.trim();
+      const email = document.getElementById('vvEmail').value.trim();
+      const password = document.getElementById('vvPass').value;
+      if (!name || !email || !password) { showToast('Name, email and password required', 'err'); return; }
+      btn.disabled = true; btn.textContent = 'Creating… (keygen ~20s)';
+      try {
+        const res = await fetch('/api/vault/create', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name, email, password }) });
+        const d = await res.json();
+        if (d.ok) {
+          showToast('Vault created — check email for code', 'ok');
+          const box = document.getElementById('vvVerifyBox');
+          box.style.display = 'flex';
+          document.getElementById('vvCode').focus();
+        } else { showToast(d.error || 'Failed', 'err'); }
+      } catch (e) { showToast(e.message, 'err'); }
+      btn.disabled = false; btn.textContent = 'Create Vault →';
+    }
+    async function vaultVerify(btn) {
+      const code = document.getElementById('vvCode').value.trim();
+      const password = document.getElementById('vvPass').value;
+      if (!code) { showToast('Enter the verification code', 'err'); return; }
+      btn.disabled = true; btn.textContent = 'Verifying…';
+      try {
+        const res = await fetch('/api/vault/verify', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ code, password }) });
+        const d = await res.json();
+        if (d.ok) { showToast('Vault saved — device share ' + d.localPartyId, 'ok'); setTimeout(() => location.reload(), 1200); }
+        else { showToast(d.error || 'Failed', 'err'); btn.disabled = false; btn.textContent = 'Verify & Save'; }
+      } catch (e) { showToast(e.message, 'err'); btn.disabled = false; btn.textContent = 'Verify & Save'; }
+    }
+    async function setTradingWallet(id) {
+      const url = id === 'vultisig' ? '/api/vault/activate' : '/api/wallets/' + id;
+      const opts = id === 'vultisig'
+        ? { method: 'POST' }
+        : { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ use_for_trading: true }) };
+      const res = await fetch(url, opts);
+      const d = await res.json();
+      if (d.ok) { showToast(id === 'vultisig' ? 'Vultisig vault is now the trading wallet' : 'Trading wallet updated', 'ok'); setTimeout(() => location.reload(), 800); }
       else showToast(d.error || 'Failed', 'err');
     }
     async function setWalletFlag(id, flag, value) {
@@ -2796,6 +3103,103 @@ async function handleToggle(body) {
   const { id, active } = JSON.parse(body);
   setStrategyActive(id, active);
   return { ok: true };
+}
+
+// ── Hyperliquid funding handlers ───────────────────────────────────────────────
+
+const ERC20_TRANSFER_ABI = [{
+  name: "transfer", type: "function", stateMutability: "nonpayable",
+  inputs: [{ name: "to", type: "address" }, { name: "amount", type: "uint256" }],
+  outputs: [{ type: "bool" }],
+}];
+
+// Balances + context for the funding card: which wallet is active, its Arbitrum
+// USDC (deposit source) and Hyperliquid withdrawable (withdraw source).
+async function handleHlFundingInfo() {
+  const t = await resolveTradingSigner();
+  if (!t.address) return { ok: false, error: "No trading wallet configured" };
+  const tw = getTradingWallet();
+  const label = t.isVault ? "Vultisig vault" : (tw?.name ?? "Trading wallet");
+  const [arbUsdc, withdrawable] = await Promise.all([
+    getArbUsdcBalance(t.address),
+    (async () => { try { const { getWithdrawable } = await import("./hyperliquid.mjs"); return await getWithdrawable(t.address); } catch { return null; } })(),
+  ]);
+  return {
+    ok: true, address: t.address, label, isVault: t.isVault,
+    arbUsdc, withdrawable, minDeposit: HL_MIN_DEPOSIT_USD, withdrawFee: 1,
+  };
+}
+
+// Deposit: ERC20 USDC transfer on Arbitrum to the HL bridge. HL credits the
+// sending address. Raw-key wallets sign via viem; the vault signs the tx digest
+// through MPC (signDigest) and we broadcast the raw tx ourselves.
+async function handleHlDeposit(body) {
+  const { amount } = JSON.parse(body);
+  const amt = parseFloat(amount);
+  if (!Number.isFinite(amt) || amt < HL_MIN_DEPOSIT_USD) return { ok: false, error: `Minimum deposit is $${HL_MIN_DEPOSIT_USD}` };
+
+  const t = await resolveTradingSigner();
+  if (!t.address) return { ok: false, error: "No trading wallet configured" };
+
+  const balance = await getArbUsdcBalance(t.address);
+  if (balance != null && balance < amt) return { ok: false, error: `Insufficient Arbitrum USDC: have ${balance.toFixed(2)}, need ${amt.toFixed(2)}` };
+
+  const { createWalletClient, createPublicClient, http, encodeFunctionData,
+          parseUnits, serializeTransaction, keccak256 } = await import("viem");
+  const { arbitrum } = await import("viem/chains");
+  const units = parseUnits(String(amt), 6);
+
+  if (!t.isVault) {
+    const { privateKeyToAccount } = await import("viem/accounts");
+    const account = privateKeyToAccount(t.key);
+    const wallet = createWalletClient({ account, chain: arbitrum, transport: http(arbRpc()) });
+    const txHash = await wallet.writeContract({
+      address: ARB_USDC, abi: ERC20_TRANSFER_ABI, functionName: "transfer", args: [HL_BRIDGE, units],
+    });
+    return { ok: true, txHash, amount: amt };
+  }
+
+  // Vault path — sign the serialized tx digest via MPC, broadcast raw.
+  const { loadVultisigAccount } = await import("./vultisig-account.mjs");
+  const acct = await loadVultisigAccount({ vultPath: getEnvValue("VULT_FILE_PATH"), password: getEnvValue("VULTISIG_PASS") });
+  const pub = createPublicClient({ chain: arbitrum, transport: http(arbRpc()) });
+  const data = encodeFunctionData({ abi: ERC20_TRANSFER_ABI, functionName: "transfer", args: [HL_BRIDGE, units] });
+  const [nonce, fees, gas] = await Promise.all([
+    pub.getTransactionCount({ address: acct.address }),
+    pub.estimateFeesPerGas(),
+    pub.estimateGas({ account: acct.address, to: ARB_USDC, data }),
+  ]);
+  const tx = {
+    chainId: ARB_CHAIN_ID, type: "eip1559", nonce, to: ARB_USDC, value: 0n, data,
+    gas, maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+  };
+  const digest = keccak256(serializeTransaction(tx));
+  const sig = await acct.signDigest(digest); // 0x{r}{s}{v}, v ∈ {27,28}
+  const r = `0x${sig.slice(2, 66)}`;
+  const s = `0x${sig.slice(66, 130)}`;
+  const yParity = parseInt(sig.slice(130, 132), 16) - 27;
+  const signed = serializeTransaction(tx, { r, s, yParity });
+  const txHash = await pub.sendRawTransaction({ serializedTransaction: signed });
+  return { ok: true, txHash, amount: amt };
+}
+
+// Withdraw: HL signed action (withdraw3) to the trading wallet's own Arbitrum
+// address. HL deducts a flat $1 fee and bridges in ~5 min.
+async function handleHlWithdraw(body) {
+  const { amount } = JSON.parse(body);
+  const amt = parseFloat(amount);
+  if (!Number.isFinite(amt) || amt <= 1) return { ok: false, error: "Amount must exceed the $1 withdrawal fee" };
+
+  const t = await resolveTradingSigner();
+  if (!t.address) return { ok: false, error: "No trading wallet configured" };
+
+  const { getWithdrawable, withdrawFunds } = await import("./hyperliquid.mjs");
+  const free = await getWithdrawable(t.address).catch(() => null);
+  if (free != null && amt > free) return { ok: false, error: `Insufficient withdrawable: have ${free.toFixed(2)}, requested ${amt.toFixed(2)}` };
+
+  const signer = await loadTradingHlSigner();
+  const result = await withdrawFunds(signer, amt, t.address);
+  return { ok: true, result, amount: amt, received: +(amt - 1).toFixed(2) };
 }
 
 async function handleSubscribeStrategy(body) {
@@ -4169,6 +4573,17 @@ const server = createServer(async (req, res) => {
       const body = await readBody();
       return json(await handleToggle(body).catch(e => ({ ok: false, error: e.message })));
     }
+    if (url === "/api/hl/funding-info" && method === "GET") {
+      return json(await handleHlFundingInfo().catch(e => ({ ok: false, error: e.message })));
+    }
+    if (url === "/api/hl/deposit" && method === "POST") {
+      const body = await readBody();
+      return json(await handleHlDeposit(body).catch(e => ({ ok: false, error: e.message })));
+    }
+    if (url === "/api/hl/withdraw" && method === "POST") {
+      const body = await readBody();
+      return json(await handleHlWithdraw(body).catch(e => ({ ok: false, error: e.message })));
+    }
     if (url === "/api/subscribe-strategy" && method === "POST") {
       const body = await readBody();
       return json(await handleSubscribeStrategy(body).catch(e => ({ ok: false, error: e.message })));
@@ -4189,6 +4604,59 @@ const server = createServer(async (req, res) => {
     if (url === "/api/open" && method === "POST") {
       const body = await readBody();
       return json(await handleOpen(body).catch(e => ({ ok: false, error: e.message })));
+    }
+
+    if (url === "/api/vault/create" && method === "POST") {
+      const body = await readBody();
+      try {
+        const { name, email, password } = JSON.parse(body);
+        const { createVaultStart } = await import("./vultisig-vault.mjs");
+        const r = await createVaultStart({ name, email, password });
+        return json({ ok: true, ...r });
+      } catch (e) { return json({ ok: false, error: e.message }); }
+    }
+    if (url === "/api/vault/verify" && method === "POST") {
+      const body = await readBody();
+      try {
+        const { code, password } = JSON.parse(body);
+        const { verifyVaultFinish, VAULT_PATH } = await import("./vultisig-vault.mjs");
+        const r = await verifyVaultFinish({ code });
+        // Persist so the trader (separate PM2 process) can load + sign unattended.
+        writeEnvValues({ VULT_FILE_PATH: VAULT_PATH, VULTISIG_PASS: password, VAULT_ADDRESS: r.address });
+        return json({ ok: true, ...r });
+      } catch (e) { return json({ ok: false, error: e.message }); }
+    }
+    if (url === "/api/vault/import" && method === "POST") {
+      const body = await readBody();
+      try {
+        const { content, password } = JSON.parse(body);
+        const { importVaultFile, VAULT_PATH } = await import("./vultisig-vault.mjs");
+        const r = await importVaultFile({ content, password });
+        writeEnvValues({ VULT_FILE_PATH: VAULT_PATH, VULTISIG_PASS: password, VAULT_ADDRESS: r.address });
+        return json({ ok: true, ...r });
+      } catch (e) { return json({ ok: false, error: e.message }); }
+    }
+    if (url === "/api/vault/activate" && method === "POST") {
+      try {
+        const { vaultStatus } = await import("./vultisig-vault.mjs");
+        const st = await vaultStatus(getEnvValue("VULTISIG_PASS"));
+        if (!st.exists) return json({ ok: false, error: "no vault on disk — create or import one first" });
+        if (st.error) return json({ ok: false, error: "vault failed to load: " + st.error });
+        if (!st.isDeviceShare) return json({ ok: false, error: "this is a server share — cannot co-sign" });
+        writeEnvValues({ VAULT_ACTIVE: "true", VAULT_ADDRESS: st.address });
+        clearTradingWallet(); // vault is now the signer — no raw-key wallet trades
+        return json({ ok: true, address: st.address });
+      } catch (e) { return json({ ok: false, error: e.message }); }
+    }
+    if (url === "/api/vault/flags" && method === "POST") {
+      try {
+        const { flag, value } = JSON.parse(await readBody());
+        const key = flag === "portfolio" ? "VAULT_SHOW_ON_PORTFOLIO"
+                  : flag === "uniswap"   ? "VAULT_SHOW_ON_UNISWAP" : null;
+        if (!key) return json({ ok: false, error: "unknown flag" });
+        writeEnvValues({ [key]: value ? "true" : "false" });
+        return json({ ok: true });
+      } catch (e) { return json({ ok: false, error: e.message }); }
     }
     if (url === "/api/sell-for-usdc" && method === "POST") {
       const body = await readBody();
@@ -4375,8 +4843,10 @@ const server = createServer(async (req, res) => {
       if (!wallet) return json({ ok: false, error: "Wallet not found" }, 404);
       if (updates.use_for_trading) {
         setTradingWallet(id);
-        writeEnvValues({ AGENT_PRIVATE_KEY: wallet.key });
+        // Selecting a raw-key wallet turns off the Vultisig signer.
+        writeEnvValues({ AGENT_PRIVATE_KEY: wallet.key, VAULT_ACTIVE: "false" });
         process.env.AGENT_PRIVATE_KEY = wallet.key;
+        PRIVATE_KEY = wallet.key; // keep the live binding in sync
       } else {
         updateWalletFlags(id, updates);
       }
@@ -4628,11 +5098,15 @@ const server = createServer(async (req, res) => {
     async function getUniswapAddresses() {
       const { privateKeyToAccount } = await import("viem/accounts");
       const uniWallets = listWallets().filter(w => w.show_on_uniswap);
-      if (uniWallets.length) {
-        return uniWallets.map(w => { try { return { address: privateKeyToAccount(w.key).address, key: w.key }; } catch { return null; } }).filter(Boolean);
+      const list = uniWallets.length
+        ? uniWallets.map(w => { try { return { address: privateKeyToAccount(w.key).address, key: w.key }; } catch { return null; } }).filter(Boolean)
+        : (PRIVATE_KEY ? [{ address: privateKeyToAccount(PRIVATE_KEY).address, key: PRIVATE_KEY }] : []);
+      // Vultisig vault — read-only (no key; fee collection not available for it)
+      const va = getEnvValue("VAULT_ADDRESS");
+      if (getEnvValue("VAULT_SHOW_ON_UNISWAP") === "true" && va && !list.some(e => e.address.toLowerCase() === va.toLowerCase())) {
+        list.push({ address: va, key: null });
       }
-      if (PRIVATE_KEY) return [{ address: privateKeyToAccount(PRIVATE_KEY).address, key: PRIVATE_KEY }];
-      return [];
+      return list;
     }
 
     if (url === "/premium-fade" && method === "GET") return send(await premiumFadePage());
@@ -4640,11 +5114,7 @@ const server = createServer(async (req, res) => {
 
     if (url === "/uniswap/wallet" && method === "GET") {
       try {
-        const { privateKeyToAccount } = await import("viem/accounts");
-        const uniWallets = listWallets().filter(w => w.show_on_uniswap);
-        const addresses = uniWallets.length
-          ? uniWallets.map(w => { try { return privateKeyToAccount(w.key).address; } catch { return null; } }).filter(Boolean)
-          : PRIVATE_KEY ? [privateKeyToAccount(PRIVATE_KEY).address] : [];
+        const addresses = (await getUniswapAddresses()).map(a => a.address);
         return json({ address: addresses[0] ?? null, addresses });
       } catch { return json({ address: null, addresses: [] }); }
     }

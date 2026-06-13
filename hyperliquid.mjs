@@ -67,12 +67,21 @@ function isSpotAsset(asset) {
   return _spotIndexCache?.[upper] !== undefined && _assetIndexCache?.[upper] === undefined;
 }
 
-function makeClients(privateKey) {
-  const wallet = privateKeyToAccount(privateKey);
-  const walletClient = createWalletClient({ account: wallet, chain: mainnet, transport: http() });
-  const exchange = new ExchangeClient({ transport, wallet: walletClient });
+// `signer` is either a 0x-prefixed private key string, or a viem-style local
+// account ({ address, signTypedData }) — e.g. a Vultisig MPC account. @nktkas
+// accepts a local account directly as `wallet`; a raw key is wrapped in a
+// viem WalletClient first (the established path).
+function makeClients(signer) {
+  if (typeof signer === "string") {
+    const wallet = privateKeyToAccount(signer);
+    const walletClient = createWalletClient({ account: wallet, chain: mainnet, transport: http() });
+    const exchange = new ExchangeClient({ transport, wallet: walletClient });
+    const info = new InfoClient({ transport });
+    return { exchange, info, wallet };
+  }
+  const exchange = new ExchangeClient({ transport, wallet: signer });
   const info = new InfoClient({ transport });
-  return { exchange, info, wallet };
+  return { exchange, info, wallet: signer };
 }
 
 // ── Info (read-only) ─────────────────────────────────────────────────────────
@@ -311,4 +320,27 @@ export async function closePosition(privateKey, asset) {
     }],
     grouping: "na",
   });
+}
+
+// ── Funding (deposit / withdraw) ───────────────────────────────────────────────
+
+/**
+ * Withdraw USDC from the Hyperliquid perp account to an Arbitrum address.
+ * Hyperliquid deducts a flat $1 fee and bridges to Arbitrum (~5 min). The
+ * destination defaults to the signer's own address. `amount` is USDC as a
+ * number/string (the gross amount; you receive amount − $1).
+ * `signer` is a raw key string or a viem-style MPC account (vault).
+ */
+export async function withdrawFunds(signer, amount, destination) {
+  const { exchange, wallet } = makeClients(signer);
+  const dest = (destination ?? wallet.address).toLowerCase();
+  const amt = new Decimal(String(amount)).toFixed(2);
+  console.log(`[hyperliquid] Withdraw ${amt} USDC → ${dest} (−$1 fee)`);
+  return exchange.withdraw3({ destination: dest, amount: amt });
+}
+
+/** Withdrawable USDC (free margin) for an address. */
+export async function getWithdrawable(address) {
+  const st = await getAccountState(address);
+  return parseFloat(st?.withdrawable ?? "0");
 }

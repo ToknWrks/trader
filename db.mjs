@@ -470,6 +470,19 @@ export function setTradingWallet(id) {
   db.prepare("UPDATE wallets SET use_for_trading = 1 WHERE id = ?").run(id);
 }
 
+// The single wallet currently flagged for trading, or null. Source of truth for
+// which key signs trades / funds Hyperliquid. When the Vultisig vault is the
+// active signer (VAULT_ACTIVE=true) all rows are cleared, so this returns null.
+export function getTradingWallet() {
+  return db.prepare("SELECT * FROM wallets WHERE use_for_trading = 1 LIMIT 1").get() ?? null;
+}
+
+// Clear the trading flag on every wallet — used when the Vultisig vault becomes
+// the active signer, so no raw-key wallet also claims to be trading.
+export function clearTradingWallet() {
+  db.prepare("UPDATE wallets SET use_for_trading = 0").run();
+}
+
 // ── Staking contracts ─────────────────────────────────────────────────────────
 
 db.exec(`

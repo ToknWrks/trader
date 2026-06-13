@@ -16,9 +16,13 @@ import {
 } from "../hyperliquid.mjs";
 
 export class HyperliquidExchange {
-  constructor(privateKey) {
-    this.privateKey = privateKey;
-    this.address = privateKeyToAccount(privateKey).address;
+  // signer: 0x private-key string, OR a viem-style account ({ address, signTypedData })
+  // such as a Vultisig MPC account from loadVultisigAccount().
+  constructor(signer) {
+    this.signer = signer;
+    this.address = typeof signer === "string"
+      ? privateKeyToAccount(signer).address
+      : signer.address;
   }
 
   get name() { return "Hyperliquid"; }
@@ -33,15 +37,15 @@ export class HyperliquidExchange {
   }
 
   async setLeverage(asset, leverage) {
-    return hlSetLeverage(this.privateKey, asset, leverage);
+    return hlSetLeverage(this.signer, asset, leverage);
   }
 
   async placeMarketOrder(asset, side, size) {
-    return hlPlaceOrder(this.privateKey, asset, side, size);
+    return hlPlaceOrder(this.signer, asset, side, size);
   }
 
   async placeLimitOrder(asset, side, size, limitPrice) {
-    return hlPlaceLimitOrder(this.privateKey, asset, side, size, limitPrice);
+    return hlPlaceLimitOrder(this.signer, asset, side, size, limitPrice);
   }
 
   async getOpenOrders() {
@@ -49,17 +53,17 @@ export class HyperliquidExchange {
   }
 
   async cancelOrder(orderId, asset) {
-    return hlCancelOrder(this.privateKey, asset, orderId);
+    return hlCancelOrder(this.signer, asset, orderId);
   }
 
   async editOrder(orderId, asset, side, size, limitPrice) {
     console.log(`[hyperliquid] Editing order ${orderId} (cancel + replace): ${size} ${asset} @ $${limitPrice}`);
-    await hlCancelOrder(this.privateKey, asset, orderId);
-    return hlPlaceLimitOrder(this.privateKey, asset, side, size, limitPrice);
+    await hlCancelOrder(this.signer, asset, orderId);
+    return hlPlaceLimitOrder(this.signer, asset, side, size, limitPrice);
   }
 
   async closePosition(asset) {
-    return hlClose(this.privateKey, asset);
+    return hlClose(this.signer, asset);
   }
 
   async getCandles(asset, interval, count) {

@@ -33,6 +33,9 @@ function loadEnv() {
 loadEnv();
 
 const PRIVATE_KEY       = process.env.AGENT_PRIVATE_KEY?.trim();
+const VAULT_ACTIVE      = process.env.VAULT_ACTIVE === "true";
+const VULT_FILE_PATH    = process.env.VULT_FILE_PATH?.trim();
+const VULTISIG_PASS     = process.env.VULTISIG_PASS;
 const KRAKEN_API_KEY    = process.env.KRAKEN_API_KEY?.trim();
 const KRAKEN_API_SECRET = process.env.KRAKEN_API_SECRET?.trim();
 const ALPACA_API_KEY         = process.env.ALPACA_API_KEY?.trim();
@@ -82,7 +85,7 @@ function isCrypto(symbol) {
   return CRYPTO_TICKERS.has(base);
 }
 
-if (!PRIVATE_KEY && !KRAKEN_API_KEY && !ALPACA_API_KEY) {
+if (!PRIVATE_KEY && !KRAKEN_API_KEY && !ALPACA_API_KEY && !VAULT_ACTIVE) {
   console.error("[trader] No exchange credentials found. Run: npm run setup");
   process.exit(1);
 }
@@ -95,6 +98,7 @@ import {
   insertSignalEvent, setTpState, getTpState, updateTpTrailMode,
   updateTpHighWater, clearTpState, logFetch, getLastTradeTime,
   setSubscriptionExpiry, getLastStrategyEntry, setStrategyRiskMode,
+  getTradingWallet,
 } from "./db.mjs";
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
@@ -103,7 +107,20 @@ import { AlpacaExchange } from "./exchanges/alpaca.mjs";
 import { CoinbaseExchange } from "./exchanges/coinbase.mjs";
 import { SchwabExchange } from "./exchanges/schwab.mjs";
 
-function getExchange(strategy) {
+// Resolve the Hyperliquid signer once and cache it. When the Vultisig MPC vault
+// is the active trading wallet, this is a viem-style account that co-signs with
+// VultiServer; otherwise the Hyperliquid branch uses the raw AGENT_PRIVATE_KEY.
+let _vaultSigner;
+async function getVaultSigner() {
+  if (_vaultSigner !== undefined) return _vaultSigner;
+  if (!VULT_FILE_PATH) throw new Error("VAULT_ACTIVE=true but VULT_FILE_PATH is not set — create/import a vault from the dashboard");
+  const { loadVultisigAccount } = await import("./vultisig-account.mjs");
+  _vaultSigner = await loadVultisigAccount({ vultPath: VULT_FILE_PATH, password: VULTISIG_PASS });
+  console.log(`[trader] 🔐 Vultisig MPC vault active — signing as ${_vaultSigner.address}`);
+  return _vaultSigner;
+}
+
+async function getExchange(strategy) {
   const exch = strategy.exchange ?? "hyperliquid";
   if (exch === "kraken") {
     if (!KRAKEN_API_KEY || !KRAKEN_API_SECRET) throw new Error("KRAKEN_API_KEY and KRAKEN_API_SECRET are required for Kraken strategies");
@@ -126,8 +143,14 @@ function getExchange(strategy) {
       contracts:   strategy.contracts    ?? 1,
     });
   }
-  if (!PRIVATE_KEY) throw new Error("AGENT_PRIVATE_KEY is required for Hyperliquid strategies");
-  return new HyperliquidExchange(PRIVATE_KEY);
+  if (VAULT_ACTIVE) {
+    return new HyperliquidExchange(await getVaultSigner());
+  }
+  // The db trading wallet is the source of truth; the dashboard keeps
+  // AGENT_PRIVATE_KEY in sync with it, so env is the fallback.
+  const key = getTradingWallet()?.key ?? PRIVATE_KEY;
+  if (!key) throw new Error("No trading wallet set and AGENT_PRIVATE_KEY is unset — pick a wallet in the dashboard");
+  return new HyperliquidExchange(key);
 }
 
 // ── Retry / guard helpers ─────────────────────────────────────────────────────
@@ -240,7 +263,7 @@ async function tryLocalEval(strategy, def) {
     const knownFlds     = new Set([...priceFlds, ...indicatorFlds, ...passthroughFlds]);
 
     const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
-    const exchange = getExchange(strategy);
+    const exchange = await getExchange(strategy);
 
     // Fetch position first — needed to decide whether RADAR gate applies
     const [price, position] = await Promise.all([
@@ -548,7 +571,7 @@ async function fetchSignal(strategy) {
 
 async function checkTpTrail(strategy) {
   const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
-  const exchange = getExchange(strategy);
+  const exchange = await getExchange(strategy);
 
   // Check actual position on exchange — not signal state
   const position    = await withRetry(() => exchange.getPosition(asset));
@@ -662,7 +685,7 @@ async function executeTrade(strategy, signal, priorSignal) {
   const leverage = strategy.leverage ?? 1;
   const sizeUsd  = strategy.position_size_usd ?? HL_SIZE_USD;
 
-  const exchange = getExchange(strategy);
+  const exchange = await getExchange(strategy);
 
   const midPrice = await withRetry(() => exchange.getMidPrice(asset));
   if (!midPrice) throw new Error(`Could not get price for ${asset}`);
