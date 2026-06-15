@@ -54,10 +54,10 @@ async function krakenRequest(apiKey, apiSecret, path, params = {}) {
 }
 
 export class KrakenExchange {
-  constructor(apiKey, apiSecret) {
+  constructor(apiKey, apiSecret, leverage = 1) {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
-    this._leverage = 1;
+    this._leverage = leverage;
   }
 
   get name() { return "Kraken"; }

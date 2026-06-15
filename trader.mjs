@@ -124,7 +124,7 @@ async function getExchange(strategy) {
   const exch = strategy.exchange ?? "hyperliquid";
   if (exch === "kraken") {
     if (!KRAKEN_API_KEY || !KRAKEN_API_SECRET) throw new Error("KRAKEN_API_KEY and KRAKEN_API_SECRET are required for Kraken strategies");
-    return new KrakenExchange(KRAKEN_API_KEY, KRAKEN_API_SECRET);
+    return new KrakenExchange(KRAKEN_API_KEY, KRAKEN_API_SECRET, strategy.leverage ?? 1);
   }
   if (exch === "alpaca") {
     if (!ALPACA_API_KEY || !ALPACA_API_SECRET) throw new Error("ALPACA_API_KEY and ALPACA_API_SECRET are required for Alpaca strategies");

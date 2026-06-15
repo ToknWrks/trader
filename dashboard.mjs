@@ -97,6 +97,7 @@ import {
   maybeCreateDefaultWallet, listWallets, insertWallet, deleteWallet, updateWalletFlags, setTradingWallet,
   getTradingWallet, clearTradingWallet,
   listStakingContracts, insertStakingContract, deleteStakingContract,
+  getVaultWatchlist, addVaultToken, removeVaultToken,
 } from "./db.mjs";
 
 if (PRIVATE_KEY) maybeCreateDefaultWallet(PRIVATE_KEY);
@@ -159,6 +160,109 @@ async function getNetworkUsdcBalance(address) {
   } catch {
     return null;
   }
+}
+
+// ── Vault multi-chain balance helpers ────────────────────────────────────────
+
+const VAULT_NATIVE_WRAP = {
+  ethereum: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+  base:     "0x4200000000000000000000000000000000000006",
+  arbitrum: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+  bsc:      "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+};
+const VAULT_NATIVE_SYMBOL = { ethereum: "ETH", base: "ETH", arbitrum: "ETH", bsc: "BNB" };
+const VAULT_CHAINS = ["ethereum", "base", "arbitrum", "bsc"];
+
+function vaultRpc(chain) {
+  const key = process.env.ALCHEMY_API_KEY;
+  if (chain === "ethereum") return key ? `https://eth-mainnet.g.alchemy.com/v2/${key}` : "https://cloudflare-eth.com";
+  if (chain === "base")     return key ? `https://base-mainnet.g.alchemy.com/v2/${key}` : "https://mainnet.base.org";
+  if (chain === "arbitrum") return key ? `https://arb-mainnet.g.alchemy.com/v2/${key}` : "https://arb1.arbitrum.io/rpc";
+  if (chain === "bsc")      return "https://bsc-dataseed.binance.org/";
+  return null;
+}
+
+async function rpcCall(rpc, method, params) {
+  const res = await fetch(rpc, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  const { result } = await res.json();
+  return result;
+}
+
+async function getNativeBalance(address, rpc) {
+  try {
+    const hex = await rpcCall(rpc, "eth_getBalance", [address, "latest"]);
+    return parseInt(hex, 16) / 1e18;
+  } catch { return 0; }
+}
+
+async function getErc20Balance(address, contract, rpc, decimals = 18) {
+  try {
+    const padded = address.toLowerCase().replace("0x", "").padStart(64, "0");
+    const hex = await rpcCall(rpc, "eth_call", [{ to: contract, data: "0x70a08231" + padded }, "latest"]);
+    return parseInt(hex, 16) / Math.pow(10, decimals);
+  } catch { return 0; }
+}
+
+async function resolveTokenMeta(contract, rpc) {
+  try {
+    const symHex = await rpcCall(rpc, "eth_call", [{ to: contract, data: "0x95d89b41" }, "latest"]);
+    const decHex = await rpcCall(rpc, "eth_call", [{ to: contract, data: "0x313ce567" }, "latest"]);
+    const decimals = parseInt(decHex, 16) || 18;
+    // ABI-decode string: 32-byte offset (ignored) | 32-byte length | UTF-8 data
+    const symData = symHex?.slice(2) ?? "";
+    let symbol = "?";
+    if (symData.length >= 128) {
+      const len = parseInt(symData.slice(64, 128), 16);
+      symbol = Buffer.from(symData.slice(128, 128 + len * 2), "hex").toString("utf8").replace(/\0/g, "");
+    } else if (symData.length >= 64) {
+      // Some tokens return symbol as bytes32
+      symbol = Buffer.from(symData.slice(0, 64), "hex").toString("utf8").replace(/\0/g, "").trim();
+    }
+    return { symbol: symbol || "?", decimals };
+  } catch { return { symbol: "?", decimals: 18 }; }
+}
+
+async function getVaultTokenPrices(items) {
+  if (!items.length) return {};
+  try {
+    const keys = items.map(t => `${t.chain}:${t.address.toLowerCase()}`).join(",");
+    const res = await fetch(`https://coins.llama.fi/prices/current/${keys}`);
+    if (!res.ok) return {};
+    const data = await res.json();
+    const out = {};
+    for (const [k, v] of Object.entries(data.coins ?? {})) out[k] = v.price ?? 0;
+    return out;
+  } catch { return {}; }
+}
+
+async function fetchVaultBalances(vaultAddress) {
+  const watchlist = getVaultWatchlist();
+  const addr = vaultAddress.toLowerCase();
+
+  // Build price lookup items: native wraps + watchlist tokens
+  const priceItems = [];
+  for (const chain of VAULT_CHAINS) priceItems.push({ chain, address: VAULT_NATIVE_WRAP[chain] });
+  for (const t of watchlist) priceItems.push({ chain: t.chain, address: t.contract_address });
+  const prices = await getVaultTokenPrices(priceItems);
+
+  const chains = {};
+  for (const chain of VAULT_CHAINS) {
+    const rpc = vaultRpc(chain);
+    const native = await getNativeBalance(addr, rpc);
+    const nativePrice = prices[`${chain}:${VAULT_NATIVE_WRAP[chain].toLowerCase()}`] ?? 0;
+    const tokens = [];
+    for (const t of watchlist.filter(w => w.chain === chain)) {
+      const bal = await getErc20Balance(addr, t.contract_address, rpc, t.decimals);
+      const price = prices[`${chain}:${t.contract_address.toLowerCase()}`] ?? 0;
+      tokens.push({ id: t.id, symbol: t.symbol ?? "?", balance: bal, usd: bal * price, contract: t.contract_address });
+    }
+    chains[chain] = { native, nativeUsd: native * nativePrice, tokens };
+  }
+  return chains;
 }
 
 // ── Hyperliquid funding (Arbitrum) ────────────────────────────────────────────
@@ -1015,7 +1119,8 @@ async function portfolioPage() {
 
   const fetchesToday = countFetchesToday();
   const fetchesTotal = countFetchesTotal();
-  const networkUsdc = hlAddress ? await getNetworkUsdcBalance(hlAddress) : null;
+  const { address: x402Addr } = await resolveTradingSigner();
+  const networkUsdc = x402Addr ? await getNetworkUsdcBalance(x402Addr) : null;
   const payNetwork = getPaymentNetwork();
   const payNetworkLabel = X402_NETWORKS[payNetwork]?.label ?? payNetwork;
 
@@ -1060,13 +1165,26 @@ async function portfolioPage() {
   // ── Uniswap positions ───────────────────────────────────────────────────────
   const uniData = hlAddress ? (await getV3Positions(hlAddress).catch(() => ({ positions: [] }))) : { positions: [] };
   const uniOpen = uniData.positions.filter(p => p.hasLiquidity);
+
+  // ── Vultisig vault balances ──────────────────────────────────────────────────
+  const vaultDisplayAddr = getEnvValue("VAULT_ADDRESS");
+  let vaultChainBalances = null;
+  let vaultTotalUsd = 0;
+  if (vaultDisplayAddr) {
+    try {
+      vaultChainBalances = await fetchVaultBalances(vaultDisplayAddr);
+      for (const c of Object.values(vaultChainBalances)) {
+        vaultTotalUsd += c.nativeUsd + c.tokens.reduce((s, t) => s + t.usd, 0);
+      }
+    } catch {}
+  }
   const uniswapLiqUsd  = uniOpen.reduce((s, p) => s + (p.totalLiquidityUsd ?? 0), 0);
   const uniswapFeesUsd = uniOpen.reduce((s, p) => s + (p.totalFeesUsd ?? 0), 0);
 
   // ── Summary calculations ────────────────────────────────────────────────────
   const cbTotalUsd = Object.values(coinbaseUsdValues).reduce((s, v) => s + (v ?? 0), 0);
   const krTotalUsd = Object.values(krakenUsdValues).reduce((s, v) => s + (v ?? 0), 0);
-  const totalValue = accountValue + usdcSpot + cbTotalUsd + krTotalUsd + uniswapLiqUsd + schwabTotalUsd;
+  const totalValue = accountValue + usdcSpot + cbTotalUsd + krTotalUsd + uniswapLiqUsd + schwabTotalUsd + vaultTotalUsd;
 
   // Liquid USDC/USD across all exchanges
   const cbUsdcTotal = coinbaseAccounts
@@ -1128,6 +1246,7 @@ async function portfolioPage() {
       ${process.env.KRAKEN_API_KEY   ? `<button id="ptab-kr" onclick="switchPTab('kr')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Kraken</button>` : ""}
       ${schwab ? `<button id="ptab-schwab" onclick="switchPTab('schwab')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Schwab</button>` : ""}
       ${uniOpen.length > 0 ? `<button id="ptab-uni" onclick="switchPTab('uni')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Uniswap (${uniOpen.length})</button>` : ""}
+      ${vaultDisplayAddr ? `<button id="ptab-vult" onclick="switchPTab('vult')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">🔐 Vultisig${vaultTotalUsd > 0.01 ? " $" + vaultTotalUsd.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}) : ""}</button>` : ""}
       <button id="ptab-orders" onclick="switchPTab('orders')" style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">Orders${openOrders.length > 0 ? ` (${openOrders.length})` : ""}</button>
     </div>
 
@@ -1277,6 +1396,48 @@ async function portfolioPage() {
       : `<p class="hint">No open Uniswap V3 positions on Base.</p><p style="margin-top:0.5rem"><a href="/uniswap" style="font-size:0.78rem;color:#A8F1F7">Go to Uniswap →</a></p>`}
     </div>
 
+    ${vaultDisplayAddr ? `<div id="ppane-vult" style="display:none">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:0.5rem">
+        <div style="display:flex;align-items:center;gap:0.75rem">
+          <span style="font-size:0.78rem;font-family:monospace;color:rgba(255,255,255,0.4)">${vaultDisplayAddr.slice(0,6)}…${vaultDisplayAddr.slice(-4)}</span>
+          <button onclick="navigator.clipboard.writeText('${vaultDisplayAddr}').then(()=>showToast('Copied','ok'))" style="background:none;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:rgba(255,255,255,0.35);cursor:pointer;padding:0.15rem 0.4rem;font-size:0.68rem">copy</button>
+        </div>
+        ${vaultTotalUsd > 0.01 ? `<span style="font-size:1.1rem;font-weight:700;color:#4ade80">$${vaultTotalUsd.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</span>` : ""}
+      </div>
+      ${vaultChainBalances ? VAULT_CHAINS.map(chain => {
+        const c = vaultChainBalances[chain];
+        const chainLabel = { ethereum: "Ethereum", base: "Base", arbitrum: "Arbitrum", bsc: "BSC" }[chain];
+        const nativeSym = VAULT_NATIVE_SYMBOL[chain];
+        const hasContent = c.native > 0.000001 || c.tokens.length > 0;
+        if (!hasContent) return "";
+        const nativeRow = c.native > 0.000001
+          ? `<tr><td style="font-weight:600">${nativeSym}</td><td style="font-family:monospace;text-align:right">${c.native.toFixed(6)}</td><td style="text-align:right;color:rgba(255,255,255,0.5)">$${c.nativeUsd.toFixed(2)}</td><td></td></tr>`
+          : "";
+        const tokenRows = c.tokens.map(t =>
+          `<tr><td style="font-weight:600">${t.symbol} <span style="font-size:0.68rem;color:rgba(255,255,255,0.3);font-family:monospace">${t.contract.slice(0,6)}…${t.contract.slice(-4)}</span></td><td style="font-family:monospace;text-align:right">${t.balance > 0.000001 ? t.balance.toLocaleString(undefined,{maximumFractionDigits:4}) : "—"}</td><td style="text-align:right;color:rgba(255,255,255,0.5)">${t.usd > 0.001 ? "$" + t.usd.toFixed(2) : "—"}</td><td style="text-align:right"><button onclick="vaultRemoveToken('${t.id}')" style="background:none;border:1px solid rgba(248,113,113,0.2);color:#f87171;border-radius:4px;cursor:pointer;padding:0.1rem 0.4rem;font-size:0.68rem">×</button></td></tr>`
+        ).join("");
+        return `<p class="section-label" style="margin-top:1rem;margin-bottom:0.4rem">${chainLabel}</p>
+        <div class="card"><table>
+          <thead><tr><th>Token</th><th style="text-align:right">Balance</th><th style="text-align:right">USD</th><th></th></tr></thead>
+          <tbody>${nativeRow}${tokenRows}</tbody>
+        </table></div>`;
+      }).join("") : `<p class="hint">Loading balances…</p>`}
+      <div style="margin-top:1.5rem;padding:1rem;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.07);border-radius:10px">
+        <p style="font-size:0.78rem;font-weight:600;color:rgba(255,255,255,0.6);margin-bottom:0.75rem">Add Token</p>
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:flex-end">
+          <select id="vultChain" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#fafafa;padding:0.45rem 0.6rem;font-size:0.8rem">
+            <option value="ethereum">Ethereum</option>
+            <option value="base" selected>Base</option>
+            <option value="arbitrum">Arbitrum</option>
+            <option value="bsc">BSC</option>
+          </select>
+          <input id="vultContract" placeholder="0x contract address" style="flex:1;min-width:200px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#fafafa;padding:0.45rem 0.6rem;font-size:0.8rem" />
+          <button onclick="vaultAddToken(this)" style="background:rgba(168,241,247,0.08);border:1px solid rgba(168,241,247,0.25);color:#A8F1F7;border-radius:6px;padding:0.45rem 0.9rem;font-size:0.8rem;cursor:pointer">Add</button>
+        </div>
+        <div id="vultAddError" style="font-size:0.72rem;color:#f87171;margin-top:0.4rem;display:none"></div>
+      </div>
+    </div>` : ""}
+
     <div id="ppane-orders" style="display:none">
       ${openOrders.length > 0 ? `<div class="card"><table>
         <thead><tr><th>Exchange</th><th>Asset</th><th>Side</th><th>Size</th><th>Limit Price</th><th></th></tr></thead>
@@ -1305,12 +1466,34 @@ async function portfolioPage() {
     <p class="hint"><a href="/portfolio">Refresh</a></p>
     <script>
       function switchPTab(tab) {
-        ['hl','cb','kr','schwab','uni','orders'].forEach(t => {
+        ['hl','cb','kr','schwab','uni','vult','orders'].forEach(t => {
           const pane = document.getElementById('ppane-' + t);
           const btn  = document.getElementById('ptab-' + t);
           if (pane) pane.style.display = t === tab ? '' : 'none';
           if (btn)  { btn.style.background = t === tab ? '#A8F1F7' : 'transparent'; btn.style.color = t === tab ? '#000' : 'rgba(255,255,255,0.5)'; }
         });
+      }
+
+      // ── Vultisig watchlist ───────────────────────────────────────────────────
+      async function vaultAddToken(btn) {
+        const chain = document.getElementById('vultChain').value;
+        const contract = document.getElementById('vultContract').value.trim();
+        const errEl = document.getElementById('vultAddError');
+        errEl.style.display = 'none';
+        if (!contract.match(/^0x[0-9a-fA-F]{40}$/)) { errEl.textContent = 'Enter a valid 0x contract address'; errEl.style.display = 'block'; return; }
+        btn.disabled = true; btn.textContent = 'Resolving…';
+        try {
+          const r = await fetch('/api/vault/watchlist', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ chain, contractAddress: contract }) });
+          const d = await r.json();
+          if (d.ok) { showToast('Added ' + (d.symbol || contract.slice(0,6)), 'ok'); setTimeout(() => location.reload(), 800); }
+          else { errEl.textContent = d.error || 'Failed'; errEl.style.display = 'block'; btn.disabled = false; btn.textContent = 'Add'; }
+        } catch(e) { errEl.textContent = e.message; errEl.style.display = 'block'; btn.disabled = false; btn.textContent = 'Add'; }
+      }
+      async function vaultRemoveToken(id) {
+        const r = await fetch('/api/vault/watchlist/' + id, { method: 'DELETE' });
+        const d = await r.json();
+        if (d.ok) { showToast('Removed', 'ok'); setTimeout(() => location.reload(), 800); }
+        else showToast(d.error || 'Failed', 'err');
       }
 
       // ── Hyperliquid funding ──────────────────────────────────────────────────
@@ -2253,15 +2436,20 @@ async function historyPage() {
 
   const isPaper = process.env.ALPACA_PAPER === "true";
 
-  // Split trades into live vs paper
-  const liveTrades = trades.filter(t => {
-    const exchange = stratMap[t.strategy_id] ?? "hyperliquid";
-    return !(exchange === "alpaca" && isPaper);
-  });
-  const paperTrades = trades.filter(t => {
-    const exchange = stratMap[t.strategy_id] ?? "hyperliquid";
-    return exchange === "alpaca" && isPaper;
-  });
+  function tradeExchange(t) {
+    if (t.strategy_id === 'uniswap') return 'uniswap';
+    const ex = stratMap[t.strategy_id] ?? "hyperliquid";
+    if (ex === 'alpaca' && isPaper) return 'paper';
+    return ex;
+  }
+
+  const allTrades     = trades.filter(t => tradeExchange(t) !== 'paper');
+  const hlTrades      = trades.filter(t => tradeExchange(t) === 'hyperliquid');
+  const krakenTrades  = trades.filter(t => tradeExchange(t) === 'kraken');
+  const coinbaseTrades= trades.filter(t => tradeExchange(t) === 'coinbase');
+  const schwabTrades  = trades.filter(t => tradeExchange(t) === 'schwab');
+  const uniswapTrades = trades.filter(t => tradeExchange(t) === 'uniswap');
+  const paperTrades   = trades.filter(t => tradeExchange(t) === 'paper');
 
   function calcStats(tList) {
     const closedTrades = tList.filter(t => t.pnl != null);
@@ -2313,8 +2501,13 @@ async function historyPage() {
     </table>`;
   }
 
-  const liveStats = calcStats(liveTrades);
-  const paperStats = calcStats(paperTrades);
+  const allStats      = calcStats(allTrades);
+  const hlStats       = calcStats(hlTrades);
+  const krakenStats   = calcStats(krakenTrades);
+  const coinbaseStats = calcStats(coinbaseTrades);
+  const schwabStats   = calcStats(schwabTrades);
+  const uniswapStats  = calcStats(uniswapTrades);
+  const paperStats    = calcStats(paperTrades);
 
   const sigSections = strategies.map(s => {
     const sigs = getSignalHistory(s.id, 20);
@@ -2337,40 +2530,49 @@ async function historyPage() {
     </div>`;
   }).join("");
 
+  const EXCHANGE_TABS = [
+    { key: 'all',      label: 'All',      stats: allStats,      list: allTrades,       empty: 'No trades yet' },
+    { key: 'hl',       label: 'HL',       stats: hlStats,       list: hlTrades,        empty: 'No Hyperliquid trades yet' },
+    { key: 'kraken',   label: 'Kraken',   stats: krakenStats,   list: krakenTrades,    empty: 'No Kraken trades yet' },
+    { key: 'coinbase', label: 'Coinbase', stats: coinbaseStats, list: coinbaseTrades,  empty: 'No Coinbase trades yet' },
+    { key: 'schwab',   label: 'Schwab',   stats: schwabStats,   list: schwabTrades,    empty: 'No Schwab trades yet' },
+    { key: 'uniswap',  label: 'Uniswap',  stats: uniswapStats,  list: uniswapTrades,   empty: 'No Uniswap fee collections yet' },
+    { key: 'paper',    label: 'Paper',    stats: paperStats,    list: paperTrades,     empty: 'No paper trades yet' },
+  ];
+
+  const tabButtons = EXCHANGE_TABS.map((t, i) =>
+    `<button onclick="switchTab('${t.key}')" id="tab-${t.key}"
+      style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;${i === 0 ? 'background:#A8F1F7;color:#000' : 'background:transparent;color:rgba(255,255,255,0.5)'}">
+      ${t.label}
+    </button>`
+  ).join("");
+
+  const tabPanes = EXCHANGE_TABS.map((t, i) =>
+    `<div id="pane-${t.key}"${i !== 0 ? ' style="display:none"' : ''}>
+      ${renderStatBar(t.stats, `stats-${t.key}`)}
+      <div class="card">${renderTradeTable(t.list, t.empty)}</div>
+    </div>`
+  ).join("");
+
   return shell("History", `
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem">
       <p class="section-label" style="margin:0">Trade Log</p>
-      <div style="display:flex;gap:0.25rem;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:0.2rem">
-        <button onclick="switchTab('live')" id="tab-live"
-          style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:#A8F1F7;color:#000">
-          Live
-        </button>
-        <button onclick="switchTab('paper')" id="tab-paper"
-          style="font-size:0.75rem;font-weight:600;padding:0.3rem 0.9rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;background:transparent;color:rgba(255,255,255,0.5)">
-          Paper
-        </button>
+      <div style="display:flex;gap:0.25rem;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:0.2rem;flex-wrap:wrap">
+        ${tabButtons}
       </div>
     </div>
 
-    <div id="pane-live">
-      ${renderStatBar(liveStats, "stats-live")}
-      <div class="card">${renderTradeTable(liveTrades, "No live trades yet")}</div>
-    </div>
-
-    <div id="pane-paper" style="display:none">
-      ${renderStatBar(paperStats, "stats-paper")}
-      <div class="card">${renderTradeTable(paperTrades, "No paper trades yet")}</div>
-    </div>
+    ${tabPanes}
 
     <script>
+      const HISTORY_TABS = ['all','hl','kraken','coinbase','schwab','uniswap','paper'];
       function switchTab(tab) {
-        const isLive = tab === 'live';
-        document.getElementById('pane-live').style.display = isLive ? '' : 'none';
-        document.getElementById('pane-paper').style.display = isLive ? 'none' : '';
-        document.getElementById('tab-live').style.background = isLive ? '#A8F1F7' : 'transparent';
-        document.getElementById('tab-live').style.color = isLive ? '#000' : 'rgba(255,255,255,0.5)';
-        document.getElementById('tab-paper').style.background = isLive ? 'transparent' : '#A8F1F7';
-        document.getElementById('tab-paper').style.color = isLive ? 'rgba(255,255,255,0.5)' : '#000';
+        HISTORY_TABS.forEach(k => {
+          const active = k === tab;
+          document.getElementById('pane-' + k).style.display = active ? '' : 'none';
+          document.getElementById('tab-' + k).style.background = active ? '#A8F1F7' : 'transparent';
+          document.getElementById('tab-' + k).style.color = active ? '#000' : 'rgba(255,255,255,0.5)';
+        });
       }
     </script>
 
@@ -3761,7 +3963,8 @@ async function premiumFadePage() {
     const stopCell = sig?.stop_price != null
       ? `<span style="color:#f87171">$${parseFloat(sig.stop_price).toFixed(2)}</span>`
       : "—";
-    const closeBtn = `<button onclick="openFadeModal('${occ.underlying}','${occ.type}',${occ.strike},'${occ.expiry}','BUY_TO_CLOSE',this)" style="font-size:0.68rem;padding:0.2rem 0.6rem;border-radius:5px;border:1px solid rgba(248,113,113,0.35);background:rgba(248,113,113,0.07);color:#f87171;cursor:pointer;white-space:nowrap">Close</button>`;
+    const addBtn   = `<button onclick="openFadeModal('${occ.underlying}','${occ.type}',${occ.strike},'${occ.expiry}','SELL_TO_OPEN',this)" title="Add contracts" style="font-size:0.68rem;padding:0.2rem 0.45rem;border-radius:5px;border:1px solid rgba(74,222,128,0.35);background:rgba(74,222,128,0.07);color:#4ade80;cursor:pointer;line-height:1"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>`;
+    const closeBtn = `<button onclick="openFadeModal('${occ.underlying}','${occ.type}',${occ.strike},'${occ.expiry}','BUY_TO_CLOSE',this,${shortQty})" style="font-size:0.68rem;padding:0.2rem 0.6rem;border-radius:5px;border:1px solid rgba(248,113,113,0.35);background:rgba(248,113,113,0.07);color:#f87171;cursor:pointer;white-space:nowrap">Close</button>`;
     return `<tr>
       <td style="font-weight:600">${occ.underlying} <span style="color:rgba(255,255,255,0.35);font-size:0.72rem">$${occ.strike % 1 === 0 ? occ.strike.toFixed(0) : occ.strike.toFixed(2)} ${occ.type.toUpperCase()}</span></td>
       <td style="font-size:0.75rem;color:rgba(255,255,255,0.5)">${occ.expiry}</td>
@@ -3772,61 +3975,90 @@ async function premiumFadePage() {
       <td style="text-align:right;color:${dayPnl >= 0 ? "#4ade80" : "#f87171"}">${dayPnl >= 0 ? "+" : ""}$${Math.abs(dayPnl).toFixed(2)}</td>
       <td style="text-align:right">${targetCell}</td>
       <td style="text-align:right">${stopCell}</td>
-      <td>${closeBtn}</td>
+      <td><div style="display:flex;gap:0.3rem;align-items:center">${addBtn}${closeBtn}</div></td>
     </tr>`;
   }).join("") || `<tr><td colspan="10" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No written positions</td></tr>`;
 
   const statusColor = { open: "#A8F1F7", target_hit: "#4ade80", stopped_out: "#f87171", expired: "rgba(255,255,255,0.25)", closed: "rgba(255,255,255,0.4)" };
   const statusLabel = { open: "Open", target_hit: "Target Hit", stopped_out: "Stopped Out", expired: "Expired", closed: "Closed" };
 
-  function signalRow(s) {
-    const color = statusColor[s.status] ?? "rgba(255,255,255,0.5)";
-    const label = statusLabel[s.status] ?? s.status;
-    const isOpen = s.status === "open";
-    const typeColor = s.option_type === "call" ? "#4ade80" : "#f87171";
-    const vel = s.velocity_pct != null ? (s.velocity_pct > 0 ? "+" : "") + s.velocity_pct.toFixed(1) + "%" : "—";
-    const iv  = s.curr_iv != null ? (s.curr_iv * 100).toFixed(1) + "%" : "—";
-    const pnl = s.pnl != null ? (s.pnl >= 0 ? "+" : "") + "$" + Math.abs(s.pnl).toFixed(2) : "";
-    const writeBtn = isOpen && schwabReady && s.ticker && s.option_type && s.strike && s.expiration
-      ? `<button onclick="openFadeModal('${s.ticker}','${s.option_type}',${parseFloat(s.strike)},'${s.expiration}','SELL_TO_OPEN',this)" style="font-size:0.68rem;padding:0.2rem 0.6rem;border-radius:5px;border:1px solid rgba(251,191,36,0.35);background:rgba(251,191,36,0.07);color:#fbbf24;cursor:pointer;white-space:nowrap">Write</button>`
-      : "";
-    return `<tr style="${isOpen ? "" : "opacity:0.65"}">
-      <td style="font-weight:600">${s.ticker}</td>
-      <td style="color:${typeColor};font-weight:600">${(s.option_type ?? "").toUpperCase()}</td>
-      <td>$${parseFloat(s.strike ?? 0).toFixed(0)}</td>
-      <td style="font-size:0.75rem;color:rgba(255,255,255,0.55)">${s.expiration ?? "—"}</td>
-      <td style="text-align:right">${s.dte ?? "—"}</td>
-      <td style="text-align:right;color:${(s.velocity_pct ?? 0) > 0 ? "#4ade80" : "#f87171"}">${vel}</td>
-      <td style="text-align:right">${iv}</td>
-      <td style="text-align:right;color:#fbbf24">${s.entry_price != null ? "$" + parseFloat(s.entry_price).toFixed(2) : "—"}</td>
-      <td style="text-align:right;color:#4ade80">${s.target_price != null ? "$" + parseFloat(s.target_price).toFixed(2) : "—"}</td>
-      <td style="text-align:right;color:#f87171">${s.stop_price != null ? "$" + parseFloat(s.stop_price).toFixed(2) : "—"}</td>
-      <td><span style="color:${color};font-size:0.72rem;font-weight:600">${label}</span></td>
-      ${pnl ? `<td style="color:${s.pnl >= 0 ? "#4ade80" : "#f87171"};font-weight:600">${pnl}</td>` : "<td>—</td>"}
-      <td>${writeBtn}</td>
-    </tr>`;
-  }
+  // Combined signal set (open + recent) feeds a single filterable scanner — mirrors agentsignal.app
+  const allSignals = [...(signals.open ?? []), ...(signals.recent ?? [])];
+  const highScore   = allSignals.filter(s => (s.velocity_score ?? 0) >= 6);
+  const callSignals = highScore.filter(s => s.option_type === "call");
+  const latestDate  = allSignals.map(s => s.signal_date).filter(Boolean).sort().slice(-1)[0] ?? null;
+  const lastScan    = allSignals.map(s => s.created_at).filter(Boolean).sort().slice(-1)[0] ?? null;
 
-  const cols = 13;
-  const openRows   = (signals.open   ?? []).map(signalRow).join("") || `<tr><td colspan="${cols}" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No open signals</td></tr>`;
-  const recentRows = (signals.recent ?? []).map(signalRow).join("") || `<tr><td colspan="${cols}" style="color:rgba(255,255,255,0.25);text-align:center;padding:1rem">No recent closed signals</td></tr>`;
+  const fmtMD   = (iso) => { try { return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return iso; } };
+  const fmtExp  = (iso) => { try { return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "2-digit" }); } catch { return iso; } };
+  const fmtScan = (iso) => { try { return new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); } catch { return iso; } };
 
-  const tableHead = `<thead><tr>
-    <th>Ticker</th><th>Type</th><th>Strike</th><th>Expiry</th>
-    <th style="text-align:right">DTE</th><th style="text-align:right">Velocity</th>
-    <th style="text-align:right">IV</th><th style="text-align:right">Entry</th>
-    <th style="text-align:right">Target</th><th style="text-align:right">Stop</th>
-    <th>Status</th><th>P&L</th>${schwabReady ? "<th></th>" : ""}
-  </tr></thead>`;
+  const fTickers = [...new Set(allSignals.map(s => s.ticker))].sort();
+  const fExps    = [...new Set(allSignals.map(s => s.expiration).filter(Boolean))].sort();
+  const tickerOpts = `<option value="all">All tickers</option>` + fTickers.map(t => `<option value="${t}">${t}</option>`).join("");
+  const expOpts    = `<option value="all">All expirations</option>` + fExps.map(e => `<option value="${e}">${fmtExp(e)}</option>`).join("");
+
+  const signalsJson = JSON.stringify(allSignals).replace(/</g, "\\u003c");
+
+  // Editable watchlist chips
+  const watchChips = (signals.tickers ?? []).map(t => `
+    <div style="display:inline-flex;align-items:center;gap:0.4rem;border-radius:10px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.03);padding:0.3rem 0.6rem">
+      <span style="font-size:0.82rem;font-weight:600;letter-spacing:-0.01em">${t}</span>
+      <button onclick="fadeRemoveTicker('${t}',this)" title="Remove ${t}" style="background:none;border:none;color:rgba(255,255,255,0.3);cursor:pointer;font-size:0.95rem;line-height:1;padding:0">×</button>
+    </div>`).join("") || `<p style="font-size:0.85rem;color:rgba(255,255,255,0.4)">No tickers in watchlist.</p>`;
 
   return shell("Premium Fade", `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem">
+    <!-- Header -->
+    <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:1rem;margin-bottom:1.5rem">
       <div>
-        <h1 style="font-size:1.5rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">Premium Fade Signals</h1>
-        <p style="font-size:0.78rem;color:rgba(255,255,255,0.35);margin-top:0.2rem">${user.email} · ${user.tier}</p>
+        <div style="display:flex;align-items:center;gap:0.6rem">
+          <span style="color:#A8F1F7;font-size:1.4rem">📉</span>
+          <h1 style="font-size:1.6rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">Premium Fade</h1>
+        </div>
+        <p style="font-size:0.8rem;color:rgba(255,255,255,0.5);margin-top:0.3rem">Scans options chains for overnight premium spikes. Score ≥ 6 = consider writing covered calls.</p>
+        <p style="font-size:0.74rem;color:rgba(255,255,255,0.3);margin-top:0.15rem">${user.email} · ${user.tier}</p>
       </div>
-      <a href="/premium-fade" style="font-size:0.78rem;color:rgba(255,255,255,0.4);padding:0.35rem 0.75rem;border:1px solid rgba(255,255,255,0.1);border-radius:6px;text-decoration:none">↻ Refresh</a>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:0.4rem">
+        <a href="/premium-fade" style="font-size:0.78rem;color:rgba(255,255,255,0.5);padding:0.35rem 0.75rem;border:1px solid rgba(255,255,255,0.12);border-radius:6px;text-decoration:none">↻ Refresh</a>
+        <span style="font-size:0.7rem;color:rgba(255,255,255,0.35)">${lastScan ? "Scan: " + fmtScan(lastScan) : "No scan data"}</span>
+      </div>
     </div>
+
+    ${fetchError ? `<div style="color:#f87171;margin-bottom:1rem;font-size:0.82rem">⚠ ${fetchError}</div>` : ""}
+
+    <!-- Summary bar -->
+    <div class="card" style="margin-bottom:1rem">
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.5rem 2rem;font-size:0.85rem">
+        <div style="display:flex;align-items:center;gap:0.5rem">
+          <span style="height:8px;width:8px;border-radius:50%;background:#A8F1F7"></span>
+          <span style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.06em;color:rgba(255,255,255,0.5)">Signals (14d)</span>
+          <span style="font-weight:700">${allSignals.length}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.5rem">
+          <span style="height:8px;width:8px;border-radius:50%;background:#fbbf24"></span>
+          <span style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.06em;color:rgba(255,255,255,0.5)">Elevated (≥6)</span>
+          <span style="font-weight:700;color:#fbbf24">${highScore.length}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.5rem">
+          <span style="height:8px;width:8px;border-radius:50%;background:#A8F1F7"></span>
+          <span style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.06em;color:rgba(255,255,255,0.5)">Covered Call Signals</span>
+          <span style="font-weight:700;color:#A8F1F7">${callSignals.length}</span>
+        </div>
+        <div style="margin-left:auto;font-size:0.74rem;color:rgba(255,255,255,0.4)">${latestDate ? "Latest signal: " + fmtMD(latestDate) : "No scans yet"}</div>
+      </div>
+    </div>
+
+    <!-- Score legend -->
+    <div class="card" style="margin-bottom:1.5rem">
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.5rem 1.5rem;font-size:0.78rem">
+        <span style="font-size:0.66rem;text-transform:uppercase;letter-spacing:0.06em;color:rgba(255,255,255,0.4)">Score key</span>
+        <span style="display:flex;align-items:center;gap:0.4rem"><span style="border-radius:999px;padding:0.1rem 0.5rem;border:1px solid rgba(161,161,170,0.4);background:rgba(161,161,170,0.15);color:#a1a1aa">1–5</span><span style="color:rgba(255,255,255,0.5)">Normal — no action</span></span>
+        <span style="display:flex;align-items:center;gap:0.4rem"><span style="border-radius:999px;padding:0.1rem 0.5rem;border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.15);color:#fbbf24">6–7</span><span style="color:rgba(255,255,255,0.5)">Elevated — consider writing calls</span></span>
+        <span style="display:flex;align-items:center;gap:0.4rem"><span style="border-radius:999px;padding:0.1rem 0.5rem;border:1px solid rgba(168,241,247,0.4);background:rgba(168,241,247,0.15);color:#A8F1F7">8–10</span><span style="color:rgba(255,255,255,0.5)">Extreme spike — strong fade opportunity</span></span>
+      </div>
+    </div>
+
+    <!-- Exchange selector -->
     <div style="display:flex;align-items:center;gap:1.25rem;margin-bottom:1.5rem">
       <span style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.35)">Exchange</span>
       <label style="display:flex;align-items:center;gap:0.45rem;cursor:pointer">
@@ -3843,11 +4075,11 @@ async function premiumFadePage() {
         <span style="font-size:0.68rem;color:rgba(255,255,255,0.2)">coming soon</span>
       </label>
     </div>
-    ${fetchError ? `<div style="color:#f87171;margin-bottom:1rem;font-size:0.82rem">⚠ ${fetchError}</div>` : ""}
-    ${signals.tickers?.length > 0 ? `<div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:1.25rem">${signals.tickers.map(t => `<span style="padding:0.15rem 0.55rem;border-radius:999px;background:rgba(168,241,247,0.08);border:1px solid rgba(168,241,247,0.2);font-size:0.72rem;color:#A8F1F7;font-weight:600">${t}</span>`).join("")}</div>` : ""}
+
     ${schwabReady ? `
+    <!-- Positions (Schwab short options) -->
     <div class="section-label">Positions</div>
-    <div class="card" style="overflow-x:auto">
+    <div class="card" style="overflow-x:auto;margin-bottom:1.5rem">
       <table>
         <thead><tr>
           <th>Contract</th><th>Expiry</th><th style="text-align:right">Qty</th>
@@ -3858,17 +4090,174 @@ async function premiumFadePage() {
         <tbody>${positionRows}</tbody>
       </table>
     </div>` : ""}
-    ${signals.noTickers ? `<div class="card" style="text-align:center;padding:2rem"><p style="color:rgba(255,255,255,0.4);margin-bottom:0.5rem">No tickers in your watchlist yet.</p><a href="${getSignalUrl()}/premium-fade" target="_blank" rel="noopener noreferrer" style="color:#A8F1F7;font-size:0.82rem">Add tickers at agentsignal.app/premium-fade →</a></div>` : `
-    <div class="section-label">Active Signals</div>
-    <div class="card" style="padding:0;overflow:hidden">
-      <div style="overflow:auto;max-height:800px">
-        <table style="min-width:100%">${tableHead}<tbody>${openRows}</tbody></table>
+
+    ${signals.noTickers ? `
+    <div class="card" style="text-align:center;padding:2rem">
+      <p style="color:rgba(255,255,255,0.4)">No tickers in your watchlist yet. Add one below to start scanning.</p>
+    </div>` : `
+    <!-- Premium Signals scanner -->
+    <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:0.75rem;margin-bottom:0.75rem">
+      <div style="display:flex;align-items:center;gap:0.5rem">
+        <span style="color:#A8F1F7">◆</span>
+        <span style="font-size:0.78rem;font-weight:500;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.5)">Premium Signals</span>
+        <span id="fadeCount" style="font-size:0.62rem;padding:0.1rem 0.4rem;border-radius:4px;background:rgba(168,241,247,0.1);color:#A8F1F7;font-weight:600"></span>
+      </div>
+      <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap">
+        <span style="color:rgba(255,255,255,0.4);font-size:0.78rem">⚲</span>
+        <select id="fadeTicker" onchange="_fTicker=this.value;renderFade()" style="border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:transparent;padding:0.25rem 0.6rem;font-size:0.75rem;color:rgba(255,255,255,0.7)">${tickerOpts}</select>
+        <div style="display:flex;border-radius:8px;border:1px solid rgba(255,255,255,0.12);overflow:hidden;font-size:0.75rem">
+          <button type="button" data-ft="all"  onclick="setFType('all',this)"  class="ftype-btn" style="padding:0.25rem 0.6rem;background:rgba(168,241,247,0.1);color:#A8F1F7;border:none;cursor:pointer">Calls + Puts</button>
+          <button type="button" data-ft="call" onclick="setFType('call',this)" class="ftype-btn" style="padding:0.25rem 0.6rem;background:transparent;color:rgba(255,255,255,0.5);border:none;cursor:pointer">Calls</button>
+          <button type="button" data-ft="put"  onclick="setFType('put',this)"  class="ftype-btn" style="padding:0.25rem 0.6rem;background:transparent;color:rgba(255,255,255,0.5);border:none;cursor:pointer">Puts</button>
+        </div>
+        <select id="fadeExp" onchange="_fExp=this.value;renderFade()" style="border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:transparent;padding:0.25rem 0.6rem;font-size:0.75rem;color:rgba(255,255,255,0.7)">${expOpts}</select>
+        <button type="button" id="fadeClear" onclick="clearFade()" style="display:none;align-items:center;gap:0.25rem;background:none;border:none;color:rgba(255,255,255,0.4);font-size:0.75rem;cursor:pointer">✕ Clear</button>
       </div>
     </div>
-    <div class="section-label" style="margin-top:1.5rem">Signal History (30 days)</div>
-    <div class="card" style="overflow-x:auto">
-      <table>${tableHead}<tbody>${recentRows}</tbody></table>
+    <div class="card" style="padding:0;overflow:hidden">
+      <div id="fadeTableWrap" style="overflow:auto;max-height:800px"></div>
     </div>`}
+
+    <!-- Watchlist -->
+    <div class="section-label" style="margin-top:1.5rem">Watchlist</div>
+    <div class="card">
+      <div id="fadeWatchChips" style="display:flex;flex-wrap:wrap;gap:0.5rem;margin-bottom:1rem">${watchChips}</div>
+      <div style="display:flex;align-items:center;gap:0.5rem;padding-top:0.75rem;border-top:1px solid rgba(255,255,255,0.06)">
+        <input id="fadeNewTicker" type="text" placeholder="Add ticker, e.g. NVDA" maxlength="10" oninput="this.value=this.value.toUpperCase()" onkeydown="if(event.key==='Enter')fadeAddTicker()" style="flex:1;max-width:200px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);padding:0.4rem 0.7rem;font-size:0.85rem;color:#fafafa;font-family:monospace;outline:none" />
+        <button onclick="fadeAddTicker()" id="fadeAddBtn" style="display:inline-flex;align-items:center;gap:0.35rem;border-radius:8px;border:1px solid rgba(168,241,247,0.3);background:rgba(168,241,247,0.1);padding:0.4rem 0.8rem;font-size:0.75rem;font-weight:600;color:#A8F1F7;cursor:pointer">+ Add</button>
+      </div>
+      <div id="fadeWatchError" style="color:#f87171;font-size:0.75rem;margin-top:0.5rem;display:none"></div>
+      <p style="font-size:0.74rem;color:rgba(255,255,255,0.3);margin-top:0.75rem">Tickers scanned nightly. Add any optionable stock to track its premium velocity.</p>
+    </div>
+
+    <p style="font-size:0.66rem;color:rgba(255,255,255,0.2);text-align:center;margin-top:1.5rem">Not financial advice. Algorithmic signals only. Always manage risk.</p>
+
+    <script>
+    var FADE_SIGNALS = ${signalsJson};
+    var SCHWAB_READY = ${schwabReady ? "true" : "false"};
+    var STATUS_COLOR = ${JSON.stringify(statusColor)};
+    var STATUS_LABEL = ${JSON.stringify(statusLabel)};
+    var _fTicker = 'all', _fType = 'all', _fExp = 'all', _fSortKey = 'velocity_score', _fSortDir = 'desc';
+
+    function optTypeBadge(type){
+      var call = type === 'call';
+      return '<span style="border-radius:999px;padding:0.1rem 0.5rem;font-size:0.68rem;font-weight:500;border:1px solid '+(call?'rgba(168,241,247,0.3)':'rgba(248,113,113,0.3)')+';background:'+(call?'rgba(168,241,247,0.1)':'rgba(248,113,113,0.1)')+';color:'+(call?'#A8F1F7':'#f87171')+'">'+(type||'').toUpperCase()+'</span>';
+    }
+    function scoreBadge(score){
+      if(score==null) return '<span style="color:rgba(255,255,255,0.3)">—</span>';
+      var c = score>=8?['rgba(168,241,247,0.15)','rgba(168,241,247,0.4)','#A8F1F7']:score>=6?['rgba(251,191,36,0.15)','rgba(251,191,36,0.4)','#fbbf24']:['rgba(161,161,170,0.15)','rgba(161,161,170,0.4)','#a1a1aa'];
+      return '<span style="border-radius:999px;padding:0.1rem 0.5rem;font-size:0.7rem;font-weight:500;border:1px solid '+c[1]+';background:'+c[0]+';color:'+c[2]+';font-variant-numeric:tabular-nums">'+score+'</span>';
+    }
+    function velDisplay(pct){
+      if(pct==null) return '<span style="color:rgba(255,255,255,0.3)">—</span>';
+      var abs=Math.abs(pct), col=abs>=100?'#A8F1F7':abs>=50?'#fbbf24':'rgba(255,255,255,0.5)';
+      return '<span style="font-family:monospace;font-weight:600;color:'+col+';font-variant-numeric:tabular-nums">'+(pct>0?'+':'')+pct.toFixed(0)+'%</span>';
+    }
+    function writeBadge(score,type){
+      if(!score||score<3) return '';
+      var ext=score>=8, mod=score>=6, c, label;
+      if(type==='call'){ c=ext?['rgba(168,241,247,0.15)','rgba(168,241,247,0.4)','#A8F1F7']:mod?['rgba(251,191,36,0.1)','rgba(251,191,36,0.3)','#fde047']:['rgba(161,161,170,0.1)','rgba(161,161,170,0.3)','#a1a1aa']; label=ext?'Write Calls':mod?'Consider Writing':'Watch'; }
+      else { c=ext?['rgba(248,113,113,0.15)','rgba(248,113,113,0.4)','#f87171']:mod?['rgba(251,146,60,0.1)','rgba(251,146,60,0.3)','#fdba74']:['rgba(161,161,170,0.1)','rgba(161,161,170,0.3)','#a1a1aa']; label=ext?'Write Puts':mod?'Consider Writing':'Watch'; }
+      return '<span style="display:inline-flex;align-items:center;gap:0.25rem;border-radius:999px;padding:0.1rem 0.5rem;font-size:0.6rem;font-weight:600;white-space:nowrap;border:1px solid '+c[1]+';background:'+c[0]+';color:'+c[2]+'">✎ '+label+'</span>';
+    }
+    function fmtDateMD(iso){ try { return new Date(iso).toLocaleDateString('en-US',{month:'short',day:'numeric'}); } catch(e){ return iso; } }
+    function fadeArrow(k){ return _fSortKey===k ? (_fSortDir==='desc'?' ▾':' ▴') : ''; }
+
+    function setFType(v,btn){
+      _fType=v;
+      var btns=document.querySelectorAll('.ftype-btn');
+      for(var i=0;i<btns.length;i++){ btns[i].style.background='transparent'; btns[i].style.color='rgba(255,255,255,0.5)'; }
+      btn.style.background='rgba(168,241,247,0.1)'; btn.style.color='#A8F1F7';
+      renderFade();
+    }
+    function clearFade(){
+      _fTicker='all'; _fType='all'; _fExp='all';
+      document.getElementById('fadeTicker').value='all';
+      document.getElementById('fadeExp').value='all';
+      var btns=document.querySelectorAll('.ftype-btn');
+      for(var i=0;i<btns.length;i++){ var on=btns[i].getAttribute('data-ft')==='all'; btns[i].style.background=on?'rgba(168,241,247,0.1)':'transparent'; btns[i].style.color=on?'#A8F1F7':'rgba(255,255,255,0.5)'; }
+      renderFade();
+    }
+    function toggleFSort(key){
+      if(_fSortKey===key){ _fSortDir = _fSortDir==='desc'?'asc':'desc'; }
+      else { _fSortKey=key; _fSortDir='desc'; }
+      renderFade();
+    }
+
+    function renderFade(){
+      var wrap=document.getElementById('fadeTableWrap'); if(!wrap) return;
+      var rows = FADE_SIGNALS
+        .filter(function(s){ return _fTicker==='all' || s.ticker===_fTicker; })
+        .filter(function(s){ return _fType==='all' || s.option_type===_fType; })
+        .filter(function(s){ return _fExp==='all' || s.expiration===_fExp; })
+        .slice()
+        .sort(function(a,b){ var av=a[_fSortKey]!=null?a[_fSortKey]:-Infinity, bv=b[_fSortKey]!=null?b[_fSortKey]:-Infinity; var cmp=av<bv?-1:av>bv?1:0; return _fSortDir==='desc'?-cmp:cmp; });
+
+      var cnt=document.getElementById('fadeCount'); if(cnt) cnt.textContent=rows.length;
+      var clr=document.getElementById('fadeClear'); if(clr) clr.style.display=(_fTicker!=='all'||_fType!=='all'||_fExp!=='all')?'inline-flex':'none';
+
+      var head='<thead><tr>'+
+        '<th onclick="toggleFSort(\\'signal_date\\')" style="cursor:pointer;user-select:none">Date'+fadeArrow('signal_date')+'</th>'+
+        '<th>Ticker</th><th>Type</th>'+
+        '<th style="text-align:right">Strike</th>'+
+        '<th style="text-align:right">DTE</th>'+
+        '<th onclick="toggleFSort(\\'velocity_score\\')" style="text-align:right;cursor:pointer;user-select:none">Velocity'+fadeArrow('velocity_score')+'</th>'+
+        '<th>Score</th>'+
+        '<th style="text-align:right">IV</th>'+
+        '<th style="text-align:right">Premium</th>'+
+        '<th>Status</th><th></th>'+
+      '</tr></thead>';
+
+      var body = rows.map(function(s){
+        var dte  = s.dte!=null ? s.dte+'d' : '—';
+        var iv   = s.curr_iv!=null ? (s.curr_iv*100).toFixed(0)+'%' : '—';
+        var prem = s.entry_price!=null ? '$'+Number(s.entry_price).toFixed(2) : '—';
+        var sc   = STATUS_COLOR[s.status] || 'rgba(255,255,255,0.5)';
+        var sl   = STATUS_LABEL[s.status] || s.status;
+        var writeBtn = (s.status==='open' && SCHWAB_READY && s.ticker && s.option_type && s.strike && s.expiration)
+          ? '<button onclick="openFadeModal(\\''+s.ticker+'\\',\\''+s.option_type+'\\','+Number(s.strike)+',\\''+s.expiration+'\\',\\'SELL_TO_OPEN\\',this)" style="font-size:0.66rem;padding:0.2rem 0.55rem;border-radius:5px;border:1px solid rgba(251,191,36,0.35);background:rgba(251,191,36,0.07);color:#fbbf24;cursor:pointer;white-space:nowrap">Write</button>'
+          : '';
+        return '<tr>'+
+          '<td style="font-size:0.74rem;color:rgba(255,255,255,0.5)">'+fmtDateMD(s.signal_date)+'</td>'+
+          '<td style="font-weight:700">'+s.ticker+'</td>'+
+          '<td>'+optTypeBadge(s.option_type)+'</td>'+
+          '<td style="text-align:right;font-family:monospace">$'+Number(s.strike).toFixed(0)+'</td>'+
+          '<td style="text-align:right;font-family:monospace;color:rgba(255,255,255,0.6)">'+dte+'</td>'+
+          '<td style="text-align:right">'+velDisplay(s.velocity_pct)+'</td>'+
+          '<td>'+scoreBadge(s.velocity_score)+'</td>'+
+          '<td style="text-align:right;font-family:monospace;color:rgba(255,255,255,0.6)">'+iv+'</td>'+
+          '<td style="text-align:right;font-family:monospace;color:#fbbf24">'+prem+'</td>'+
+          '<td><span style="color:'+sc+';font-size:0.7rem;font-weight:600">'+sl+'</span></td>'+
+          '<td><div style="display:flex;align-items:center;gap:0.4rem">'+writeBadge(s.velocity_score,s.option_type)+writeBtn+'</div></td>'+
+        '</tr>';
+      }).join('');
+      if(!rows.length) body='<tr><td colspan="11" style="text-align:center;padding:2.5rem;color:rgba(255,255,255,0.3)">No signals match these filters.</td></tr>';
+
+      wrap.innerHTML='<table style="min-width:100%">'+head+'<tbody>'+body+'</tbody></table>';
+    }
+
+    async function fadeAddTicker(){
+      var inp=document.getElementById('fadeNewTicker'); var t=(inp.value||'').trim().toUpperCase();
+      if(!t) return;
+      var btn=document.getElementById('fadeAddBtn'); var err=document.getElementById('fadeWatchError');
+      err.style.display='none'; btn.disabled=true; var o=btn.textContent; btn.textContent='Adding…';
+      try{
+        var r=await fetch('/premium-fade/watchlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticker:t})});
+        var d=await r.json(); if(d.error) throw new Error(d.error);
+        location.reload();
+      }catch(e){ err.textContent=e.message; err.style.display='block'; btn.disabled=false; btn.textContent=o; }
+    }
+    async function fadeRemoveTicker(t,btn){
+      btn.disabled=true; btn.textContent='…';
+      try{
+        var r=await fetch('/premium-fade/watchlist',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticker:t})});
+        var d=await r.json(); if(d.error) throw new Error(d.error);
+        location.reload();
+      }catch(e){ var err=document.getElementById('fadeWatchError'); err.textContent=e.message; err.style.display='block'; btn.disabled=false; btn.textContent='×'; }
+    }
+
+    renderFade();
+    </script>
 
     ${schwabReady ? `
     <!-- Fade order modal (write + close) -->
@@ -3876,6 +4265,12 @@ async function premiumFadePage() {
       <div style="background:#111113;border:1px solid rgba(255,255,255,0.12);border-radius:14px;padding:1.75rem;max-width:380px;width:90%">
         <div id="fadeWriteTitle" style="font-size:1rem;font-weight:700;color:#fafafa;margin-bottom:1.25rem"></div>
         <div id="fadeWriteDetails" style="padding:0.85rem 1rem;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:0.85rem;color:rgba(255,255,255,0.75);line-height:1.8;margin-bottom:1rem"></div>
+        <div style="margin-bottom:1rem">
+          <label style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.06em;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.35rem">Contracts</label>
+          <input id="fadeWriteContracts" type="number" min="1" step="1" value="1"
+            oninput="updateFadeCredit()"
+            style="width:100%;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:0.5rem 0.75rem;color:#fafafa;font-size:0.95rem;outline:none" />
+        </div>
         <div style="margin-bottom:1rem">
           <label style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.06em;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.35rem">Limit Price</label>
           <input id="fadeWritePrice" type="number" step="0.01" min="0.01"
@@ -3894,7 +4289,7 @@ async function premiumFadePage() {
     var _fadeData = null;
     var _fadeExchange = 'Schwab';
 
-    async function openFadeModal(ticker, type, strike, expiry, instruction, btn) {
+    async function openFadeModal(ticker, type, strike, expiry, instruction, btn, defaultQty = 1) {
       var orig = btn.textContent;
       btn.disabled = true; btn.textContent = '…';
       try {
@@ -3916,6 +4311,7 @@ async function premiumFadePage() {
           ' &nbsp;·&nbsp; Mid: <strong style="color:' + accentColor + '">$' + d.mid.toFixed(2) + '</strong>' +
           ' &nbsp;·&nbsp; Ask: <span style="color:rgba(255,255,255,0.6)">$' + d.ask.toFixed(2) + '</span>';
 
+        document.getElementById('fadeWriteContracts').value = defaultQty;
         var priceInput = document.getElementById('fadeWritePrice');
         priceInput.value = d.mid.toFixed(2);
 
@@ -3939,11 +4335,13 @@ async function premiumFadePage() {
     function updateFadeCredit() {
       if (!_fadeData) return;
       var price = parseFloat(document.getElementById('fadeWritePrice').value) || 0;
+      var qty   = parseInt(document.getElementById('fadeWriteContracts').value) || 1;
       var isSTO = _fadeData.instruction === 'SELL_TO_OPEN';
-      var total = (price * 100).toFixed(2);
-      document.getElementById('fadeWriteCredit').textContent = isSTO
-        ? 'Credit: $' + total + ' per contract'
-        : 'Cost: $' + total + ' per contract';
+      var perContract = (price * 100).toFixed(2);
+      var label = isSTO ? 'Credit' : 'Cost';
+      document.getElementById('fadeWriteCredit').textContent = qty > 1
+        ? label + ': $' + perContract + ' × ' + qty + ' = $' + (price * 100 * qty).toFixed(2)
+        : label + ': $' + perContract + ' per contract';
     }
 
     function closeFadeWrite() {
@@ -3962,10 +4360,11 @@ async function premiumFadePage() {
       var btn = document.getElementById('fadeWriteSubmit');
       btn.disabled = true; btn.textContent = 'Placing…';
       document.getElementById('fadeWriteError').style.display = 'none';
+      var qty = parseInt(document.getElementById('fadeWriteContracts').value) || 1;
       try {
         var r = await fetch('/schwab/write', {
           method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ optionSymbol: _fadeData.symbol, contracts: 1, limitPrice: price, instruction: _fadeData.instruction })
+          body: JSON.stringify({ optionSymbol: _fadeData.symbol, contracts: qty, limitPrice: price, instruction: _fadeData.instruction })
         });
         var d = await r.json();
         if (d.error) throw new Error(d.error);
@@ -4791,6 +5190,23 @@ const server = createServer(async (req, res) => {
         return json({ ok: true });
       } catch (e) { return json({ ok: false, error: e.message }); }
     }
+    if (url === "/api/vault/watchlist" && method === "POST") {
+      try {
+        const { chain, contractAddress } = JSON.parse(await readBody());
+        if (!VAULT_CHAINS.includes(chain)) return json({ ok: false, error: "unsupported chain" });
+        if (!contractAddress?.match(/^0x[0-9a-fA-F]{40}$/)) return json({ ok: false, error: "invalid contract address" });
+        const rpc = vaultRpc(chain);
+        const { symbol, decimals } = await resolveTokenMeta(contractAddress, rpc);
+        const { randomUUID } = await import("crypto");
+        addVaultToken({ id: randomUUID(), chain, contractAddress, symbol, decimals });
+        return json({ ok: true, symbol, decimals });
+      } catch (e) { return json({ ok: false, error: e.message }); }
+    }
+    if (url.startsWith("/api/vault/watchlist/") && method === "DELETE") {
+      const id = decodeURIComponent(url.replace("/api/vault/watchlist/", ""));
+      removeVaultToken(id);
+      return json({ ok: true });
+    }
     if (url === "/api/sell-for-usdc" && method === "POST") {
       const body = await readBody();
       try {
@@ -5243,6 +5659,22 @@ const server = createServer(async (req, res) => {
     }
 
     if (url === "/premium-fade" && method === "GET") return send(await premiumFadePage());
+
+    if (url === "/premium-fade/watchlist" && (method === "POST" || method === "DELETE")) {
+      try {
+        const key = process.env.AGENT_API_KEY?.trim();
+        if (!key) return json({ error: "No AgentSignal API key configured" }, 401);
+        const { ticker } = JSON.parse((await readBody()) || "{}");
+        if (!ticker) return json({ error: "ticker required" }, 400);
+        const r = await fetch(`${getSignalUrl()}/api/premium-fade/subscribe`, {
+          method,
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
+          body: JSON.stringify({ ticker }),
+        });
+        const d = await r.json().catch(() => ({}));
+        return json(d, r.status);
+      } catch (e) { return json({ error: e.message }, 500); }
+    }
     if (url === "/uniswap" && method === "GET") return send(renderUniswapPage());
 
     if (url === "/uniswap/wallet" && method === "GET") {

@@ -429,6 +429,33 @@ db.exec(`
   )
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS vault_watchlist (
+    id               TEXT PRIMARY KEY,
+    chain            TEXT NOT NULL,
+    contract_address TEXT NOT NULL,
+    symbol           TEXT,
+    decimals         INTEGER NOT NULL DEFAULT 18,
+    label            TEXT,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`);
+
+export function getVaultWatchlist() {
+  return db.prepare("SELECT * FROM vault_watchlist ORDER BY chain, created_at ASC").all();
+}
+
+export function addVaultToken({ id, chain, contractAddress, symbol, decimals, label }) {
+  db.prepare(`
+    INSERT OR REPLACE INTO vault_watchlist (id, chain, contract_address, symbol, decimals, label)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, chain, contractAddress.toLowerCase(), symbol ?? null, decimals ?? 18, label ?? null);
+}
+
+export function removeVaultToken(id) {
+  db.prepare("DELETE FROM vault_watchlist WHERE id = ?").run(id);
+}
+
 export function maybeCreateDefaultWallet(key) {
   const count = db.prepare("SELECT COUNT(*) as c FROM wallets").get().c;
   if (count === 0 && key) {
