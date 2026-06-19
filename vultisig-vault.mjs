@@ -81,7 +81,9 @@ export async function verifyVaultFinish({ code }) {
 
   const { Chain } = await import("@vultisig/sdk");
   const address = (await vault.address(Chain.Hyperliquid)).toLowerCase();
-  return { address, localPartyId, path: VAULT_PATH };
+  const cosmosAddress = await vault.address(Chain.Cosmos).catch(() => null);
+  const akashAddress  = await vault.address(Chain.Akash).catch(() => null);
+  return { address, cosmosAddress, akashAddress, localPartyId, path: VAULT_PATH };
 }
 
 /**
@@ -111,7 +113,9 @@ export async function importVaultFile({ content, password }) {
 
   const { Chain } = await import("@vultisig/sdk");
   const address = (await vault.address(Chain.Hyperliquid)).toLowerCase();
-  return { address, localPartyId, path: VAULT_PATH };
+  const cosmosAddress = await vault.address(Chain.Cosmos).catch(() => null);
+  const akashAddress  = await vault.address(Chain.Akash).catch(() => null);
+  return { address, cosmosAddress, akashAddress, localPartyId, path: VAULT_PATH };
 }
 
 /**
@@ -126,9 +130,14 @@ export async function vaultStatus(password) {
     const acct = await loadVultisigAccount({ vultPath: VAULT_PATH, password });
     const cv = acct.vault.coreVault ?? acct.vault.vaultData?.vault ?? acct.vault.vaultData;
     const localPartyId = cv?.localPartyId ?? acct.vault.localPartyId ?? "";
+    const { Chain } = await import("@vultisig/sdk");
+    const cosmosAddress = await acct.vault.address(Chain.Cosmos).catch(() => null);
+    const akashAddress  = await acct.vault.address(Chain.Akash).catch(() => null);
     return {
       exists: true,
       address: acct.address,
+      cosmosAddress,
+      akashAddress,
       localPartyId,
       isDeviceShare: !/^Server-/i.test(localPartyId),
     };

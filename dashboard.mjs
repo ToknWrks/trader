@@ -172,6 +172,12 @@ const VAULT_NATIVE_WRAP = {
 };
 const VAULT_NATIVE_SYMBOL = { ethereum: "ETH", base: "ETH", arbitrum: "ETH", bsc: "BNB" };
 const VAULT_CHAINS = ["ethereum", "base", "arbitrum", "bsc"];
+const COSMOS_CHAINS = [
+  { key: "cosmos", envKey: "VAULT_COSMOS_ADDRESS", symbol: "ATOM", denom: "uatom",
+    rest: "https://cosmos-rest.publicnode.com", cgId: "cosmos" },
+  { key: "akash",  envKey: "VAULT_AKASH_ADDRESS",  symbol: "AKT",  denom: "uakt",
+    rest: "https://akash-rest.publicnode.com",  cgId: "akash-network" },
+];
 
 function vaultRpc(chain) {
   const key = process.env.ALCHEMY_API_KEY;
@@ -239,6 +245,15 @@ async function getVaultTokenPrices(items) {
   } catch { return {}; }
 }
 
+async function fetchCosmosBalance(restUrl, address, denom) {
+  try {
+    const r = await fetch(`${restUrl}/cosmos/bank/v1beta1/balances/${address}`);
+    const d = await r.json();
+    const coin = (d.balances ?? []).find(b => b.denom === denom);
+    return Number(coin?.amount ?? "0") / 1e6;
+  } catch { return 0; }
+}
+
 async function fetchVaultBalances(vaultAddress) {
   const watchlist = getVaultWatchlist();
   const addr = vaultAddress.toLowerCase();
@@ -262,6 +277,27 @@ async function fetchVaultBalances(vaultAddress) {
     }
     chains[chain] = { native, nativeUsd: native * nativePrice, tokens };
   }
+
+  // Cosmos chains (ATOM, AKT)
+  const cosmosWithAddr = COSMOS_CHAINS.filter(c => getEnvValue(c.envKey));
+  if (cosmosWithAddr.length) {
+    const cgIds = cosmosWithAddr.map(c => c.cgId).join(",");
+    try {
+      const cgKey = process.env.COINGECKO_API_KEY;
+      const cgUrl = cgKey
+        ? `https://pro-api.coingecko.com/api/v3/simple/price?ids=${cgIds}&vs_currencies=usd&x_cg_pro_api_key=${cgKey}`
+        : `https://api.coingecko.com/api/v3/simple/price?ids=${cgIds}&vs_currencies=usd`;
+      const priceRes = await fetch(cgUrl);
+      const priceData = priceRes.ok ? await priceRes.json() : {};
+      for (const c of cosmosWithAddr) {
+        const addr = getEnvValue(c.envKey);
+        const balance = await fetchCosmosBalance(c.rest, addr, c.denom);
+        const price = priceData[c.cgId]?.usd ?? 0;
+        chains[c.key] = { symbol: c.symbol, address: addr, native: balance, nativeUsd: balance * price, tokens: [] };
+      }
+    } catch {}
+  }
+
   return chains;
 }
 
@@ -1422,6 +1458,22 @@ async function portfolioPage() {
           <tbody>${nativeRow}${tokenRows}</tbody>
         </table></div>`;
       }).join("") : `<p class="hint">Loading balances…</p>`}
+      ${vaultChainBalances ? COSMOS_CHAINS.filter(c => vaultChainBalances[c.key] && vaultChainBalances[c.key].native >= 0.000001).map(c => {
+        const ch = vaultChainBalances[c.key];
+        const chainLabel = c.key === "cosmos" ? "Cosmos Hub" : "Akash Network";
+        const addr = ch.address;
+        const addrSnip = addr ? `<span style="font-size:0.68rem;color:rgba(255,255,255,0.3);font-family:monospace;margin-left:0.5rem">${addr.slice(0,8)}…${addr.slice(-4)}</span><button onclick="navigator.clipboard.writeText('${addr}').then(()=>showToast('Copied','ok'))" style="background:none;border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:rgba(255,255,255,0.35);cursor:pointer;padding:0.1rem 0.35rem;font-size:0.65rem;margin-left:0.3rem">copy</button>` : "";
+        return `<p class="section-label" style="margin-top:1rem;margin-bottom:0.4rem">${chainLabel}${addrSnip}</p>
+        <div class="card"><table>
+          <thead><tr><th>Token</th><th style="text-align:right">Balance</th><th style="text-align:right">USD</th><th></th></tr></thead>
+          <tbody><tr>
+            <td style="font-weight:600">${c.symbol}</td>
+            <td style="font-family:monospace;text-align:right">${ch.native.toLocaleString(undefined,{maximumFractionDigits:6})}</td>
+            <td style="text-align:right;color:rgba(255,255,255,0.5)">${ch.nativeUsd > 0.001 ? "$" + ch.nativeUsd.toFixed(2) : "—"}</td>
+            <td></td>
+          </tr></tbody>
+        </table></div>`;
+      }).join("") : ""}
       <div style="margin-top:1.5rem;padding:1rem;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.07);border-radius:10px">
         <p style="font-size:0.78rem;font-weight:600;color:rgba(255,255,255,0.6);margin-bottom:0.75rem">Add Token</p>
         <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:flex-end">
@@ -5154,7 +5206,7 @@ const server = createServer(async (req, res) => {
         const { verifyVaultFinish, VAULT_PATH } = await import("./vultisig-vault.mjs");
         const r = await verifyVaultFinish({ code });
         // Persist so the trader (separate PM2 process) can load + sign unattended.
-        writeEnvValues({ VULT_FILE_PATH: VAULT_PATH, VULTISIG_PASS: password, VAULT_ADDRESS: r.address });
+        writeEnvValues({ VULT_FILE_PATH: VAULT_PATH, VULTISIG_PASS: password, VAULT_ADDRESS: r.address, ...(r.cosmosAddress ? { VAULT_COSMOS_ADDRESS: r.cosmosAddress } : {}), ...(r.akashAddress ? { VAULT_AKASH_ADDRESS: r.akashAddress } : {}) });
         return json({ ok: true, ...r });
       } catch (e) { return json({ ok: false, error: e.message }); }
     }
@@ -5164,7 +5216,7 @@ const server = createServer(async (req, res) => {
         const { content, password } = JSON.parse(body);
         const { importVaultFile, VAULT_PATH } = await import("./vultisig-vault.mjs");
         const r = await importVaultFile({ content, password });
-        writeEnvValues({ VULT_FILE_PATH: VAULT_PATH, VULTISIG_PASS: password, VAULT_ADDRESS: r.address });
+        writeEnvValues({ VULT_FILE_PATH: VAULT_PATH, VULTISIG_PASS: password, VAULT_ADDRESS: r.address, ...(r.cosmosAddress ? { VAULT_COSMOS_ADDRESS: r.cosmosAddress } : {}), ...(r.akashAddress ? { VAULT_AKASH_ADDRESS: r.akashAddress } : {}) });
         return json({ ok: true, ...r });
       } catch (e) { return json({ ok: false, error: e.message }); }
     }
@@ -5175,7 +5227,7 @@ const server = createServer(async (req, res) => {
         if (!st.exists) return json({ ok: false, error: "no vault on disk — create or import one first" });
         if (st.error) return json({ ok: false, error: "vault failed to load: " + st.error });
         if (!st.isDeviceShare) return json({ ok: false, error: "this is a server share — cannot co-sign" });
-        writeEnvValues({ VAULT_ACTIVE: "true", VAULT_ADDRESS: st.address });
+        writeEnvValues({ VAULT_ACTIVE: "true", VAULT_ADDRESS: st.address, ...(st.cosmosAddress ? { VAULT_COSMOS_ADDRESS: st.cosmosAddress } : {}), ...(st.akashAddress ? { VAULT_AKASH_ADDRESS: st.akashAddress } : {}) });
         clearTradingWallet(); // vault is now the signer — no raw-key wallet trades
         return json({ ok: true, address: st.address });
       } catch (e) { return json({ ok: false, error: e.message }); }
