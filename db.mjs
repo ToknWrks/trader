@@ -141,6 +141,10 @@ export function setStrategyRiskMode(id, mode) {
   db.prepare("UPDATE strategies SET risk_mode = ? WHERE id = ?").run(mode ?? null, id);
 }
 
+export function setStrategySlPct(id, sl_pct) {
+  db.prepare("UPDATE strategies SET sl_pct = ? WHERE id = ?").run(sl_pct ?? null, id);
+}
+
 // ── TP / Trail state (one row per open position) ──────────────────────────────
 
 db.exec(`

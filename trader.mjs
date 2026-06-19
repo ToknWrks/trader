@@ -98,7 +98,7 @@ import {
   insertSignalEvent, setTpState, getTpState, updateTpTrailMode,
   updateTpHighWater, clearTpState, logFetch, getLastTradeTime,
   setSubscriptionExpiry, getLastStrategyEntry, setStrategyRiskMode,
-  getTradingWallet,
+  getTradingWallet, setStrategySlPct,
 } from "./db.mjs";
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
@@ -224,6 +224,19 @@ function computeEMA(values, period) {
   let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
   for (let i = period; i < values.length; i++) ema = values[i] * k + ema * (1 - k);
   return ema;
+}
+
+// Wilder's smoothed ATR. Candles must have .h .l .c fields.
+function computeATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const h = parseFloat(candles[i].h), l = parseFloat(candles[i].l), pc = parseFloat(candles[i - 1].c);
+    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+  }
+  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < trs.length; i++) atr = (atr * (period - 1) + trs[i]) / period;
+  return atr;
 }
 
 // ── Strategy definition fetch (free, no x402) ────────────────────────────────
@@ -453,6 +466,101 @@ async function subscribeStrategy(strategyId, intervalMinutes, period) {
   const paid = await fetch(url, { method: "POST", headers: { "payment-signature": paymentHeader, "X-Wallet-Address": account.address } });
   if (!paid.ok) throw new Error(`Subscription payment rejected (${paid.status})`);
   return await paid.json();
+}
+
+// ── Entry confirmation gate ───────────────────────────────────────────────────
+// Four layers run on every new scalper entry signal. Exits (FLAT) are never
+// blocked. Returns { slPct } on pass, null on block. Fails open — candle errors
+// return { slPct: strategy.sl_pct } so the fallback SL still applies.
+//
+// Layer 1 — RSI band: only enter in "healthy trend" zone (40–65 long, 35–60 short).
+//           Blocks overbought chasing and oversold panic entries.
+// Layer 2 — EMA50 trend: price must be above EMA50 for longs, below for shorts.
+// Layer 3 — ATR volatility regime: if ATR(14) > 1.5×ATR(50), market is stressed
+//           — stand aside until volatility normalises.
+// Layer 4 — BTC macro filter: if BTC drops >2.5% on the last 4h candle, skip
+//           all alt entries (most alt selloffs are BTC-led).
+// Adaptive SL — computed as 1.5×ATR(14) / price, clamped [3%, 15%]. Widens in
+//           volatile conditions, tightens in calm ones. Written to the DB at entry
+//           so checkTpTrail uses the condition-appropriate stop throughout the trade.
+//
+// TUNING: if too many blocks → widen RSI band (e.g. 35–70 long), lower ATR ratio
+//         (e.g. 1.8×), or raise BTC threshold (e.g. -3.5%). If too many losses →
+//         tighten RSI band, lower ATR ratio (e.g. 1.2×), lower BTC threshold.
+
+async function confirmEntry(strategy, signal, exchange) {
+  if (signal !== "LONG" && signal !== "SHORT") return { slPct: strategy.sl_pct };
+  const asset = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
+  try {
+    const position = await withRetry(() => exchange.getPosition(asset));
+    if (parseFloat(position?.szi ?? "0") !== 0) return { slPct: strategy.sl_pct }; // already in
+
+    if (typeof exchange.getCandles !== "function") return { slPct: strategy.sl_pct };
+    const iv      = minutesToInterval(strategy.interval_minutes ?? 60);
+    const candles = await withRetry(() => exchange.getCandles(asset, iv, 60));
+    if (!candles?.length) return { slPct: strategy.sl_pct };
+
+    const closes = candles.map(c => parseFloat(c.c));
+    const price  = closes[closes.length - 1];
+    const rsi    = computeRSI(closes, 14);
+    const ema50  = computeEMA(closes, 50);
+    const atr14  = computeATR(candles, 14);
+    const atr50  = computeATR(candles, 50);
+
+    // ── Layer 1: RSI band ────────────────────────────────────────────────
+    if (rsi != null) {
+      const [lo, hi] = signal === "LONG" ? [40, 65] : [35, 60];
+      if (rsi < lo || rsi > hi) {
+        console.log(`[trader] 🚫 Gate L1 blocked ${signal} — RSI ${rsi.toFixed(1)} outside band [${lo}–${hi}]`);
+        return null;
+      }
+    }
+
+    // ── Layer 2: EMA50 trend alignment ───────────────────────────────────
+    if (ema50 != null) {
+      const trendOk = signal === "LONG" ? price > ema50 : price < ema50;
+      if (!trendOk) {
+        console.log(`[trader] 🚫 Gate L2 blocked ${signal} — price ${signal === "LONG" ? "below" : "above"} EMA50 $${ema50.toFixed(4)}`);
+        return null;
+      }
+    }
+
+    // ── Layer 3: ATR volatility regime ───────────────────────────────────
+    if (atr14 != null && atr50 != null && atr14 > atr50 * 1.5) {
+      console.log(`[trader] 🚫 Gate L3 blocked ${signal} — elevated volatility (ATR14 ${atr14.toFixed(4)} > 1.5×ATR50 ${atr50.toFixed(4)})`);
+      return null;
+    }
+
+    // ── Layer 4: BTC macro filter ────────────────────────────────────────
+    try {
+      const now = Date.now();
+      const btcRaw = await fetch("https://api.hyperliquid.xyz/info", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "candleSnapshot", req: { coin: "BTC", interval: "4h", startTime: now - 3 * 4 * 3600 * 1000, endTime: now } }),
+      }).then(r => r.json());
+      if (Array.isArray(btcRaw) && btcRaw.length >= 2) {
+        const prev = parseFloat(btcRaw[btcRaw.length - 2].c);
+        const cur  = parseFloat(btcRaw[btcRaw.length - 1].c);
+        const chg  = (cur - prev) / prev;
+        if (chg < -0.025) {
+          console.log(`[trader] 🚫 Gate L4 blocked ${signal} — BTC down ${(chg * 100).toFixed(1)}% in last 4h (macro risk)`);
+          return null;
+        }
+      }
+    } catch { /* BTC fetch failed — fail open */ }
+
+    // ── Adaptive SL: 1.5×ATR as % of price, clamped [3%, 15%] ──────────
+    let slPct = strategy.sl_pct ?? 7;
+    if (atr14 != null && price > 0) {
+      slPct = Math.max(3, Math.min(15, parseFloat((1.5 * atr14 / price * 100).toFixed(2))));
+    }
+
+    console.log(`[trader] ✅ Entry gate passed — RSI ${rsi?.toFixed(1)} | ATR14/50 ${atr14?.toFixed(4)}/${atr50?.toFixed(4)} | adaptive SL ${slPct.toFixed(2)}%`);
+    return { slPct };
+  } catch (err) {
+    console.warn(`[trader] ⚠️  Entry gate error: ${err.message} — allowing entry`);
+    return { slPct: strategy.sl_pct }; // fail open
+  }
 }
 
 // ── Fetch signal from agentsignal.app ─────────────────────────────────────────
@@ -876,6 +984,18 @@ for (const strategy of strategies) {
   });
 
   console.log(`[trader] 🔄 Signal flip: ${priorSignal?.signal ?? "N/A"} → ${signal}`);
+
+  // Entry confirmation gate — scalpers only, new entries only
+  if (effectiveStrategy.risk?.mode === "scalp" && (signal === "LONG" || signal === "SHORT")) {
+    const gateExchange = await getExchange(effectiveStrategy);
+    const gateResult   = await confirmEntry(effectiveStrategy, signal, gateExchange);
+    if (!gateResult) continue; // blocked — reason already logged inside confirmEntry
+    if (gateResult.slPct != null) {
+      setStrategySlPct(strategy.id, gateResult.slPct);
+      effectiveStrategy.sl_pct = gateResult.slPct;
+      console.log(`[trader] 🛡 Adaptive SL: ${gateResult.slPct.toFixed(2)}%`);
+    }
+  }
 
   try {
     await executeTrade(effectiveStrategy, signal, priorSignal);
