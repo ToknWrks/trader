@@ -30,9 +30,12 @@ Your private key never leaves your machine.
 - [x] Circuit breaker: halt if VultiServer unreachable
 
 ### Phase 3b — VPS-hosted Trader
-Run Trader on AgentSignal-managed VPS so users don't need a local machine. Fast Vault stays the key model — VPS holds device share, VultiServer holds server share, neither alone can sign. Users onboard via AgentSignal UI (no CLI). Engine's model almost certainly holds a complete hot wallet key on their VPS — single point of failure. Ours doesn't.
+- [ ] Vault onboarding UI in AgentSignal dashboard
+- [ ] Per-user Neon Postgres DB
+- [ ] VPS cron replacing PM2
+- [ ] Multi-tenancy model (shared process vs per-user)
 
-Changes vs local: PM2 cron → VPS cron, SQLite → Neon Postgres, CLI setup → UI vault onboarding. Exchange logic, signal fetch, entry gate, and VultiSig signing path all carry over unchanged.
+See `docs/vps-trader.md` for full architecture, open questions, and Engine comparison.
 
 ### Phase 4 — Ticker Signal Engine (Bring-Your-Own-Key AI)
 - [ ] `ticker-signal/` scaffold (providers/, prompts/, score.mjs)
