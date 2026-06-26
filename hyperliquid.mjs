@@ -216,6 +216,34 @@ export async function getOpenOrders(address) {
 }
 
 /**
+ * Place a native stop-loss order (trigger market, reduce-only).
+ * Returns { result, oid } — oid is null if the exchange didn't echo it.
+ */
+export async function placeStopOrder(signer, asset, isLong, size, triggerPrice) {
+  const { exchange } = makeClients(signer);
+  const assetIdx = await getAssetIndex(asset);
+  // Limit px is worst acceptable fill — 5% slippage beyond trigger guarantees market fill
+  const limitPx = isLong
+    ? (triggerPrice * 0.95).toPrecision(5)
+    : (triggerPrice * 1.05).toPrecision(5);
+  console.log(`[hyperliquid] Native SL ${isLong ? "SELL" : "BUY"} ${size} ${asset} trigger $${triggerPrice.toLocaleString()} limit $${parseFloat(limitPx).toLocaleString()}`);
+  const result = await exchange.order({
+    orders: [{
+      a: assetIdx,
+      b: !isLong,
+      p: limitPx,
+      s: fmtSize(size, asset),
+      r: true,
+      t: { trigger: { triggerPx: triggerPrice.toPrecision(6), isMarket: true, tpsl: "sl" } },
+    }],
+    grouping: "na",
+  });
+  const status = result?.response?.data?.statuses?.[0];
+  const oid = status?.resting?.oid ?? status?.filled?.oid ?? null;
+  return { result, oid };
+}
+
+/**
  * Cancel an open order by asset + order ID.
  */
 export async function cancelOrder(privateKey, asset, oid) {

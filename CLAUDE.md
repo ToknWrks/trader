@@ -100,7 +100,7 @@ node trader.mjs --stocks-only      # only stock/ETF strategies
 | L3 ATR regime | ATR(14) vs ATR(50) | Block if ATR(14) > 1.5× ATR(50) |
 | L4 BTC macro | BTC 4h candle change | Block if BTC down > 2.5% |
 
-**Adaptive SL:** `1.5 × ATR(14) / price × 100`, clamped [3%, 15%], written to `strategies.sl_pct` at entry. Tuning: widen RSI band / raise ATR ratio / raise BTC threshold for more trades; tighten for fewer losses. See full tuning guide in the CLAUDE.md "Entry Gate" section.
+**Adaptive SL:** `1.5 × ATR(14) / price × 100`, clamped [3%, 15%], written to `strategies.sl_pct` at entry. See `docs/entry-gate.md` for full tuning guide, threshold rationale, and known limitations.
 
 ## Signal Flow
 

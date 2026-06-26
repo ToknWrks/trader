@@ -136,6 +136,7 @@ try { db.exec("ALTER TABLE strategies ADD COLUMN trail_pct REAL"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN max_size_usd REAL"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN cooldown_minutes INTEGER"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN risk_mode TEXT"); } catch {}
+try { db.exec("ALTER TABLE strategies ADD COLUMN stop_order_id TEXT"); } catch {}
 
 export function setStrategyRiskMode(id, mode) {
   db.prepare("UPDATE strategies SET risk_mode = ? WHERE id = ?").run(mode ?? null, id);
@@ -143,6 +144,14 @@ export function setStrategyRiskMode(id, mode) {
 
 export function setStrategySlPct(id, sl_pct) {
   db.prepare("UPDATE strategies SET sl_pct = ? WHERE id = ?").run(sl_pct ?? null, id);
+}
+
+export function setStrategyStopOrderId(id, oid) {
+  db.prepare("UPDATE strategies SET stop_order_id = ? WHERE id = ?").run(oid ?? null, id);
+}
+
+export function getStrategyStopOrderId(id) {
+  return db.prepare("SELECT stop_order_id FROM strategies WHERE id = ?").get(id)?.stop_order_id ?? null;
 }
 
 // ── TP / Trail state (one row per open position) ──────────────────────────────

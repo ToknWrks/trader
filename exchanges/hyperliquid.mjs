@@ -8,6 +8,7 @@ import {
   getPosition as hlGetPosition,
   placeMarketOrder as hlPlaceOrder,
   placeLimitOrder as hlPlaceLimitOrder,
+  placeStopOrder as hlPlaceStopOrder,
   closePosition as hlClose,
   setLeverage as hlSetLeverage,
   getOpenOrders as hlGetOpenOrders,
@@ -46,6 +47,10 @@ export class HyperliquidExchange {
 
   async placeLimitOrder(asset, side, size, limitPrice) {
     return hlPlaceLimitOrder(this.signer, asset, side, size, limitPrice);
+  }
+
+  async placeStopOrder(asset, isLong, size, triggerPrice) {
+    return hlPlaceStopOrder(this.signer, asset, isLong, size, triggerPrice);
   }
 
   async getOpenOrders() {

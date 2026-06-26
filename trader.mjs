@@ -98,7 +98,7 @@ import {
   insertSignalEvent, setTpState, getTpState, updateTpTrailMode,
   updateTpHighWater, clearTpState, logFetch, getLastTradeTime,
   setSubscriptionExpiry, getLastStrategyEntry, setStrategyRiskMode,
-  getTradingWallet, setStrategySlPct,
+  getTradingWallet, setStrategySlPct, setStrategyStopOrderId, getStrategyStopOrderId,
 } from "./db.mjs";
 
 import { HyperliquidExchange } from "./exchanges/hyperliquid.mjs";
@@ -502,28 +502,8 @@ async function confirmEntry(strategy, signal, exchange) {
 
     const closes = candles.map(c => parseFloat(c.c));
     const price  = closes[closes.length - 1];
-    const rsi    = computeRSI(closes, 14);
-    const ema50  = computeEMA(closes, 50);
     const atr14  = computeATR(candles, 14);
     const atr50  = computeATR(candles, 50);
-
-    // ── Layer 1: RSI band ────────────────────────────────────────────────
-    if (rsi != null) {
-      const [lo, hi] = signal === "LONG" ? [40, 65] : [35, 60];
-      if (rsi < lo || rsi > hi) {
-        console.log(`[trader] 🚫 Gate L1 blocked ${signal} — RSI ${rsi.toFixed(1)} outside band [${lo}–${hi}]`);
-        return null;
-      }
-    }
-
-    // ── Layer 2: EMA50 trend alignment ───────────────────────────────────
-    if (ema50 != null) {
-      const trendOk = signal === "LONG" ? price > ema50 : price < ema50;
-      if (!trendOk) {
-        console.log(`[trader] 🚫 Gate L2 blocked ${signal} — price ${signal === "LONG" ? "below" : "above"} EMA50 $${ema50.toFixed(4)}`);
-        return null;
-      }
-    }
 
     // ── Layer 3: ATR volatility regime ───────────────────────────────────
     if (atr14 != null && atr50 != null && atr14 > atr50 * 1.5) {
@@ -555,7 +535,7 @@ async function confirmEntry(strategy, signal, exchange) {
       slPct = Math.max(3, Math.min(15, parseFloat((1.5 * atr14 / price * 100).toFixed(2))));
     }
 
-    console.log(`[trader] ✅ Entry gate passed — RSI ${rsi?.toFixed(1)} | ATR14/50 ${atr14?.toFixed(4)}/${atr50?.toFixed(4)} | adaptive SL ${slPct.toFixed(2)}%`);
+    console.log(`[trader] ✅ Entry gate passed — ATR14/50 ${atr14?.toFixed(4)}/${atr50?.toFixed(4)} | adaptive SL ${slPct.toFixed(2)}%`);
     return { slPct };
   } catch (err) {
     console.warn(`[trader] ⚠️  Entry gate error: ${err.message} — allowing entry`);
@@ -714,32 +694,6 @@ async function checkTpTrail(strategy) {
   const price = await withRetry(() => exchange.getMidPrice(asset));
   if (!price) return false;
 
-  // Stop loss check — runs before TP/trail
-  if (strategy.sl_pct) {
-    const entryPx = parseFloat(position?.entryPx ?? "0");
-    if (entryPx > 0) {
-      const isLong   = positionSzi > 0;
-      const slPrice  = isLong ? entryPx * (1 - strategy.sl_pct / 100) : entryPx * (1 + strategy.sl_pct / 100);
-      const slHit    = isLong ? price <= slPrice : price >= slPrice;
-      if (slHit) {
-        const size = Math.abs(positionSzi);
-        const pnl  = parseFloat(((price - entryPx) * size * (isLong ? 1 : -1)).toFixed(2));
-        console.log(`[trader] 🛑 Stop loss @ $${price.toLocaleString()} (entry $${entryPx.toLocaleString()}, SL $${slPrice.toLocaleString()})`);
-        if (!isDryRun) await exchange.closePosition(asset);
-        else console.log(`[trader] [DRY RUN] Would close via stop loss`);
-        clearTpState(strategy.id);
-        insertTrade({
-          strategy_id: strategy.id,
-          action: `STOP LOSS @ $${price.toLocaleString()} (entry $${entryPx.toLocaleString()})`,
-          asset, size, price, leverage: strategy.leverage ?? 1, pnl,
-          result: { stop_loss: true, entry_price: entryPx, sl_price: slPrice },
-        });
-        console.log(`[trader] P&L: ${pnl >= 0 ? "+" : ""}$${pnl}`);
-        return true;
-      }
-    }
-  }
-
   if (!state) return false;
 
   if (!state.trail_mode) {
@@ -765,7 +719,10 @@ async function checkTpTrail(strategy) {
     const size     = Math.abs(parseFloat(position?.szi ?? "0"));
     const pnl      = parseFloat(((price - entryPx) * size).toFixed(2));
 
-    if (!isDryRun) await exchange.closePosition(asset);
+    if (!isDryRun) {
+      await cancelNativeStop(strategy, exchange, asset);
+      await exchange.closePosition(asset);
+    }
     else console.log(`[trader] [DRY RUN] Would close via trail stop`);
 
     clearTpState(strategy.id);
@@ -787,6 +744,18 @@ async function checkTpTrail(strategy) {
 }
 
 // ── Execute trade ─────────────────────────────────────────────────────────────
+
+async function cancelNativeStop(strategy, exchange, asset) {
+  const oid = getStrategyStopOrderId(strategy.id);
+  if (!oid) return;
+  try {
+    await exchange.cancelOrder(oid, asset);
+    console.log(`[trader] 🗑 Native stop cancelled (order ${oid})`);
+  } catch (e) {
+    console.warn(`[trader] Could not cancel stop order ${oid}: ${e.message}`);
+  }
+  setStrategyStopOrderId(strategy.id, null);
+}
 
 async function executeTrade(strategy, signal, priorSignal) {
   const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
@@ -823,6 +792,11 @@ async function executeTrade(strategy, signal, priorSignal) {
     if (!isDryRun) {
       await withRetry(() => exchange.setLeverage(asset, leverage));
       result = await withRetry(() => exchange.placeMarketOrder(asset, "buy", positionSize));
+      if (strategy.sl_pct && typeof exchange.placeStopOrder === "function") {
+        const slPrice = parseFloat((midPrice * (1 - strategy.sl_pct / 100)).toPrecision(6));
+        const { oid } = await withRetry(() => exchange.placeStopOrder(asset, true, positionSize, slPrice));
+        if (oid) { setStrategyStopOrderId(strategy.id, oid); console.log(`[trader] 🛑 Native SL set: $${slPrice.toLocaleString()} (order ${oid})`); }
+      }
     }
     if (strategy.tp_pct && strategy.trail_pct) {
       const tpPrice = new Decimal(midPrice).times(1 + strategy.tp_pct / 100).toDecimalPlaces(2).toNumber();
@@ -837,6 +811,7 @@ async function executeTrade(strategy, signal, priorSignal) {
       console.log(`[trader] P&L: ${pnl >= 0 ? "+" : ""}$${pnl}`);
     }
     if (!isDryRun) {
+      await cancelNativeStop(strategy, exchange, asset);
       result = await withRetry(() => exchange.closePosition(asset));
     }
     clearTpState(strategy.id);
@@ -845,6 +820,11 @@ async function executeTrade(strategy, signal, priorSignal) {
     if (!isDryRun) {
       await withRetry(() => exchange.setLeverage(asset, leverage));
       result = await withRetry(() => exchange.placeMarketOrder(asset, "sell", positionSize));
+      if (strategy.sl_pct && typeof exchange.placeStopOrder === "function") {
+        const slPrice = parseFloat((midPrice * (1 + strategy.sl_pct / 100)).toPrecision(6));
+        const { oid } = await withRetry(() => exchange.placeStopOrder(asset, false, positionSize, slPrice));
+        if (oid) { setStrategyStopOrderId(strategy.id, oid); console.log(`[trader] 🛑 Native SL set: $${slPrice.toLocaleString()} (order ${oid})`); }
+      }
     }
   } else if (signal === "SHORT" && !isFlat && isLong) {
     action = `FLIPPED SHORT ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
@@ -853,9 +833,15 @@ async function executeTrade(strategy, signal, priorSignal) {
       console.log(`[trader] Closed long P&L: ${pnl >= 0 ? "+" : ""}$${pnl}`);
     }
     if (!isDryRun) {
+      await cancelNativeStop(strategy, exchange, asset);
       await withRetry(() => exchange.closePosition(asset));
       await withRetry(() => exchange.setLeverage(asset, leverage));
       result = await withRetry(() => exchange.placeMarketOrder(asset, "sell", positionSize));
+      if (strategy.sl_pct && typeof exchange.placeStopOrder === "function") {
+        const slPrice = parseFloat((midPrice * (1 + strategy.sl_pct / 100)).toPrecision(6));
+        const { oid } = await withRetry(() => exchange.placeStopOrder(asset, false, positionSize, slPrice));
+        if (oid) { setStrategyStopOrderId(strategy.id, oid); console.log(`[trader] 🛑 Native SL set: $${slPrice.toLocaleString()} (order ${oid})`); }
+      }
     }
   } else {
     console.log(`[trader] ⚪ HOLD — no action needed`);
